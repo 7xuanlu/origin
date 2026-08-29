@@ -23,7 +23,9 @@ The daemon listens on `127.0.0.1:7878`, which is your own machine only. Nothing 
 
 ## When Wenlan reaches the network
 
-Wenlan is not fully offline. Three requests happen at startup on their own, with no setting to stop them, and a fourth is triggered by content you open. None carry memory content, but each tells the other end your IP address.
+Wenlan is not fully offline. Three requests happen at startup on their own, with no setting to stop them. Each tells the other end your IP address and nothing else about you.
+
+Separately, a note that contains remote images causes one request per image when you open it, and that request carries an address taken from the note itself. That is described under "Images in your notes reach their host" below.
 
 | What | When | Where | What it sends |
 | --- | --- | --- | --- |
@@ -35,13 +37,15 @@ To avoid the model download, copy an existing model cache into the daemon's cach
 
 ### Images in your notes reach their host
 
-This is the fourth request, and it is worth its own heading because it is the one that can reach a server nobody at Wenlan chose.
+These requests deserve their own heading, because they are the ones that can reach a server nobody at Wenlan chose, and because there is one of them for every image rather than one in total.
 
-Wenlan renders Markdown, and Markdown images may point at any address. If a note contains `![something](https://example.com/picture.png)`, then **opening or editing that note fetches the picture from `example.com`**, in both the editor and the reading view. The desktop app sets no content security policy, so nothing blocks it.
+Wenlan renders Markdown, and a Markdown image may point at any address. If a note contains `![something](https://example.com/picture.png)`, **displaying that note fetches the picture from `example.com`**. A note with ten remote images makes ten requests, to whichever hosts those ten addresses name. The desktop app sets no content security policy, so nothing blocks them.
 
-That request tells the host your IP address, the time you opened the note, and which image URL you loaded. A uniquely generated image URL therefore works as a read receipt. The editor sends no referrer; the reading view does not set that header.
+Each request tells the host your IP address, the time it happened, and the exact image address, which came out of your note. A uniquely generated image address therefore works as a read receipt on anyone who opens the note.
 
-This matters most for content you did not write: a page imported from elsewhere, or a document someone sent you. It cannot be turned off today, and there is no local alternative -- the editor renders only `http:` and `https:` images, so a picture that appears in a note was fetched from somewhere. If that concerns you, remove the image link from the note.
+Reading and editing differ. The reading view builds every image as soon as it renders the note. The editor builds images only for the part of the note on screen, and marks them to load lazily, so an image far below your cursor is not fetched until you scroll to it.
+
+This matters most for content you did not write: a page imported from elsewhere, or a document someone sent you. There is no switch to turn it off. There is also no working local alternative. The reading view accepts a relative address such as `![x](pictures/photo.png)`, but resolves it against the app itself rather than your notes folder, so a picture on your disk does not appear; the editor shows only `http:` and `https:` images and skips it entirely. In practice, an image you can see in a note was fetched over the network. If a note worries you, remove the image link from it.
 
 ## Sending your content somewhere
 
@@ -66,8 +70,24 @@ Wenlan reaches these services, so their policies govern what they do with the re
 | GitHub | The two version checks, and downloading a release | [GitHub Privacy Statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement) |
 | Hugging Face | Downloading the search model, and any optional model you install | [Hugging Face Privacy Policy](https://huggingface.co/privacy) |
 | Cloudflare | Only if you turn on Remote Access, which runs `cloudflared` to open the tunnel | [Cloudflare Privacy Policy](https://www.cloudflare.com/privacypolicy/) |
-| A cloud AI provider you configure | Only if you save a key and pick that provider for enrichment | That provider's own policy. Anthropic's is the [Anthropic Privacy Policy](https://www.anthropic.com/legal/privacy) |
-| The host of a remote image in one of your notes | Opening a note whose Markdown points at a remote image | Whoever runs that host. Wenlan cannot know who that is |
+| The host of a remote image in one of your notes | Displaying a note whose Markdown points at a remote image | Whoever runs that host. Wenlan cannot know who that is |
+
+### The cloud AI providers Wenlan offers
+
+None of these is contacted unless you save a key and choose that provider for enrichment. Wenlan ships a preset for each one, so each one's policy is named here.
+
+| Provider | Their policy |
+| --- | --- |
+| Anthropic | [Anthropic Privacy Policy](https://www.anthropic.com/legal/privacy) |
+| OpenAI | [OpenAI terms and policies](https://openai.com/policies/), which splits privacy by region |
+| Google, for Gemini | [Google Privacy Policy](https://policies.google.com/privacy) |
+| Groq | [Groq Privacy Policy](https://groq.com/privacy-policy) |
+| OpenRouter | [OpenRouter Privacy Policy](https://openrouter.ai/privacy) |
+| Mistral | [Mistral legal terms](https://legal.mistral.ai/terms) |
+| DeepSeek | [DeepSeek Privacy Policy](https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html) |
+| xAI | [xAI Privacy Policy](https://x.ai/legal/privacy-policy) |
+
+Wenlan also offers presets for Ollama and LM Studio, which run on your own machine and reach no network, and a custom option where you type the address yourself. For a custom address, the policy is whatever the operator of that address publishes.
 
 Wenlan's own relay, at `origin-relay.originmemory.workers.dev`, is run by this project rather than a third party. It stores the tunnel address you register and the random identifier described above, and nothing else.
 
