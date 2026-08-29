@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=dd88d8c8878e94e03957331568237c1818cfd727b7401a6e82efdb4a8441e35d -->
+<!-- README_SYNC: source=README.md sha256=8a1c36df2bd07d9e114840e5a17c6860ddad51936a8826d38c694325a85eee82 -->
 
 <p align="center">
   <picture>
@@ -16,7 +16,7 @@ El trabajo útil con IA no debería desaparecer cuando termina una conversación
 <p align="center">
   <a href="https://github.com/7xuanlu/wenlan/actions/workflows/ci.yml?query=branch%3Amain"><img alt="CI" src="https://github.com/7xuanlu/wenlan/actions/workflows/ci.yml/badge.svg?branch=main&event=push"></a>
   <a href="https://github.com/7xuanlu/wenlan/releases/latest"><img alt="Última versión" src="https://img.shields.io/github/v/release/7xuanlu/wenlan?sort=semver&label=release"></a>
-  <a href="#license"><img alt="Licencia: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="#license"><img alt="Licencia: Apache-2.0 y AGPL-3.0" src="https://img.shields.io/badge/license-Apache--2.0%20%2B%20AGPL--3.0-blue.svg"></a>
 </p>
 
 <p align="center">
@@ -378,7 +378,12 @@ Wenlan no transferirá ninguna información a otros sistemas en red salvo que lo
 
 ## Licencia
 
-Wenlan tiene licencia bajo **Apache-2.0**. Esto incluye el runtime local, la CLI, el servidor MCP, los tipos compartidos y los archivos del plugin de Claude Code/Codex en este repositorio.
+Wenlan usa dos licencias, una por cada parte del repositorio.
+
+- **Apache-2.0** ([`LICENSE`](LICENSE)) cubre el runtime local, la CLI, el servidor MCP, los tipos compartidos y los archivos del plugin de Claude Code y Codex. Constrúyelo libremente sobre esto.
+- **AGPL-3.0-only** ([`app/LICENSE`](app/LICENSE)) cubre la aplicación de escritorio: el crate `app/` y el frontend de React que incluye. Si ejecutas una versión modificada de la aplicación como servicio en red, la AGPL te pide ofrecer ese código modificado a sus usuarios.
+
+La separación es deliberada. El código Apache-2.0 puede usarse dentro de un programa AGPL-3.0, así que la aplicación de escritorio se apoya en el runtime sin que ninguna de las dos licencias se incumpla.
 
 ---
 
