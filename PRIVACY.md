@@ -23,15 +23,15 @@ The daemon listens on `127.0.0.1:7878`, which is your own machine only. Nothing 
 
 ## When Wenlan reaches the network
 
-Wenlan is not fully offline. Three things happen on their own, with no setting to stop them, and each tells the other end your IP address. The first of the three is a download rather than a single request: it fetches the model file and its tokenizer and configuration files, so expect several requests, not one.
+Wenlan is not fully offline. Three things happen on their own, and each tells the other end your IP address. The first is a download rather than a single request: it fetches the model file plus its tokenizer and configuration files, so expect several requests. Only one of the three has an off switch, noted in the table.
 
-Separately, displaying a note that contains remote images reaches those image hosts. That is described under "Images in your notes reach their host" below.
+Separately, displaying a note that contains remote images may reach those image hosts. That is described under "Images in your notes reach their host" below.
 
 | What | When | Where | What it sends |
 | --- | --- | --- | --- |
 | Search model download | Once, the first time the daemon starts | `https://huggingface.co`, repository `Qdrant/bge-base-en-v1.5-onnx-Q` | Downloads about 210 MB across several files. Sends no memory content. One caveat: the download library reads a Hugging Face access token from that tool's standard cache directory if you already have one saved on this machine, and attaches it, which identifies your Hugging Face account to them. This model is what makes local search work; without it the daemon cannot start. |
-| Desktop app update check | 3 seconds after every launch of the app | `https://github.com/7xuanlu/wenlan/releases/latest/download/latest.json` | Nothing but the request itself, identified as `tauri-plugin-updater`. If a newer version exists the app asks you; it never installs without your click. |
-| MCP server version check | Every time an AI client starts `wenlan-mcp`, at most once a day | `https://github.com/7xuanlu/wenlan/releases/latest` | Nothing but the request itself, identified as `wenlan-mcp/<version>`. It reads only where GitHub redirects, to compare version numbers. |
+| Desktop app update check | About 3 seconds after a launch. Skipped entirely when the app starts with `WENLAN_DATA_DIR` or `ORIGIN_DATA_DIR` set, which is the one off switch. | `https://github.com/7xuanlu/wenlan/releases/latest/download/latest.json` | Nothing but the request itself, identified as `tauri-plugin-updater`. If a newer version exists the app asks you; it never installs without your click. |
+| MCP server version check | Every time an AI client starts `wenlan-mcp`, normally at most once a day | `https://github.com/7xuanlu/wenlan/releases/latest` | Nothing but the request itself, identified as `wenlan-mcp/<version>`. It reads only where GitHub redirects, to compare version numbers. The daily limit is remembered in a cache file; where that file cannot be written, such as a read-only home directory, the limit lasts only for that one process, so each new one can check again. |
 
 To avoid the model download, copy an existing model cache into the daemon's cache directory before first start. To avoid the two version checks, block `github.com` for those processes at your firewall; both fail quietly and Wenlan keeps working.
 
@@ -39,11 +39,11 @@ To avoid the model download, copy an existing model cache into the daemon's cach
 
 These requests deserve their own heading, because they are the ones that can reach a server nobody at Wenlan chose, and because a note can produce many of them.
 
-Wenlan renders Markdown, and a Markdown image may point at any address. If a note contains `![something](https://example.com/picture.png)`, **displaying that note tries to load the picture from `example.com`**. Every remote image in a note is a separate load, so a note with ten of them reaches up to ten hosts. How many network requests that actually becomes depends on your browser cache and on any redirects those addresses follow. The desktop app sets no content security policy, so nothing blocks them.
+Wenlan renders Markdown, and a Markdown image may point at any address. If a note contains `![something](https://example.com/picture.png)`, **displaying that note tries to load the picture from `example.com`**. Every remote image in a note is a separate load, so a note with ten of them names up to ten hosts, and a redirect can pull in further hosts that the note never named. How many network requests that becomes depends on your browser cache and on those redirects. The desktop app sets no content security policy of its own, so it does not block them, though your network or the webview still might.
 
-A load that does reach the host tells it your IP address, the time, and the exact image address, which came out of your note. A uniquely generated image address therefore works as a read receipt on anyone who opens the note.
+A load that does reach the host tells it your IP address, the time, and the address it asked for, which came out of your note. Wenlan adds nothing to that address; the path and any query string already in it are sent, while a fragment after a `#` stays in the browser. A uniquely generated image address therefore works as a read receipt on anyone who opens the note.
 
-It can tell the host more than that. The reading view uses an ordinary image tag with no restrictions set, so the browser applies its defaults: it sends any cookies that host has already set in this app, and a `Referer` header naming the app's own address. The editor sets `referrerpolicy="no-referrer"`, which drops the referrer but does not stop the cookies. Wenlan adds nothing to the address, but anything already in it, including a query string, is sent as written.
+It may tell the host more than that. The reading view uses an ordinary image tag and sets nothing on it, so your browser's own defaults decide the rest: it may send cookies that host has already set in this app, subject to the usual same-site and scope rules, and it normally sends a `Referer` naming the app's address rather than the note. The editor sets `referrerpolicy="no-referrer"`, which drops the referrer but does not affect cookies. Exactly what is sent is your webview's behaviour, not something Wenlan controls or can promise.
 
 Reading and editing differ. The reading view builds every image as soon as it renders the note. The editor builds images only for the part of the note on screen, and marks them to load lazily, so an image far below your cursor is not fetched until you scroll to it.
 
@@ -69,7 +69,7 @@ None. Wenlan collects no usage analytics, no crash reports, and no diagnostics. 
 
 ## The other companies involved
 
-Wenlan reaches these services, so their policies govern what they do with the request. We have no agreement with any of them and receive nothing back from them about you.
+Wenlan reaches these services, so their own terms decide what they do with the request. We have no agreement with any of them and receive nothing back from them about you.
 
 | Service | Why Wenlan reaches it | Their policy |
 | --- | --- | --- |
@@ -80,7 +80,9 @@ Wenlan reaches these services, so their policies govern what they do with the re
 
 ### The cloud AI providers Wenlan offers
 
-None of these is contacted unless you save a key and choose that provider for enrichment. Wenlan ships a preset for each one, so each one's policy is named here.
+None of these is contacted unless you save a key and choose that provider for enrichment. Wenlan ships a preset for each one, so each one's published privacy policy is named here.
+
+**Read one thing before relying on the table.** Wenlan talks to these providers through their APIs, and several of them state in the very policies below that the policy does not cover content submitted through an API by a business or developer customer. Anthropic, OpenAI, Groq and xAI all say a version of this and point to a separate customer or API agreement instead. That agreement is the document that actually governs the text Wenlan sends, and you accepted it when you created the key. Find it on the same provider's legal page; we deliberately do not guess which version applies to your account.
 
 | Provider | Their policy |
 | --- | --- |

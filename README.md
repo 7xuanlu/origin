@@ -370,7 +370,7 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 
 Multi-factor authentication is required of every maintainer, on GitHub and on SignPath, and nobody is added to either without it. Releases are built only by the tagged release workflow in this repository, on GitHub-hosted runners, from the commit the tag points at.
 
-**Privacy policy:** [PRIVACY.md](PRIVACY.md) — what Wenlan stores, where it stores it, and every case in which it reaches the network. How each platform is signed: [docs/code-signing.md](docs/code-signing.md).
+**Privacy policy:** [PRIVACY.md](PRIVACY.md) — what Wenlan stores, where it stores it, and each case we know of in which it reaches the network. How each platform is signed: [docs/code-signing.md](docs/code-signing.md).
 
 The SignPath application is pending. Windows installers are not signed yet.
 

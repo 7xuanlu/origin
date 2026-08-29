@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=6a710bec3531f7c5c21ee3d1ef828f4201b3bc30240fce12e3994be658aee5b2 -->
+<!-- README_SYNC: source=README.md sha256=f1012091058402c7d36676def6995936ea9d51e3096c713dd8357319e2926295 -->
 
 <p align="center">
   <picture>
@@ -372,7 +372,7 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 
 本專案要求每位 maintainer 在 GitHub 與 SignPath 上都啟用多因素驗證；未啟用者不會被加入其中任何一方。Release 只由本 repository 的 tag release workflow 建置，執行在 GitHub 託管的 runner 上，來源是該 tag 指向的 commit。
 
-**隱私權政策：**[PRIVACY.md](PRIVACY.md) —— Wenlan 保存什麼、保存在哪裡，以及它存取網路的每一種情況。各平台的簽章方式見 [docs/code-signing.md](docs/code-signing.md)。
+**隱私權政策：**[PRIVACY.md](PRIVACY.md) —— Wenlan 保存什麼、保存在哪裡，以及我們已知它會存取網路的各種情況。各平台的簽章方式見 [docs/code-signing.md](docs/code-signing.md)。
 
 SignPath 的申請正在審核中，Windows 安裝包尚未簽署。
 

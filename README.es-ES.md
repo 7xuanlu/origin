@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=6a710bec3531f7c5c21ee3d1ef828f4201b3bc30240fce12e3994be658aee5b2 -->
+<!-- README_SYNC: source=README.md sha256=f1012091058402c7d36676def6995936ea9d51e3096c713dd8357319e2926295 -->
 
 <p align="center">
   <picture>
@@ -370,7 +370,7 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 
 La autenticación multifactor es obligatoria para cada mantenedor, en GitHub y en SignPath, y nadie se añade a ninguno de los dos sin ella. Las versiones se compilan únicamente con el workflow de release por etiqueta de este repositorio, en runners alojados por GitHub, desde el commit al que apunta la etiqueta.
 
-**Política de privacidad:** [PRIVACY.md](PRIVACY.md) — qué guarda Wenlan, dónde lo guarda y cada caso en que accede a la red. Cómo se firma cada plataforma: [docs/code-signing.md](docs/code-signing.md).
+**Política de privacidad:** [PRIVACY.md](PRIVACY.md) — qué guarda Wenlan, dónde lo guarda y cada caso que conocemos en que accede a la red. Cómo se firma cada plataforma: [docs/code-signing.md](docs/code-signing.md).
 
 La solicitud a SignPath está pendiente. Los instaladores de Windows aún no están firmados.
 
