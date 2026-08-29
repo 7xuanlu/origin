@@ -31,7 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let model_path = PathBuf::from(&args[1]);
     let prompts = PromptRegistry::default();
-    let engine = LlmEngine::new(&model_path, prompts.clone())?;
+    let engine = LlmEngine::new(&model_path, prompts.clone())?.with_thinking_mode(
+        wenlan_core::on_device_models::thinking_mode_for_model_file(&model_path),
+    );
     let runtime = engine.inference_runtime_info();
 
     println!("--- Inference backend: {} ---", runtime.backend);

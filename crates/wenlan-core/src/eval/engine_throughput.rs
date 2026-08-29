@@ -247,6 +247,7 @@ pub fn synthetic_mixed_workload(n: usize, temperature: f32) -> Vec<WorkloadItem>
                 let prompt = crate::llm_provider::format_chatml_prompt(
                     Some("You are a terse sentiment classifier."),
                     &user,
+                    crate::on_device_models::get_default_model().thinking_mode,
                 );
                 WorkloadItem {
                     prompt: (
@@ -270,6 +271,7 @@ pub fn synthetic_mixed_workload(n: usize, temperature: f32) -> Vec<WorkloadItem>
                 let prompt = crate::llm_provider::format_chatml_prompt(
                     Some("You extract knowledge-graph entities and relations as JSON."),
                     &user,
+                    crate::on_device_models::get_default_model().thinking_mode,
                 );
                 WorkloadItem {
                     prompt: (
@@ -317,7 +319,11 @@ pub fn shared_prefix_workload(n: usize, temperature: f32) -> Vec<WorkloadItem> {
         .map(|i| {
             let (canary, s) = base[i % base.len()];
             let user = format!("Sentence: \"{s}\"");
-            let prompt = crate::llm_provider::format_chatml_prompt(Some(SYSTEM), &user);
+            let prompt = crate::llm_provider::format_chatml_prompt(
+                Some(SYSTEM),
+                &user,
+                crate::on_device_models::get_default_model().thinking_mode,
+            );
             // Vary the output budget too, so decode width drains raggedly.
             let max_out = if i % 2 == 0 { 24 } else { 64 };
             WorkloadItem {
