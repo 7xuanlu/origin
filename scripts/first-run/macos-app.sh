@@ -52,9 +52,12 @@ DMG="Wenlan_${VERSION}_aarch64.dmg"
 check dmg-download -- curl -fsSL --retry 3 -o "$DL/$DMG" "https://github.com/7xuanlu/wenlan/releases/download/$TAG/$DMG"
 # A browser stamps com.apple.quarantine on everything it downloads and curl
 # stamps nothing, and that attribute is the only reason Gatekeeper is consulted
-# on a first launch. Set it by hand so the assessments below see what a user
-# who downloaded from the Releases page sees, not the quieter path curl takes.
-check dmg-quarantine-applied -- xattr -w com.apple.quarantine "0083;00000000;Safari;" "$DL/$DMG"
+# at all. Set it by hand, in the four-field shape Safari writes, so the
+# assessments below run against a quarantined file rather than the quieter path
+# curl takes. This marks the file only; no LaunchServices quarantine event is
+# recorded, so it stands in for a browser download, it does not reproduce one.
+QUARANTINE="0083;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)"
+check dmg-quarantine-applied -- xattr -w com.apple.quarantine "$QUARANTINE" "$DL/$DMG"
 check dmg-stapled -- xcrun stapler validate "$DL/$DMG"
 check_output dmg-gatekeeper "accepted" -- spctl -a -t open --context context:primary-signature -vv "$DL/$DMG"
 check dmg-attach -- hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT" "$DL/$DMG"
@@ -62,9 +65,13 @@ check dmg-has-app -- test -d "$MOUNT/Wenlan.app"
 check_output dmg-bundle-version "$VERSION" -- plutil -extract CFBundleShortVersionString raw "$MOUNT/Wenlan.app/Contents/Info.plist"
 check_output dmg-developer-id "Authority=Developer ID Application" -- codesign -dv --verbose=2 "$MOUNT/Wenlan.app"
 check dmg-codesign-valid -- codesign --verify --deep --strict "$MOUNT/Wenlan.app"
-# "Notarized Developer ID" is the only source string that means a first launch
-# opens with no dialog at all. A signed-but-unnotarized bundle is rejected here,
-# and an ad-hoc signed one is rejected without any source line.
+# "Notarized Developer ID" is the verdict that stops Gatekeeper from blocking
+# the app: no "cannot be opened" refusal and no detour through System Settings
+# to approve it. macOS still shows the one-time "downloaded from the Internet,
+# are you sure you want to open it?" confirmation for any quarantined app,
+# notarized or not, and spctl assesses policy rather than replaying that launch.
+# A signed-but-unnotarized bundle is rejected here, and an ad-hoc signed one is
+# rejected without any source line.
 check_output app-gatekeeper "source=Notarized Developer ID" -- spctl -a -t exec -vv "$MOUNT/Wenlan.app"
 check dmg-detach -- hdiutil detach "$MOUNT"
 

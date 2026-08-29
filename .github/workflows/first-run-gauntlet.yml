@@ -30,7 +30,10 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Release tag (vX.Y.Z) or 'latest'
+        description: >-
+          Release tag (vX.Y.Z) or 'latest'. The macos-app channel asserts
+          Developer ID signing and notarization, which no release before
+          v0.17.4 has, so an older tag fails that leg by design.
         required: false
         default: latest
         type: string
