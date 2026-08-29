@@ -1,6 +1,6 @@
 # Privacy Policy
 
-Wenlan is a local-first personal memory system. This policy covers the Wenlan daemon, CLI, MCP server, and Claude Code plugin.
+Wenlan is a local-first personal memory system. This policy covers everything the project ships: the desktop app, the daemon, the CLI, the MCP server, and the Claude Code and Codex plugins.
 
 ## What data Wenlan stores
 
@@ -8,7 +8,7 @@ Only what you explicitly capture: decisions, lessons, observations, project cont
 
 ## Where data is stored
 
-All data stays on your machine:
+All of your data stays on your machine:
 
 - `~/.wenlan/pages/` -- wiki pages (Markdown)
 - `~/.wenlan/sessions/` -- session logs (Markdown)
@@ -17,19 +17,33 @@ All data stays on your machine:
 - `~/.wenlan/db/` -- symlink to the platform data directory (macOS: `~/Library/Application Support/wenlan/`; Linux: `~/.local/share/wenlan/`; Windows: `%LOCALAPPDATA%\wenlan\`), with the libSQL database at `<data dir>/memorydb/`
 - `~/.wenlan/bin/` -- installed binaries
 
-The daemon listens on `127.0.0.1:7878` (localhost only). No data is sent to any remote server by default.
+The daemon listens on `127.0.0.1:7878`, which is your own machine only. Nothing you capture -- no memory, page, source, or search -- is sent anywhere unless you turn on one of the features in "Sending your content somewhere" below.
 
-## Third-party services
+## When Wenlan reaches the network
 
-None by default. Two opt-in integrations exist:
+Wenlan is not fully offline. Three requests happen on their own, with no setting to stop them. They carry no memory content, but they do tell the other end your IP address.
 
-- **Anthropic API (BYOK):** If you run `wenlan keys set anthropic`, your memories are sent to the Anthropic API for richer extraction and synthesis. Anthropic's privacy policy applies to that data. Wenlan does not store or relay your API key beyond the local config file.
-- **On-device model:** If you run `wenlan models install`, a Qwen model is downloaded from Hugging Face Hub. No memory data leaves your machine in this mode.
-- **Remote Access (experimental, desktop app only):** when you turn it on, the app opens a Cloudflare tunnel to the local MCP server and registers the tunnel URL with Wenlan's relay (a Cloudflare Worker) so Claude.ai and ChatGPT get a stable address. The address has no login: anyone who has it can read and write your memory until you turn Remote Access off. Nothing is sent while it is off.
+| What | When | Where | What it sends |
+| --- | --- | --- | --- |
+| Search model download | Once, the first time the daemon starts | `https://huggingface.co`, repository `Qdrant/bge-base-en-v1.5-onnx-Q` | Downloads about 210 MB of model files. Sends nothing about you. This model is what makes local search work; without it the daemon cannot start. |
+| Desktop app update check | 3 seconds after every launch of the app | `https://github.com/7xuanlu/wenlan/releases/latest/download/latest.json` | Nothing but the request itself, identified as `tauri-plugin-updater`. If a newer version exists the app asks you; it never installs without your click. |
+| MCP server version check | Every time an AI client starts `wenlan-mcp`, at most once a day | `https://github.com/7xuanlu/wenlan/releases/latest` | Nothing but the request itself, identified as `wenlan-mcp/<version>`. It reads only where GitHub redirects, to compare version numbers. |
+
+To avoid the model download, copy an existing model cache into the daemon's cache directory before first start. To avoid the two version checks, block `github.com` for those processes at your firewall; both fail quietly and Wenlan keeps working.
+
+## Sending your content somewhere
+
+These are off until you turn them on. Each one is the only way your captured content leaves your machine.
+
+- **A cloud AI provider (bring your own key).** If you save an API key and pick that provider for enrichment, Wenlan sends the text of the memory or document being processed, plus its prompt, to that provider. Anthropic goes to `https://api.anthropic.com/v1/messages`. Any other provider goes to the endpoint you entered -- the app offers presets for OpenAI, Google, Groq, OpenRouter, Mistral, DeepSeek and xAI, and an endpoint on your own machine such as Ollama stays local. That provider's privacy policy governs what it does with the text. Your key is stored in the local config and sent only to that provider. Turn it off with `wenlan enrichment disable`, or by clearing the key.
+- **Testing a provider.** The "test endpoint" button sends one fixed sentence, `Say 'hello' and nothing else.`, and the model-list button asks the provider what models it offers. Neither sends anything you captured.
+- **Remote Access (experimental, desktop app only).** When you turn it on, the app runs `cloudflared` to open a tunnel to the local MCP server so Claude.ai and ChatGPT can reach a stable address, and registers that address with Wenlan's relay at `https://origin-relay.originmemory.workers.dev/register`. The registration sends the tunnel address and a random 16-byte identifier that Wenlan generates once and keeps on disk; that identifier is used as both the account name and the shared secret. While it is on, the app checks the tunnel's health every 30 seconds. **The address has no login: anyone who has it can read and write your entire memory** until you turn Remote Access off. Nothing is sent while it is off.
+- **On-device model download.** If you run `wenlan models install` or start the download from Settings, a Qwen model is fetched from `https://huggingface.co`. This is separate from the search model above and does not happen on its own. Once installed, enrichment runs on your machine and nothing leaves it.
+- **Better search ranking.** If you turn on the reranker, its weights are downloaded from `https://huggingface.co` the next time the daemon starts, between roughly 146 MB and 1.1 GB depending on which one you choose. It is off unless you set it.
 
 ## Telemetry
 
-None. Wenlan collects no usage analytics, crash reports, or diagnostics.
+None. Wenlan collects no usage analytics, no crash reports, and no diagnostics. There is no analytics library of any kind in the code. The app's fonts are bundled rather than fetched, so opening a window contacts nothing.
 
 ## Data deletion
 
@@ -42,4 +56,4 @@ None. Wenlan collects no usage analytics, crash reports, or diagnostics.
 
 Questions or concerns: open an issue at https://github.com/7xuanlu/wenlan/issues.
 
-Last updated: 2026-08-27.
+Last updated: 2026-08-29.
