@@ -15,6 +15,14 @@ interface CitationPopoverProps {
 
 const WIDTH = 280;
 
+// A document citation's locator is the document source id
+// (`<source id>::<absolute path>`); only the path part is a file the shell can
+// open or a human wants to read. Web and memory locators pass through unchanged.
+export function citationFilePath(locator: string): string {
+  const sep = locator.lastIndexOf("::");
+  return sep === -1 ? locator : locator.slice(sep + 2);
+}
+
 // Spec: external_url shows a *domain* badge, other kinds a fixed label.
 function kindBadge(citation: PageCitation): string {
   if (citation.source_kind === "external_url") {
@@ -90,10 +98,11 @@ export default function CitationPopover({
       );
     }
     if (citation.source_kind === "external_file") {
+      const filePath = citationFilePath(citation.locator);
       return (
         <>
-          <p style={{ ...mono, wordBreak: "break-all" }}>{citation.locator}</p>
-          <button style={actionStyle} onClick={() => void shellOpen(citation.locator)}>
+          <p style={{ ...mono, wordBreak: "break-all" }}>{filePath}</p>
+          <button style={actionStyle} onClick={() => void shellOpen(filePath)}>
             Open file →
           </button>
         </>
