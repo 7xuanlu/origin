@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=754c86c6f3fe749574a07a69700db479e34e4f95e2734ee4c61ab87ba0f10aeb -->
+<!-- README_SYNC: source=README.md sha256=6a710bec3531f7c5c21ee3d1ef828f4201b3bc30240fce12e3994be658aee5b2 -->
 
 <p align="center">
   <picture>
@@ -370,7 +370,7 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 - **Reviewers：**[@7xuanlu](https://github.com/7xuanlu)。非 committer 的每一处改动都以 pull request 形式提交，合并前先经过 review。
 - **Approvers：**[@7xuanlu](https://github.com/7xuanlu)，审批每一次签名请求，决定哪一个 release 被签名。
 
-每位 maintainer 在 GitHub 与 SignPath 上都启用了多因素认证。Release 只由本 repository 的 tag release workflow 构建，运行在 GitHub 托管的 runner 上，来源是该 tag 指向的 commit。
+本项目要求每位 maintainer 在 GitHub 与 SignPath 上都启用多因素认证；未启用者不会被加入其中任何一方。Release 只由本 repository 的 tag release workflow 构建，运行在 GitHub 托管的 runner 上，来源是该 tag 指向的 commit。
 
 **隐私政策：**[PRIVACY.md](PRIVACY.md) —— Wenlan 保存什么、保存在哪里，以及它访问网络的每一种情况。各平台的签名方式见 [docs/code-signing.md](docs/code-signing.md)。
 

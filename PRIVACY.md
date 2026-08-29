@@ -4,7 +4,9 @@ Wenlan is a local-first personal memory system. This policy covers everything th
 
 ## What data Wenlan stores
 
-Only what you explicitly capture: decisions, lessons, observations, project context, and wiki pages synthesized from those memories. Wenlan does not monitor, scrape, or ingest anything automatically.
+Only what you explicitly capture: decisions, lessons, observations, project context, and wiki pages synthesized from those memories. Wenlan does not monitor or scrape.
+
+One thing is automatic, and you switch it on yourself. When you connect a folder as a source, Wenlan watches it and reads changed files without asking again for each one -- it syncs that folder once at startup and then whenever a file in it changes. Choosing the folder is the consent; each individual file is not a separate prompt.
 
 ## Where data is stored
 
@@ -21,7 +23,7 @@ The daemon listens on `127.0.0.1:7878`, which is your own machine only. Nothing 
 
 ## When Wenlan reaches the network
 
-Wenlan is not fully offline. Three requests happen on their own, with no setting to stop them. They carry no memory content, but they do tell the other end your IP address.
+Wenlan is not fully offline. Three requests happen at startup on their own, with no setting to stop them, and a fourth is triggered by content you open. None carry memory content, but each tells the other end your IP address.
 
 | What | When | Where | What it sends |
 | --- | --- | --- | --- |
@@ -30,6 +32,16 @@ Wenlan is not fully offline. Three requests happen on their own, with no setting
 | MCP server version check | Every time an AI client starts `wenlan-mcp`, at most once a day | `https://github.com/7xuanlu/wenlan/releases/latest` | Nothing but the request itself, identified as `wenlan-mcp/<version>`. It reads only where GitHub redirects, to compare version numbers. |
 
 To avoid the model download, copy an existing model cache into the daemon's cache directory before first start. To avoid the two version checks, block `github.com` for those processes at your firewall; both fail quietly and Wenlan keeps working.
+
+### Images in your notes reach their host
+
+This is the fourth request, and it is worth its own heading because it is the one that can reach a server nobody at Wenlan chose.
+
+Wenlan renders Markdown, and Markdown images may point at any address. If a note contains `![something](https://example.com/picture.png)`, then **opening or editing that note fetches the picture from `example.com`**, in both the editor and the reading view. The desktop app sets no content security policy, so nothing blocks it.
+
+That request tells the host your IP address, the time you opened the note, and which image URL you loaded. A uniquely generated image URL therefore works as a read receipt. The editor sends no referrer; the reading view does not set that header.
+
+This matters most for content you did not write: a page imported from elsewhere, or a document someone sent you. It cannot be turned off today, and there is no local alternative -- the editor renders only `http:` and `https:` images, so a picture that appears in a note was fetched from somewhere. If that concerns you, remove the image link from the note.
 
 ## Sending your content somewhere
 
@@ -43,7 +55,21 @@ These are off until you turn them on. Each one is the only way your captured con
 
 ## Telemetry
 
-None. Wenlan collects no usage analytics, no crash reports, and no diagnostics. There is no analytics library of any kind in the code. The app's fonts are bundled rather than fetched, so opening a window contacts nothing.
+None. Wenlan collects no usage analytics, no crash reports, and no diagnostics. There is no analytics library of any kind in the code, and the app's fonts are bundled rather than fetched. Opening a window contacts nothing by itself -- but see "Images in your notes reach their host" above, because the note you open can.
+
+## The other companies involved
+
+Wenlan reaches these services, so their policies govern what they do with the request. We have no agreement with any of them and receive nothing back from them about you.
+
+| Service | Why Wenlan reaches it | Their policy |
+| --- | --- | --- |
+| GitHub | The two version checks, and downloading a release | [GitHub Privacy Statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement) |
+| Hugging Face | Downloading the search model, and any optional model you install | [Hugging Face Privacy Policy](https://huggingface.co/privacy) |
+| Cloudflare | Only if you turn on Remote Access, which runs `cloudflared` to open the tunnel | [Cloudflare Privacy Policy](https://www.cloudflare.com/privacypolicy/) |
+| A cloud AI provider you configure | Only if you save a key and pick that provider for enrichment | That provider's own policy. Anthropic's is the [Anthropic Privacy Policy](https://www.anthropic.com/legal/privacy) |
+| The host of a remote image in one of your notes | Opening a note whose Markdown points at a remote image | Whoever runs that host. Wenlan cannot know who that is |
+
+Wenlan's own relay, at `origin-relay.originmemory.workers.dev`, is run by this project rather than a third party. It stores the tunnel address you register and the random identifier described above, and nothing else.
 
 ## Data deletion
 

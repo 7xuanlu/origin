@@ -80,7 +80,7 @@ Two consequences of choosing the Foundation tier, both worth knowing before appl
 
 1. **Turn on multi-factor authentication** for the GitHub account. Their terms require it: "All team members must use multi-factor authentication for both SignPath and source code repository access (e.g. GitHub)."
 2. **Publish the code signing policy.** Done: the READMEs carry a `Code signing policy` section naming the Author, Reviewer and Approver roles and the required credit line. The Foundation checks the project's home page for it.
-3. **Apply** at <https://signpath.org/apply>. Expect the repository URL, the license name, the release download URL, and a project description. The Foundation publishes no service level, so do not plan a release date around an acceptance date.
+3. **Apply** at <https://signpath.org/apply>. Expect the repository URL, the license name, the release download URL, and a project description. The application page states no turnaround time, so do not plan a release date around an acceptance date.
 
    The license answer is "Apache-2.0 and AGPL-3.0-only", not Apache-2.0 alone: `package.json` and `app/Cargo.toml` declare AGPL for the desktop app. Both are OSI-approved and neither part is sold, so the split meets "an OSI-approved Open Source license without commercial dual-licensing"; answering with one license would simply be wrong, and a reviewer who reads the manifests will ask.
 
@@ -103,7 +103,7 @@ Two limits to plan around.
 
 ### Why not the alternatives
 
-No certificate removes the warning on a first release. Microsoft withdrew the extended-validation certificate's instant SmartScreen bypass in 2024, so every tier now builds reputation the same way: release after release under one consistent publisher identity. Microsoft's own guidance is that paying the extended-validation premium purely to avoid SmartScreen is "no longer justified". Until reputation accumulates, the READMEs walk Windows users through "More info" and then "Run anyway", which is the same click path an unsigned installer needs.
+A certificate does not guarantee that a first release avoids a warning. Microsoft withdrew the extended-validation certificate's instant SmartScreen bypass in 2024, so every tier now builds reputation the same way: release after release under one consistent publisher identity. Microsoft's own guidance is that paying the extended-validation premium purely to avoid SmartScreen is "no longer justified". Until reputation accumulates, the READMEs walk Windows users through "More info" and then "Run anyway", which is the same click path an unsigned installer needs.
 
 Every price, country restriction, and SmartScreen behavior below is taken from [Microsoft's code signing options for Windows app developers](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/code-signing-options). Read that page before buying; these terms drift, and Microsoft's page wins wherever it disagrees with this table.
 

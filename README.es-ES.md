@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=754c86c6f3fe749574a07a69700db479e34e4f95e2734ee4c61ab87ba0f10aeb -->
+<!-- README_SYNC: source=README.md sha256=6a710bec3531f7c5c21ee3d1ef828f4201b3bc30240fce12e3994be658aee5b2 -->
 
 <p align="center">
   <picture>
@@ -368,7 +368,7 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 - **Revisores:** [@7xuanlu](https://github.com/7xuanlu). Todo cambio de alguien que no sea committer llega como pull request y se revisa antes de fusionarse.
 - **Aprobadores:** [@7xuanlu](https://github.com/7xuanlu), que aprueba cada solicitud de firma y así decide qué versión se firma.
 
-Cada mantenedor usa autenticación multifactor para GitHub y para SignPath. Las versiones se compilan únicamente con el workflow de release por etiqueta de este repositorio, en runners alojados por GitHub, desde el commit al que apunta la etiqueta.
+La autenticación multifactor es obligatoria para cada mantenedor, en GitHub y en SignPath, y nadie se añade a ninguno de los dos sin ella. Las versiones se compilan únicamente con el workflow de release por etiqueta de este repositorio, en runners alojados por GitHub, desde el commit al que apunta la etiqueta.
 
 **Política de privacidad:** [PRIVACY.md](PRIVACY.md) — qué guarda Wenlan, dónde lo guarda y cada caso en que accede a la red. Cómo se firma cada plataforma: [docs/code-signing.md](docs/code-signing.md).
 

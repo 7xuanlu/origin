@@ -368,7 +368,7 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 - **Reviewers:** [@7xuanlu](https://github.com/7xuanlu). Every change from someone who is not a committer arrives as a pull request and is reviewed before it merges.
 - **Approvers:** [@7xuanlu](https://github.com/7xuanlu), who approves each signing request and so decides which release is signed.
 
-Every maintainer uses multi-factor authentication for GitHub and for SignPath. Releases are built only by the tagged release workflow in this repository, on GitHub-hosted runners, from the commit the tag points at.
+Multi-factor authentication is required of every maintainer, on GitHub and on SignPath, and nobody is added to either without it. Releases are built only by the tagged release workflow in this repository, on GitHub-hosted runners, from the commit the tag points at.
 
 **Privacy policy:** [PRIVACY.md](PRIVACY.md) — what Wenlan stores, where it stores it, and every case in which it reaches the network. How each platform is signed: [docs/code-signing.md](docs/code-signing.md).
 
