@@ -358,6 +358,22 @@ pnpm build:all
 
 ---
 
+<a id="code-signing-policy"></a>
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+- **Authors:** [@7xuanlu](https://github.com/7xuanlu), who may commit to this repository without a further review.
+- **Reviewers:** [@7xuanlu](https://github.com/7xuanlu). Every change from someone who is not a committer arrives as a pull request and is reviewed before it merges.
+- **Approvers:** [@7xuanlu](https://github.com/7xuanlu), who approves each signing request and so decides which release is signed.
+
+Every maintainer uses multi-factor authentication for GitHub and for SignPath. Releases are built only by the tagged release workflow in this repository, on GitHub-hosted runners, from the commit the tag points at.
+
+Wenlan will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it. [PRIVACY.md](PRIVACY.md) lists every path Wenlan writes and every case in which it makes a network request. How each platform is signed: [docs/code-signing.md](docs/code-signing.md).
+
+---
+
 <a id="license"></a>
 
 ## License

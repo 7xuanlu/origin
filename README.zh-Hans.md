@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=9c35d476caf5741fa3ccb413e186705c7aacaf8a9c6621e29c91f7553f2fc3b8 -->
+<!-- README_SYNC: source=README.md sha256=dd88d8c8878e94e03957331568237c1818cfd727b7401a6e82efdb4a8441e35d -->
 
 <p align="center">
   <picture>
@@ -357,6 +357,22 @@ pnpm build:all
 ```
 
 `pnpm dev:all` 是桌面 app 受支持的开发入口。它让开发用的端口、数据、进程归属、app 标识、MCP socket 与 Remote Access 状态都与已安装的生产运行时隔离；未处于该隔离环境的 debug build 会拒绝启动。完整开发流程见本 repository 的 [AGENTS.md](AGENTS.md) 与 [CONTRIBUTING.md](CONTRIBUTING.md)，以及仓库内的 [app/AGENTS.md](app/AGENTS.md)。安全性问题请见 [SECURITY.md](SECURITY.md)，隐私政策请见 [PRIVACY.md](PRIVACY.md)，也请阅读 [Code of Conduct](CODE_OF_CONDUCT.md)。
+
+---
+
+<a id="code-signing-policy"></a>
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+- **Authors：**[@7xuanlu](https://github.com/7xuanlu)，可直接向本 repository 提交 commit，无需额外 review。
+- **Reviewers：**[@7xuanlu](https://github.com/7xuanlu)。非 committer 的每一处改动都以 pull request 形式提交，合并前先经过 review。
+- **Approvers：**[@7xuanlu](https://github.com/7xuanlu)，审批每一次签名请求，决定哪一个 release 被签名。
+
+每位 maintainer 在 GitHub 与 SignPath 上都启用了多因素认证。Release 只由本 repository 的 tag release workflow 构建，运行在 GitHub 托管的 runner 上，来源是该 tag 指向的 commit。
+
+除非用户，或安装、运行 Wenlan 的人明确要求，Wenlan 不会将任何信息传输到其他联网系统。[PRIVACY.md](PRIVACY.md) 列出了 Wenlan 写入的每一个路径，以及它发起网络请求的每一种情况。各平台的签名方式见 [docs/code-signing.md](docs/code-signing.md)。
 
 ---
 
