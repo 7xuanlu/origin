@@ -620,9 +620,13 @@ jobs:
           bundle_dir="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle"
           dmg="$(find "$bundle_dir/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
           [[ -n "$dmg" && -f "$dmg" ]] || { echo "ERROR: no .dmg found under $bundle_dir/dmg." >&2; exit 1; }
+          # 90m, not the job's full 120: the build ahead of this step has
+          # already spent part of the budget, and a wait that outlives the job
+          # is killed without printing the submission id. Apple's queue is
+          # unpredictable enough that this timeout is reached in practice.
           set +e
           out="$(xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" --wait --timeout 30m 2>&1)"
+            --team-id "$APPLE_TEAM_ID" --wait --timeout 90m 2>&1)"
           rc=$?
           set -e
           echo "$out"
@@ -636,7 +640,17 @@ jobs:
             xcrun notarytool log "$sub_id" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
               --team-id "$APPLE_TEAM_ID" 2>&1 | head -200 || true
           fi
-          [[ "$rc" -eq 0 ]] || { echo "ERROR: notarytool exited $rc for the DMG." >&2; exit 1; }
+          if [[ "$rc" -ne 0 ]]; then
+            echo "ERROR: notarytool exited $rc for the DMG." >&2
+            # A timeout leaves the submission alive in Apple's queue. Name it,
+            # because the fix is to wait on this id -- `xcrun notarytool wait
+            # <id>` -- not to rerun the job, which would submit the same disk
+            # image a second time and queue behind the first.
+            if [[ -n "$sub_id" ]]; then
+              echo "Submission $sub_id is still with Apple. Wait on that id rather than resubmitting." >&2
+            fi
+            exit 1
+          fi
           grep -q 'status: Accepted' <<<"$out" || { echo "ERROR: DMG notarization was not Accepted." >&2; exit 1; }
           xcrun stapler staple "$dmg"
           xcrun stapler validate "$dmg"
@@ -718,6 +732,10 @@ jobs:
             # image really does hold a notarized app rather than assuming it.
             mount="$RUNNER_TEMP/dmg-assess"
             rm -rf "$mount"
+            # hdiutil creates a missing mountpoint on current macOS, but the
+            # runner image is older than the machine this was checked on, so
+            # make it rather than depend on the version.
+            mkdir -p "$mount"
             hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg"
             mounted_app="$(find "$mount" -maxdepth 1 -type d -name '*.app' -print -quit)"
             if [[ -z "$mounted_app" || ! -d "$mounted_app" ]]; then
