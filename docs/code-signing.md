@@ -5,7 +5,7 @@ What ships today, and what it takes to make the installers trusted by the OS.
 | Artifact | Today | What the OS shows | Fix |
 | --- | --- | --- | --- |
 | `Wenlan_<ver>_aarch64.dmg`, `Wenlan_aarch64.app.tar.gz` | ad-hoc signed (`"signingIdentity": "-"` in `app/tauri.conf.json`; `APPLE_SIGNING_IDENTITY` falls back to `-` in `release.yml`), not notarized | Gatekeeper: "Wenlan cannot be opened" (first-run gauntlet finding F11, `spctl --assess` → `rejected`) | Developer ID certificate + notarization, section 1 |
-| `Wenlan_<ver>_x64-setup.exe` | unsigned; the READMEs walk the user through the warning | SmartScreen: "Windows protected your PC", unknown publisher | sign it to establish a publisher identity, section 2; the warning itself fades only as that identity earns reputation |
+| `Wenlan_<ver>_x64-setup.exe` | unsigned; the READMEs walk the user through the warning | SmartScreen: "Windows protected your PC", unknown publisher | a free SignPath Foundation certificate, section 2; the warning itself fades only as that publisher identity earns reputation |
 | `*.sig` next to the app bundles | signed with the Tauri updater key (`TAURI_SIGNING_PRIVATE_KEY`) | nothing; this is what the in-app updater verifies | already done; unrelated to Gatekeeper and SmartScreen |
 | CLI tarballs, `wenlan-windows-x64.zip` | unsigned; `install.sh` strips quarantine and verifies `SHA256SUMS` | none for a terminal install | not needed for launch |
 
@@ -67,9 +67,34 @@ The workflow is already wired: once the secrets below exist, the next release is
 - Notarization removes Gatekeeper's block, not every dialog. A quarantined app still shows the one-time "downloaded from the Internet, are you sure you want to open it?" confirmation, which has an Open button. What goes away is the "cannot be opened because Apple cannot check it for malicious software" refusal and the trip to System Settings to approve it. The README one-liner installer strips the quarantine attribute, so that path shows nothing at all.
 - Developer ID signing without notarization still fails Gatekeeper, so set all six secrets together.
 
-## 2. Windows: Authenticode or Azure Artifact Signing
+## 2. Windows: SignPath Foundation
 
-Not wired yet; pick a provider first. Since June 2023 code-signing private keys must live in hardware, so CI signs through a cloud signer rather than a `.pfx` file in a secret.
+The provider is chosen: [SignPath Foundation](https://signpath.org/), which signs qualifying open-source projects for free. Nothing is wired yet, because the workflow needs an organization id, a project slug, a signing-policy slug, and an API token that only exist once the Foundation accepts the application. Since June 2023 code-signing private keys must live in hardware, so CI signs through a cloud signer rather than a `.pfx` file in a secret; SignPath is that cloud signer.
+
+Two consequences of choosing the Foundation tier, both irreversible in practice and worth knowing before applying:
+
+- **The certificate is issued to SignPath Foundation, not to Wenlan.** Their terms say "The code signing certificate is issued to *SignPath Foundation*. This means that *SignPath Foundation* is the publisher of the OSS project." Windows will name SignPath Foundation as the verified publisher. The same certificate already signs several hundred projects, so it carries reputation a new certificate would not.
+- **A human approves every release.** The Foundation requires that "each signing request must be approved by a team member". The Windows job will block on that approval, so a tag release is no longer fully unattended.
+
+### Before applying
+
+1. **Turn on multi-factor authentication** for the GitHub account. Their terms require it: "All team members must use multi-factor authentication for both SignPath and source code repository access (e.g. GitHub)."
+2. **Publish the code signing policy.** Done: the READMEs carry a `Code signing policy` section naming the Author, Reviewer and Approver roles and the required credit line. The Foundation checks the project's home page for it.
+3. **Apply** at <https://signpath.org/apply>. Expect the repository URL, the license name, the release download URL, and a project description. Reported turnaround is a few days to a few weeks; no service level is published.
+
+### After acceptance
+
+Signing is a submission from inside the workflow, not a local `signtool` call: [`signpath/github-action-submit-signing-request`](https://github.com/SignPath/github-action-submit-signing-request) uploads the built installer, waits for the approval, and downloads the signed file. The pieces to add to `app-bundle-windows` in `release.yml`, in order:
+
+1. Upload `*-setup.exe` as a GitHub artifact and submit it, guarded on a `SIGNPATH_CONFIGURED` flag the way the macOS steps are guarded by `APPLE_SIGNING_CONFIGURED`, so a fork without the secret still builds. Raise the action's `wait-for-completion-timeout-in-seconds` past its 600-second default, because it is waiting for a person.
+2. **Re-sign the updater artifact.** The `.sig` beside the installer is computed over the unsigned bytes, so Authenticode signing invalidates it. Delete it and re-run `pnpm tauri signer sign`, the same repair the macOS path makes after stapling.
+3. Take the SHA-256 checksums from the signed installer, not the unsigned one.
+4. Verify with `Get-AuthenticodeSignature`, status must be `Valid`, guarded the same way.
+5. Prove it on a clean machine through the first-run gauntlet's `windows-nsis` leg.
+
+Two limits to plan around. SignPath has no artifact type for an NSIS container, so it signs the installer as an ordinary PE file and leaves the executables inside it unsigned; deep-signing them means splitting `pnpm tauri build` into separate compile and bundle phases, which is only worth doing if Smart App Control turns out to reject the inner binaries. And the bundled upstream binaries — cloudflared, the ONNX Runtime and Vulkan libraries — must stay out of the submission, because the terms cover a project signing its own output.
+
+### Why not the alternatives
 
 No certificate removes the warning on a first release. Microsoft withdrew the extended-validation certificate's instant SmartScreen bypass in 2024, so every tier now builds reputation the same way: release after release under one consistent publisher identity. Microsoft's own guidance is that paying the extended-validation premium purely to avoid SmartScreen is "no longer justified". Until reputation accumulates, the READMEs walk Windows users through "More info" and then "Run anyway", which is the same click path an unsigned installer needs.
 
@@ -77,13 +102,15 @@ Every price, country restriction, and SmartScreen behavior below is taken from [
 
 | Option | Cost and prerequisites | SmartScreen | How it plugs into the build |
 | --- | --- | --- | --- |
-| [Azure Artifact Signing](https://learn.microsoft.com/en-us/azure/artifact-signing/quickstart) (called Trusted Signing until 2026) | about USD 10 per month, plus an Azure subscription and identity validation. Organizations are limited to a country list Microsoft publishes in the quickstart prerequisites; an individual developer must be in the United States or Canada. Validation takes a few business days. | warnings at first; reputation builds across releases | `trusted-signing-cli` as `bundle.windows.signCommand` in `app/tauri.conf.json`, with `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` secrets on the `app-bundle-windows` build step |
-| [SignPath Foundation](https://signpath.org/) | free for qualifying open-source projects, signed through a managed pipeline. Confirm their eligibility rules and whose name the certificate carries before relying on it. | ordinary-certificate behavior | SignPath's own CI integration signs the artifact |
+| [Azure Artifact Signing](https://learn.microsoft.com/en-us/azure/artifact-signing/quickstart) (called Trusted Signing until 2026) | about USD 10 per month, plus an Azure subscription and identity validation. Organizations are limited to a country list Microsoft publishes in the quickstart prerequisites; an individual developer must be in the United States or Canada. Validation takes a few business days. | warnings at first; reputation builds across releases | `trusted-signing-cli` as `bundle.windows.signCommand` in `app/tauri.windows.conf.json`, with `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` secrets on the `app-bundle-windows` build step |
+| [SignPath Foundation](https://signpath.org/) — **chosen** | free. Requires an OSI-approved license with no commercial dual-licensing, no proprietary component, an actively maintained and already released project, multi-factor authentication on every maintainer account, a published code signing policy, and a build on a trusted build system (GitHub-hosted runners qualify). A maintainer approves every signing request. | ordinary-certificate behavior, on a certificate that already carries reputation from several hundred projects | their GitHub Action submits the built installer and returns it signed |
 | Ordinary certificate (DigiCert, Sectigo, GlobalSign) | roughly USD 150–300 per year; the private key must sit on a hardware module or the vendor's cloud signer | same as Azure Artifact Signing | the vendor's CLI as `signCommand` |
 | Extended-validation certificate | roughly USD 400 per year and up, stricter identity checks | same as an ordinary certificate since 2024 | same as an ordinary certificate |
 | Microsoft Store, MSIX package | free; Microsoft re-signs the package | no warning at all | out of reach today: Tauri bundles NSIS and MSI, not MSIX, and a Store submission of an MSI or EXE installer must still be signed by the publisher |
 
-When a provider is chosen: add a `scripts/windows-sign.ps1` that runs the vendor CLI on `%1` and exits 0 with a log line when its secrets are absent (so forks and unsigned builds still bundle), point `bundle.windows.signCommand` at it, and pass the secrets to *Build Windows desktop app bundle* in `release.yml`. Add a verification step (`Get-AuthenticodeSignature` status must be `Valid`) guarded the way the macOS one is guarded by `APPLE_SIGNING_CONFIGURED`, so it runs only when the signing secrets are present and an unsigned fork build still succeeds. The first-run gauntlet's `windows-nsis` leg then proves the installer from a clean Windows runner. Then finish the paperwork the way section 1 does for macOS: update the summary table at the top of this page, and replace the "not signed yet" sentence in `README.md`, `README.es-ES.md`, `README.zh-Hans.md`, and `README.zh-Hant.md`. <!-- drift-ok -->
+Azure Artifact Signing is the fallback if the Foundation declines. It costs money rather than an approval click, and an individual developer must be resident in the United States or Canada, so check that first. A paid certificate from a commercial authority works anywhere but needs a hardware module or the vendor's cloud signer, and would be driven by a `scripts/windows-sign.ps1` wired to `bundle.windows.signCommand` in `app/tauri.windows.conf.json` — that overlay file, not `app/tauri.conf.json`, is where the Windows bundle settings live.
+
+Once the first signed installer ships, finish the paperwork the way section 1 does for macOS: update the summary table at the top of this page, and replace the "not signed yet" sentence in `README.md`, `README.es-ES.md`, `README.zh-Hans.md`, and `README.zh-Hant.md`. <!-- drift-ok -->
 
 ## 3. Related integrity checks already in place
 

@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=9c35d476caf5741fa3ccb413e186705c7aacaf8a9c6621e29c91f7553f2fc3b8 -->
+<!-- README_SYNC: source=README.md sha256=dd88d8c8878e94e03957331568237c1818cfd727b7401a6e82efdb4a8441e35d -->
 
 <p align="center">
   <picture>
@@ -355,6 +355,22 @@ pnpm build:all
 ```
 
 `pnpm dev:all` es el punto de entrada de desarrollo admitido para la aplicación de escritorio. Mantiene los puertos de desarrollo, los datos, la propiedad de los procesos, la identidad de la aplicación, los sockets MCP y el estado de Remote Access separados del runtime de producción instalado; una compilación de depuración iniciada sin ese aislamiento se niega a ejecutarse. Consulta el [AGENTS.md](AGENTS.md) y [CONTRIBUTING.md](CONTRIBUTING.md) de este repositorio, además del [app/AGENTS.md](app/AGENTS.md) dentro del repositorio, para el flujo de trabajo de desarrollo completo. Reportes de seguridad: [SECURITY.md](SECURITY.md). Política de privacidad: [PRIVACY.md](PRIVACY.md). Por favor, lee también el [Código de Conducta](CODE_OF_CONDUCT.md).
+
+---
+
+<a id="code-signing-policy"></a>
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+- **Autores:** [@7xuanlu](https://github.com/7xuanlu), que puede hacer commit en este repositorio sin una revisión adicional.
+- **Revisores:** [@7xuanlu](https://github.com/7xuanlu). Todo cambio de alguien que no sea committer llega como pull request y se revisa antes de fusionarse.
+- **Aprobadores:** [@7xuanlu](https://github.com/7xuanlu), que aprueba cada solicitud de firma y así decide qué versión se firma.
+
+Cada mantenedor usa autenticación multifactor para GitHub y para SignPath. Las versiones se compilan únicamente con el workflow de release por etiqueta de este repositorio, en runners alojados por GitHub, desde el commit al que apunta la etiqueta.
+
+Wenlan no transferirá ninguna información a otros sistemas en red salvo que lo solicite expresamente el usuario o la persona que lo instala u opera. [PRIVACY.md](PRIVACY.md) enumera cada ruta que Wenlan escribe y cada caso en que hace una petición de red. Cómo se firma cada plataforma: [docs/code-signing.md](docs/code-signing.md).
 
 ---
 
