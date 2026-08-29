@@ -586,6 +586,27 @@ fn wenlan_mcp_process_identity(pid: u32, port: u16) -> Option<String> {
     Some(format!("{}\n{}", started.trim(), command.trim()))
 }
 
+/// The exact argument vector `start_remote_access` hands to the cloudflared
+/// sidecar.
+///
+/// This lives in one place, rather than inline at the spawn site, so the
+/// regression test can drive the argv the app really spawns. When the two were
+/// written out independently, deleting `--no-autoupdate` from production left
+/// the test green -- the fix could be removed without anything failing.
+///
+/// Order matters as much as membership. cloudflared accepts `--no-autoupdate`
+/// before `tunnel` as well, but `is_expected_remote_tunnel_command` requires
+/// `tunnel` at index 1, so that placement would break the app's own recognition
+/// of the process it started and leave the tunnel running after a quit.
+fn remote_tunnel_args(port: u16) -> [String; 4] {
+    [
+        "tunnel".to_string(),
+        "--no-autoupdate".to_string(),
+        "--url".to_string(),
+        format!("http://localhost:{port}"),
+    ]
+}
+
 fn is_expected_remote_tunnel_command(command: &str, port: u16) -> bool {
     let args: Vec<_> = command.split_whitespace().collect();
     let Some(executable) = args.first() else {
@@ -1550,9 +1571,17 @@ async fn start_tunnel(
             return Err(format!("cloudflared sidecar not found: {error}"));
         }
     };
-    let (mut tunnel_rx, tunnel_child) = match tunnel_command
-        .args(["tunnel", "--url", &format!("http://localhost:{}", port)])
-        .spawn()
+    // `--no-autoupdate` because cloudflared's default is to check for a new
+    // version every 24 hours and then overwrite its own binary and restart.
+    // Inside an installed Wenlan that binary is a bundled sidecar covered by
+    // the app's code signature, so a self-update would silently replace a
+    // signed file with an unsigned one -- Gatekeeper and Authenticode both
+    // stop trusting it, and on Windows that is exactly what the installer
+    // signature is meant to vouch for. It would also add an undisclosed
+    // periodic request to a Cloudflare update host. Wenlan ships cloudflared
+    // on its own release cadence; upgrading it is a Wenlan release, not
+    // something the sidecar decides for itself.
+    let (mut tunnel_rx, tunnel_child) = match tunnel_command.args(remote_tunnel_args(port)).spawn()
     {
         Ok(child) => child,
         Err(error) => {
@@ -1872,6 +1901,22 @@ mod tests {
         ));
         assert!(is_expected_remote_tunnel_command(
             "/tmp/cloudflared tunnel --url http://localhost:22000",
+            22000,
+        ));
+        // The argv `start_remote_access` actually spawns, taken from the same
+        // builder the spawn site calls rather than written out again here. A
+        // hand-written copy stays green when the production flag is deleted,
+        // which is the whole failure this test exists to catch.
+        let args = remote_tunnel_args(22000);
+        assert_eq!(args[0], "tunnel");
+        assert_eq!(args[1], "--no-autoupdate");
+        assert_eq!(args[2], "--url");
+        assert_eq!(args[3], "http://localhost:22000");
+        // And orphan cleanup still recognizes that argv. If it stops matching,
+        // the app no longer knows the tunnel it started and leaves it running
+        // after a quit, holding an unauthenticated public URL open.
+        assert!(is_expected_remote_tunnel_command(
+            &format!("/tmp/cloudflared-aarch64-apple-darwin {}", args.join(" ")),
             22000,
         ));
         assert!(!is_expected_remote_tunnel_command(
