@@ -370,7 +370,9 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 
 Every maintainer uses multi-factor authentication for GitHub and for SignPath. Releases are built only by the tagged release workflow in this repository, on GitHub-hosted runners, from the commit the tag points at.
 
-Wenlan will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it. [PRIVACY.md](PRIVACY.md) lists every path Wenlan writes and every case in which it makes a network request. How each platform is signed: [docs/code-signing.md](docs/code-signing.md).
+**Privacy policy:** [PRIVACY.md](PRIVACY.md) — what Wenlan stores, where it stores it, and every case in which it reaches the network. How each platform is signed: [docs/code-signing.md](docs/code-signing.md).
+
+The SignPath application is pending. Windows installers are not signed yet.
 
 ---
 

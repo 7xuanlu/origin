@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=8a1c36df2bd07d9e114840e5a17c6860ddad51936a8826d38c694325a85eee82 -->
+<!-- README_SYNC: source=README.md sha256=754c86c6f3fe749574a07a69700db479e34e4f95e2734ee4c61ab87ba0f10aeb -->
 
 <p align="center">
   <picture>
@@ -370,7 +370,9 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 
 Cada mantenedor usa autenticación multifactor para GitHub y para SignPath. Las versiones se compilan únicamente con el workflow de release por etiqueta de este repositorio, en runners alojados por GitHub, desde el commit al que apunta la etiqueta.
 
-Wenlan no transferirá ninguna información a otros sistemas en red salvo que lo solicite expresamente el usuario o la persona que lo instala u opera. [PRIVACY.md](PRIVACY.md) enumera cada ruta que Wenlan escribe y cada caso en que hace una petición de red. Cómo se firma cada plataforma: [docs/code-signing.md](docs/code-signing.md).
+**Política de privacidad:** [PRIVACY.md](PRIVACY.md) — qué guarda Wenlan, dónde lo guarda y cada caso en que accede a la red. Cómo se firma cada plataforma: [docs/code-signing.md](docs/code-signing.md).
+
+La solicitud a SignPath está pendiente. Los instaladores de Windows aún no están firmados.
 
 ---
 
