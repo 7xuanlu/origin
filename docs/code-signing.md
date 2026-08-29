@@ -74,7 +74,7 @@ The provider is chosen: [SignPath Foundation](https://signpath.org/), which sign
 Two consequences of choosing the Foundation tier, both irreversible in practice and worth knowing before applying:
 
 - **The certificate is issued to SignPath Foundation, not to Wenlan.** Their terms say "The code signing certificate is issued to *SignPath Foundation*. This means that *SignPath Foundation* is the publisher of the OSS project." Windows will name SignPath Foundation as the verified publisher. The same certificate already signs several hundred projects, so it carries reputation a new certificate would not.
-- **A human approves every release.** The Foundation requires that "each signing request must be approved by a team member". The Windows job will block on that approval, so a tag release is no longer fully unattended.
+- **A human probably approves every release.** The Foundation's terms require that "each signing request must be approved by a team member", but their platform documentation lists the approval process as *available* for open-source signing rather than *required*, so the software itself permits an unattended policy. Ask during onboarding which applies. If approval stays on, the Windows job blocks until someone clicks approve and a tag release is no longer unattended.
 
 ### Before applying
 
@@ -108,7 +108,7 @@ Every price, country restriction, and SmartScreen behavior below is taken from [
 | Extended-validation certificate | roughly USD 400 per year and up, stricter identity checks | same as an ordinary certificate since 2024 | same as an ordinary certificate |
 | Microsoft Store, MSIX package | free; Microsoft re-signs the package | no warning at all | out of reach today: Tauri bundles NSIS and MSI, not MSIX, and a Store submission of an MSI or EXE installer must still be signed by the publisher |
 
-Azure Artifact Signing is the fallback if the Foundation declines. It costs money rather than an approval click, and an individual developer must be resident in the United States or Canada, so check that first. A paid certificate from a commercial authority works anywhere but needs a hardware module or the vendor's cloud signer, and would be driven by a `scripts/windows-sign.ps1` wired to `bundle.windows.signCommand` in `app/tauri.windows.conf.json` — that overlay file, not `app/tauri.conf.json`, is where the Windows bundle settings live.
+Azure Artifact Signing is the fallback if the Foundation declines. It costs money rather than an approval click, and an individual developer must be resident in the United States or Canada, so check that first. A paid certificate from a commercial authority works anywhere but needs a hardware module or the vendor's cloud signer, and would be driven by a small wrapper script wired to `bundle.windows.signCommand` in `app/tauri.windows.conf.json` — that overlay file, not `app/tauri.conf.json`, is where the Windows bundle settings live.
 
 Once the first signed installer ships, finish the paperwork the way section 1 does for macOS: update the summary table at the top of this page, and replace the "not signed yet" sentence in `README.md`, `README.es-ES.md`, `README.zh-Hans.md`, and `README.zh-Hant.md`. <!-- drift-ok -->
 
