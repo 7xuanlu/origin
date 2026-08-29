@@ -59,7 +59,7 @@ This preview is ad-hoc signed and not notarized, so macOS blocks the first launc
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-On Windows x64, run the `-setup.exe` from the same [Releases](https://github.com/7xuanlu/wenlan/releases/latest) page. It installs the daemon, CLI, and MCP connector along with the runtime libraries they load, so there is nothing else to install. Linux has no desktop build yet; use the headless runtime below.
+On Windows x64, run the `-setup.exe` from the same [Releases](https://github.com/7xuanlu/wenlan/releases/latest) page. It installs the daemon, CLI, and MCP connector along with the runtime libraries they load, so there is nothing else to install. The installer is not signed yet, so SmartScreen says "Windows protected your PC": choose "More info", then "Run anyway". Linux has no desktop build yet; use the headless runtime below.
 
 <a id="claude-code-in-30-seconds"></a>
 

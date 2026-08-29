@@ -5,11 +5,11 @@ What ships today, and what it takes to make the installers trusted by the OS.
 | Artifact | Today | What the OS shows | Fix |
 | --- | --- | --- | --- |
 | `Wenlan_<ver>_aarch64.dmg`, `Wenlan_aarch64.app.tar.gz` | ad-hoc signed (`"signingIdentity": "-"` in `app/tauri.conf.json`; `APPLE_SIGNING_IDENTITY` falls back to `-` in `release.yml`), not notarized | Gatekeeper: "Wenlan cannot be opened" (first-run gauntlet finding F11, `spctl --assess` → `rejected`) | Developer ID certificate + notarization, section 1 |
-| `Wenlan_<ver>_x64-setup.exe` | unsigned | SmartScreen: "Windows protected your PC", unknown publisher | Authenticode certificate or Azure Trusted Signing, section 2 |
+| `Wenlan_<ver>_x64-setup.exe` | unsigned; the READMEs walk the user through the warning | SmartScreen: "Windows protected your PC", unknown publisher | Authenticode certificate or Azure Artifact Signing, section 2 |
 | `*.sig` next to the app bundles | signed with the Tauri updater key (`TAURI_SIGNING_PRIVATE_KEY`) | nothing; this is what the in-app updater verifies | already done; unrelated to Gatekeeper and SmartScreen |
 | CLI tarballs, `wenlan-windows-x64.zip` | unsigned; `install.sh` strips quarantine and verifies `SHA256SUMS` | none for a terminal install | not needed for launch |
 
-The Tauri updater signature protects updates after the first install. Gatekeeper and SmartScreen judge the first install, and only an OS-trusted certificate satisfies them.
+The Tauri updater signature protects updates after the first install. Gatekeeper and SmartScreen judge the first install. A Developer ID certificate plus notarization satisfies Gatekeeper outright; SmartScreen also weighs how often an installer has been downloaded, so a certificate quiets it only as downloads accumulate.
 
 ## 1. macOS: Developer ID and notarization
 
@@ -59,15 +59,18 @@ The workflow is already wired: once the secrets below exist, the next release is
 - Tauri notarizes and staples the `.app` only; the DMG is Developer ID signed but never notarized or stapled itself. The gauntlet's `dmg-gatekeeper` check runs `spctl -a -t exec` on the mounted `.app`, not the DMG file, so it flips to accepted once the app is notarized and stapled and says nothing about the DMG itself. If users report macOS blocking the DMG on open, notarize the DMG too with the `notarytool submit … --wait` and `stapler staple` step already described.
 - Developer ID signing without notarization still fails Gatekeeper, so set all six secrets together.
 
-## 2. Windows: Authenticode or Azure Trusted Signing
+## 2. Windows: Authenticode or Azure Artifact Signing
 
 Not wired yet; pick a provider first. Since 2023 code-signing private keys must live in hardware, so CI signs through a cloud signer rather than a `.pfx` file in a secret.
 
+Signing no longer buys a quiet first install. Microsoft stopped granting extended-validation certificates an automatic SmartScreen reputation boost in March 2024, so ordinary and extended-validation certificates now earn reputation the same way: by download volume. The pricier tier buys stricter validation of who you are, not a warning-free download. Until a release accumulates downloads the READMEs tell Windows users to choose "More info" and then "Run anyway", which is what an unsigned installer needs too.
+
 | Option | Cost and prerequisites | SmartScreen | How it plugs into the build |
 | --- | --- | --- | --- |
-| Azure Trusted Signing | about USD 10 per month; an Azure subscription and identity validation (individual or organization); not offered in every country | reputation from the first signed release | `trusted-signing-cli` as `bundle.windows.signCommand` in `app/tauri.conf.json`, with `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` secrets on the `app-bundle-windows` build step |
-| OV certificate (Sectigo, DigiCert, SSL.com) | roughly USD 200–400 per year plus a cloud-signing service such as SSL.com eSigner or DigiCert KeyLocker | warning persists until download reputation builds | the vendor's CLI as `signCommand` |
-| EV certificate | roughly USD 300–700 per year, stricter validation | immediate reputation | same as OV |
+| Azure Artifact Signing (called Trusted Signing until 2026) | about USD 10 per month, plus an Azure subscription and identity validation. Public-trust certificates go to organizations in the United States, Canada, the European Union, the United Kingdom, Australia, New Zealand, Japan, South Korea, Singapore, Switzerland, Norway, and Israel. An individual developer must be in the United States or Canada, and the Azure billing account must have account type "Individual". Validation takes 1 to 20 business days. | reputation builds from the first signed release | `trusted-signing-cli` as `bundle.windows.signCommand` in `app/tauri.conf.json`, with `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` secrets on the `app-bundle-windows` build step |
+| SignPath Foundation | free for open-source projects; SignPath checks that the binary was built from the public repository and keeps the key in its own hardware module | same as any ordinary certificate | SignPath's CI integration signs the artifact, but under SignPath Foundation's certificate, so Windows names SignPath Foundation as the publisher rather than Wenlan |
+| Ordinary certificate (Sectigo, Certum, SSL.com, DigiCert) | roughly USD 110–400 per year, plus a cloud signing service such as SSL.com eSigner or DigiCert KeyLocker | warning persists until download reputation builds | the vendor's CLI as `signCommand` |
+| Extended-validation certificate | roughly USD 300–700 per year, stricter validation | same as an ordinary certificate since March 2024 | same as an ordinary certificate |
 
 Prices are approximate; check the vendor page before buying.
 

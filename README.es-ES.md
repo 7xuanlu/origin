@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=a0a769a739c5e46353dc5a2c480ce641cc39512b6a517dc976aa174aa35d6c3d -->
+<!-- README_SYNC: source=README.md sha256=9c35d476caf5741fa3ccb413e186705c7aacaf8a9c6621e29c91f7553f2fc3b8 -->
 
 <p align="center">
   <picture>
@@ -61,7 +61,7 @@ Esta vista previa está firmada ad hoc y no notarizada, así que macOS bloquea e
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-En Windows x64, ejecuta el `-setup.exe` de la misma página de [Releases](https://github.com/7xuanlu/wenlan/releases/latest). Instala el daemon, la CLI y el conector MCP junto con las bibliotecas que necesitan en tiempo de ejecución, así que no hay nada más que instalar. Linux todavía no tiene versión de escritorio; usa el entorno de ejecución sin interfaz de abajo.
+En Windows x64, ejecuta el `-setup.exe` de la misma página de [Releases](https://github.com/7xuanlu/wenlan/releases/latest). Instala el daemon, la CLI y el conector MCP junto con las bibliotecas que necesitan en tiempo de ejecución, así que no hay nada más que instalar. El instalador todavía no está firmado, así que SmartScreen muestra «Windows protegió su PC»: elige «Más información» y luego «Ejecutar de todas formas». Linux todavía no tiene versión de escritorio; usa el entorno de ejecución sin interfaz de abajo.
 
 <a id="claude-code-in-30-seconds"></a>
 

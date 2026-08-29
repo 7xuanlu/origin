@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=a0a769a739c5e46353dc5a2c480ce641cc39512b6a517dc976aa174aa35d6c3d -->
+<!-- README_SYNC: source=README.md sha256=9c35d476caf5741fa3ccb413e186705c7aacaf8a9c6621e29c91f7553f2fc3b8 -->
 
 <p align="center">
   <picture>
@@ -61,7 +61,7 @@ Wenlan 以單一本地 daemon 運行。桌面 app 內建這個 daemon；無 GUI 
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
 ```
 
-Windows x64 請在同一個 [Releases](https://github.com/7xuanlu/wenlan/releases/latest) 頁面下載 `-setup.exe` 並執行。安裝包內含 daemon、CLI 與 MCP 連接器，以及它們執行時要載入的函式庫，不需要再裝別的東西。Linux 暫時沒有桌面版，請使用下面的無 GUI runtime。
+Windows x64 請在同一個 [Releases](https://github.com/7xuanlu/wenlan/releases/latest) 頁面下載 `-setup.exe` 並執行。安裝包內含 daemon、CLI 與 MCP 連接器，以及它們執行時要載入的函式庫，不需要再裝別的東西。安裝包尚未簽署，SmartScreen 會顯示「Windows 已保護您的電腦」：點選「其他資訊」，再點「仍要執行」。Linux 暫時沒有桌面版，請使用下面的無 GUI runtime。
 
 <a id="claude-code-in-30-seconds"></a>
 
