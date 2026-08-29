@@ -50,11 +50,22 @@ trap cleanup EXIT
 # ── Part A: the .dmg a user downloads from the Releases page ─────────────────
 DMG="Wenlan_${VERSION}_aarch64.dmg"
 check dmg-download -- curl -fsSL --retry 3 -o "$DL/$DMG" "https://github.com/7xuanlu/wenlan/releases/download/$TAG/$DMG"
+# A browser stamps com.apple.quarantine on everything it downloads and curl
+# stamps nothing, and that attribute is the only reason Gatekeeper is consulted
+# on a first launch. Set it by hand so the assessments below see what a user
+# who downloaded from the Releases page sees, not the quieter path curl takes.
+check dmg-quarantine-applied -- xattr -w com.apple.quarantine "0083;00000000;Safari;" "$DL/$DMG"
+check dmg-stapled -- xcrun stapler validate "$DL/$DMG"
+check_output dmg-gatekeeper "accepted" -- spctl -a -t open --context context:primary-signature -vv "$DL/$DMG"
 check dmg-attach -- hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT" "$DL/$DMG"
 check dmg-has-app -- test -d "$MOUNT/Wenlan.app"
 check_output dmg-bundle-version "$VERSION" -- plutil -extract CFBundleShortVersionString raw "$MOUNT/Wenlan.app/Contents/Info.plist"
-info dmg-codesign "$(codesign -dv --verbose=2 "$MOUNT/Wenlan.app" 2>&1 || true)"
-info dmg-gatekeeper "$(spctl -a -t exec -vv "$MOUNT/Wenlan.app" 2>&1 || true)"
+check_output dmg-developer-id "Authority=Developer ID Application" -- codesign -dv --verbose=2 "$MOUNT/Wenlan.app"
+check dmg-codesign-valid -- codesign --verify --deep --strict "$MOUNT/Wenlan.app"
+# "Notarized Developer ID" is the only source string that means a first launch
+# opens with no dialog at all. A signed-but-unnotarized bundle is rejected here,
+# and an ad-hoc signed one is rejected without any source line.
+check_output app-gatekeeper "source=Notarized Developer ID" -- spctl -a -t exec -vv "$MOUNT/Wenlan.app"
 check dmg-detach -- hdiutil detach "$MOUNT"
 
 # ── Part B: the README one-liner, launching the app ──────────────────────────

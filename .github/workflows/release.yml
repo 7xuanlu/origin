@@ -440,7 +440,10 @@ jobs:
     name: Build macOS desktop app bundle
     needs: [resolve-promotion, bind-release-tag]
     runs-on: macos-14
-    timeout-minutes: 90
+    # Notarization now waits on Apple's queue twice, once for the .app and once
+    # for the .dmg, and a submission can sit In Progress for a quarter of an
+    # hour with nothing wrong.
+    timeout-minutes: 120
     permissions:
       contents: read
     outputs:
@@ -585,6 +588,31 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --target aarch64-apple-darwin
 
+      # Tauri notarizes and staples the .app but only signs the .dmg
+      # (tauri-bundler crates/tauri-bundler/src/bundle/macos/dmg/mod.rs). The
+      # .dmg is what a browser download hands a new user, and a browser stamps
+      # it com.apple.quarantine, so Gatekeeper assesses the disk image itself
+      # on the first double-click. Notarize it here and staple the ticket so
+      # that assessment succeeds without a network round trip.
+      - name: Notarize and staple the DMG
+        if: env.APPLE_SIGNING_CONFIGURED == 'true' && env.APPLE_ID != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_dir="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle"
+          dmg="$(find "$bundle_dir/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          [[ -n "$dmg" && -f "$dmg" ]] || { echo "ERROR: no .dmg found under $bundle_dir/dmg." >&2; exit 1; }
+          set +e
+          out="$(xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" --wait --timeout 30m 2>&1)"
+          rc=$?
+          set -e
+          echo "$out"
+          [[ "$rc" -eq 0 ]] || { echo "ERROR: notarytool exited $rc for the DMG." >&2; exit 1; }
+          grep -q 'status: Accepted' <<<"$out" || { echo "ERROR: DMG notarization was not Accepted." >&2; exit 1; }
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+
       - name: Verify Apple signature and notarization
         shell: bash
         run: |
@@ -602,6 +630,10 @@ jobs:
           if [[ -n "${APPLE_ID:-}" ]]; then
             spctl --assess --type execute --verbose=2 "$app"
             xcrun stapler validate "$app"
+            dmg="$(find "$bundle_dir/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+            [[ -n "$dmg" && -f "$dmg" ]] || { echo "ERROR: no .dmg found under $bundle_dir/dmg." >&2; exit 1; }
+            xcrun stapler validate "$dmg"
+            spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
           else
             echo "Notarization not configured (APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID); the app is Developer ID signed but Gatekeeper still blocks the first launch. See docs/code-signing.md."
           fi
