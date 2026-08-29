@@ -588,6 +588,24 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --target aarch64-apple-darwin
 
+      # Tauri submits the .app to the notary service from inside `tauri build`
+      # and reports only that notarization failed, never Apple's reasons. That
+      # submission is invisible from here otherwise, so on a failed build read
+      # the queue back and print the log Apple keeps for each entry.
+      - name: Read Apple's notarization verdicts after a failed build
+        if: failure() && env.APPLE_SIGNING_CONFIGURED == 'true' && env.APPLE_ID != ''
+        shell: bash
+        run: |
+          set -uo pipefail
+          history="$(xcrun notarytool history --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" 2>&1)"
+          echo "$history"
+          for id in $(sed -n 's/^ *id: \([0-9a-f-]*\)$/\1/p' <<<"$history" | head -3); do
+            echo "--- notarytool log for $id ---"
+            xcrun notarytool log "$id" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" 2>&1 | head -120
+          done
+
       # Tauri notarizes and staples the .app but only signs the .dmg
       # (tauri-bundler crates/tauri-bundler/src/bundle/macos/dmg/mod.rs). The
       # .dmg is what a browser download hands a new user, and a browser stamps
@@ -608,6 +626,16 @@ jobs:
           rc=$?
           set -e
           echo "$out"
+          # --wait prints a verdict but never a cause. Apple keeps the reasons
+          # in the per-submission log alone, so read it on every verdict: a
+          # rejected release then explains itself here instead of costing
+          # another hour-long build to diagnose.
+          sub_id="$(sed -n 's/^ *id: \([0-9a-f-]*\)$/\1/p' <<<"$out" | head -1)"
+          if [[ -n "$sub_id" ]]; then
+            echo "--- notarytool log for $sub_id ---"
+            xcrun notarytool log "$sub_id" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" 2>&1 | head -200 || true
+          fi
           [[ "$rc" -eq 0 ]] || { echo "ERROR: notarytool exited $rc for the DMG." >&2; exit 1; }
           grep -q 'status: Accepted' <<<"$out" || { echo "ERROR: DMG notarization was not Accepted." >&2; exit 1; }
           xcrun stapler staple "$dmg"
