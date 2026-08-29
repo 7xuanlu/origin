@@ -451,7 +451,10 @@ def contract_violations(
         "update-homebrew": 20,
         "docker-manifest": 10,
         "finalize-release": 10,
-        "app-bundle": 90,
+        # Raised from 90 when the DMG gained its own notarization submission:
+        # the job now waits on Apple's queue twice, and a single submission has
+        # been observed sitting In Progress for over 40 minutes.
+        "app-bundle": 120,
         "app-bundle-windows": 120,
     }.items():
         if not re.search(
