@@ -383,6 +383,8 @@ pub struct LlmEngine {
     pub(crate) model: LlamaCppModel,
     pub(crate) prompts: crate::prompts::PromptRegistry,
     backend_plan: InferenceBackendPlan,
+    /// See [`crate::on_device_models::OnDeviceModel::thinking_mode`].
+    thinking_mode: bool,
 }
 
 // SAFETY: LlamaCppModel and LlamaBackend are created once on the init thread
@@ -484,6 +486,7 @@ impl LlmEngine {
             model,
             prompts,
             backend_plan,
+            thinking_mode: false,
         })
     }
 
@@ -505,6 +508,22 @@ impl LlmEngine {
     /// Backward-compatible Metal-specific probe retained for existing callers.
     pub fn probe_metal_context(&self) -> bool {
         self.probe_context().is_ok()
+    }
+
+    /// Set whether prompts open with an empty think block. Off by default;
+    /// the provider sets it from the model registry.
+    pub fn with_thinking_mode(mut self, on: bool) -> Self {
+        self.thinking_mode = on;
+        self
+    }
+
+    pub fn thinking_mode(&self) -> bool {
+        self.thinking_mode
+    }
+
+    /// The ChatML prompt this engine sends for a system/user pair.
+    pub fn format_prompt(&self, system_prompt: Option<&str>, prompt: &str) -> String {
+        format_chatml_prompt(system_prompt, prompt, self.thinking_mode)
     }
 
     pub(crate) fn inference_backend_plan(&self) -> &InferenceBackendPlan {
@@ -530,6 +549,7 @@ impl LlmEngine {
             model,
             prompts,
             backend_plan: plan,
+            thinking_mode: false,
         })
     }
 
@@ -791,6 +811,7 @@ impl LlmEngine {
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut output = String::new();
         let mut n_cur = batch.n_tokens();
+        let batch_len_start = n_cur;
         let max_pos = n_cur + max_output_tokens;
         let mut failed = false;
 
@@ -852,6 +873,16 @@ impl LlmEngine {
                 start.elapsed()
             );
             if trimmed.is_empty() {
+                // Diagnostic: the caller only sees "inference returned no
+                // output"; show what the model actually emitted so a
+                // thinking-mode leak or an immediate stop is visible in the log.
+                log::warn!(
+                    "[llm_engine] persistent inference{} produced no usable text; raw ({} chars, {} tokens): {:?}",
+                    label_suffix,
+                    output.len(),
+                    n_cur - batch_len_start,
+                    output.chars().take(400).collect::<String>()
+                );
                 None
             } else {
                 Some(trimmed)
@@ -873,7 +904,7 @@ impl LlmEngine {
 
     /// Count tokens for the formatted ChatML prompt used by the provider path.
     pub fn count_prompt_tokens(&self, system_prompt: Option<&str>, prompt: &str) -> usize {
-        let formatted = format_chatml_prompt(system_prompt, prompt);
+        let formatted = self.format_prompt(system_prompt, prompt);
         self.model
             .str_to_token(&formatted, AddBos::Always)
             .map(|t| t.len())
