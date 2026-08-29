@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=8a1c36df2bd07d9e114840e5a17c6860ddad51936a8826d38c694325a85eee82 -->
+<!-- README_SYNC: source=README.md sha256=754c86c6f3fe749574a07a69700db479e34e4f95e2734ee4c61ab87ba0f10aeb -->
 
 <p align="center">
   <picture>
@@ -372,7 +372,9 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 
 每位 maintainer 在 GitHub 与 SignPath 上都启用了多因素认证。Release 只由本 repository 的 tag release workflow 构建，运行在 GitHub 托管的 runner 上，来源是该 tag 指向的 commit。
 
-除非用户，或安装、运行 Wenlan 的人明确要求，Wenlan 不会将任何信息传输到其他联网系统。[PRIVACY.md](PRIVACY.md) 列出了 Wenlan 写入的每一个路径，以及它发起网络请求的每一种情况。各平台的签名方式见 [docs/code-signing.md](docs/code-signing.md)。
+**隐私政策：**[PRIVACY.md](PRIVACY.md) —— Wenlan 保存什么、保存在哪里，以及它访问网络的每一种情况。各平台的签名方式见 [docs/code-signing.md](docs/code-signing.md)。
+
+SignPath 的申请正在审核中，Windows 安装包尚未签名。
 
 ---
 
