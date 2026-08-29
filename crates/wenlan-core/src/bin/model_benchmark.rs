@@ -401,7 +401,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Size: {:.2} GB", model_size as f64 / 1e9);
 
     let prompts = PromptRegistry::default();
-    let engine = LlmEngine::new(&model_path, prompts.clone())?;
+    let engine = LlmEngine::new(&model_path, prompts.clone())?.with_thinking_mode(
+        wenlan_core::on_device_models::thinking_mode_for_model_file(&model_path),
+    );
     println!("Model loaded.\n");
 
     let mut all_results = vec![];

@@ -5,6 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import type { MemoryItem, PageCitation } from "../../../lib/tauri";
 import CitationChip from "./CitationChip";
+import { citationFilePath } from "./CitationPopover";
 
 const cite = (over: Partial<PageCitation> = {}): PageCitation => ({
   occurrence: 1,
@@ -164,9 +165,35 @@ describe("CitationChip", () => {
     expect(vi.mocked(shellOpen)).toHaveBeenCalledWith("/notes/design.md");
   });
 
+  it("shows only the path of a document citation whose locator carries the source id", async () => {
+    const user = userEvent.setup();
+    renderChip({
+      citation: cite({
+        source_kind: "external_file",
+        locator: "directory-notes::/Users/me/Tally/notes/architecture-notes.md",
+      }),
+      sourceMemory: null,
+    });
+    fireEvent.focus(screen.getByRole("button", { name: /architecture-notes\.md/ }));
+    expect(screen.getByText("/Users/me/Tally/notes/architecture-notes.md")).toBeInTheDocument();
+    expect(screen.queryByText(/directory-notes::/)).toBeNull();
+    await user.click(screen.getByRole("button", { name: /Open file/ }));
+    expect(vi.mocked(shellOpen)).toHaveBeenCalledWith("/Users/me/Tally/notes/architecture-notes.md");
+  });
+
   it("explains that authored content survives re-distillation", () => {
     renderChip({ citation: cite({ source_kind: "authored" }), sourceMemory: null });
     fireEvent.focus(screen.getByRole("button", { name: /authored/ }));
     expect(screen.getByText(/kept unchanged when the page is re-distilled/i)).toBeInTheDocument();
+  });
+});
+
+
+describe("citationFilePath", () => {
+  it("strips a document source id prefix and leaves plain locators alone", () => {
+    expect(citationFilePath("directory-notes::/Users/me/notes/a.md")).toBe("/Users/me/notes/a.md");
+    expect(citationFilePath("obsidian-vault::C:\\Users\\me\\vault\\a.md")).toBe("C:\\Users\\me\\vault\\a.md");
+    expect(citationFilePath("/notes/design.md")).toBe("/notes/design.md");
+    expect(citationFilePath("https://docs.rs/serde")).toBe("https://docs.rs/serde");
   });
 });

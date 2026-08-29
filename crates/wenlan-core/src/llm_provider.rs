@@ -172,20 +172,33 @@ pub(crate) fn hf_snapshot_model_version(repo_id: &str, model_path: &Path) -> Opt
 
 /// Wrap a user/system prompt pair in the Qwen ChatML template.
 ///
-/// The empty `<think></think>` block disables thinking mode for Qwen3.5
-/// (which defaults to thinking-on). Without it, all output tokens go to
-/// reasoning and `strip_think_tags` removes them, leaving empty output.
-/// Harmless for Qwen3 (which has no thinking mode).
-pub(crate) fn format_chatml_prompt(system: Option<&str>, user: &str) -> String {
+/// `thinking_mode` is true for models that default to thinking-on (Qwen3.5):
+/// the assistant turn then opens with an empty `<think></think>` block so no
+/// output tokens go to reasoning (`strip_think_tags` would otherwise remove
+/// them all). Models without a thinking mode (Qwen3-4B-Instruct-2507) must
+/// not get that block: they read it as an answer that already ended and, at
+/// the title job's sampling temperature, stop before the first word (greedy
+/// decoding still answers). Callers outside this module go through
+/// [`crate::engine::LlmEngine::format_prompt`], which knows its model.
+pub(crate) fn format_chatml_prompt(
+    system: Option<&str>,
+    user: &str,
+    thinking_mode: bool,
+) -> String {
+    let prefill = if thinking_mode {
+        "<think>\n\n</think>\n\n"
+    } else {
+        ""
+    };
     match system {
         Some(sys) => format!(
             "<|im_start|>system\n{sys}\n<|im_end|>\n\
              <|im_start|>user\n{user}\n<|im_end|>\n\
-             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+             <|im_start|>assistant\n{prefill}"
         ),
         None => format!(
             "<|im_start|>user\n{user}\n<|im_end|>\n\
-             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+             <|im_start|>assistant\n{prefill}"
         ),
     }
 }
@@ -374,7 +387,8 @@ impl OnDeviceProvider {
         #[cfg(target_os = "macos")]
         std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
 
-        let engine = LlmEngine::new(&model_path, prompts.clone())?;
+        let engine = LlmEngine::new(&model_path, prompts.clone())?
+            .with_thinking_mode(model_spec.thinking_mode);
         let backend_plan = engine.inference_backend_plan().clone();
         log::info!(
             "[on_device_provider] selected inference backend: {}",
@@ -406,7 +420,8 @@ impl OnDeviceProvider {
                 drop(engine);
                 // Sleep to let autorelease pool fully drain queues from the dropped engine.
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                let fallback = LlmEngine::new(&model_path, prompts)?;
+                let fallback = LlmEngine::new(&model_path, prompts)?
+                    .with_thinking_mode(model_spec.thinking_mode);
                 if !Self::probe_metal_with_retries(&fallback, "BF16-disabled") {
                     log::error!(
                         "[on_device_provider] Metal context still fails with BF16 disabled \
@@ -428,7 +443,8 @@ impl OnDeviceProvider {
                 if backend_plan.supports_cpu_fallback() {
                     log::warn!("[on_device_provider] {message}; reloading the model on CPU");
                     drop(engine);
-                    let fallback = LlmEngine::reload_on_cpu(&model_path, prompts, message.clone())?;
+                    let fallback = LlmEngine::reload_on_cpu(&model_path, prompts, message.clone())?
+                        .with_thinking_mode(model_spec.thinking_mode);
                     fallback.probe_context().map_err(|cpu_cause| {
                         crate::error::WenlanError::Llm(format!(
                             "{message}; CPU fallback context creation failed: {cpu_cause}"
@@ -653,7 +669,7 @@ impl OnDeviceProvider {
                             let batch_n_seqs = batch_reqs.len();
                             let req = batch_reqs.pop().expect("batch has at least 1 req");
                             let full_prompt =
-                                format_chatml_prompt(req.system_prompt.as_deref(), &req.prompt);
+                                engine.format_prompt(req.system_prompt.as_deref(), &req.prompt);
                             let (timeout_secs, strip_think) = match req.timeout_secs {
                                 Some(secs) => (secs, false),
                                 None => (30, true),
@@ -729,10 +745,8 @@ impl OnDeviceProvider {
                             batch_reqs
                                 .iter()
                                 .map(|req| {
-                                    let prompt = format_chatml_prompt(
-                                        req.system_prompt.as_deref(),
-                                        &req.prompt,
-                                    );
+                                    let prompt = engine
+                                        .format_prompt(req.system_prompt.as_deref(), &req.prompt);
                                     let (timeout_secs, strip_think) = match req.timeout_secs {
                                         Some(secs) => (secs, false),
                                         None => (30, true),
@@ -1696,18 +1710,28 @@ mod tests {
 
     #[test]
     fn test_format_chatml_prompt_with_system() {
-        let p = format_chatml_prompt(Some("you are helpful"), "hi");
+        let p = format_chatml_prompt(Some("you are helpful"), "hi", true);
         assert!(p.contains("<|im_start|>system\nyou are helpful\n<|im_end|>"));
         assert!(p.contains("<|im_start|>user\nhi\n<|im_end|>"));
-        assert!(p.contains("<|im_start|>assistant\n<think>"));
+        assert!(p.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     }
 
     #[test]
     fn test_format_chatml_prompt_no_system() {
-        let p = format_chatml_prompt(None, "hello world");
+        let p = format_chatml_prompt(None, "hello world", true);
         assert!(!p.contains("<|im_start|>system"));
         assert!(p.contains("<|im_start|>user\nhello world\n<|im_end|>"));
-        assert!(p.contains("<|im_start|>assistant\n<think>"));
+        assert!(p.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn test_format_chatml_prompt_without_thinking_mode_has_no_think_block() {
+        let p = format_chatml_prompt(Some("you are helpful"), "hi", false);
+        assert!(!p.contains("<think>"));
+        assert!(p.ends_with("<|im_start|>assistant\n"));
+        let p = format_chatml_prompt(None, "hi", false);
+        assert!(!p.contains("<think>"));
+        assert!(p.ends_with("<|im_start|>assistant\n"));
     }
 
     #[test]
