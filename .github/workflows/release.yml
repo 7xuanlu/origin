@@ -556,6 +556,14 @@ jobs:
             done
           fi
 
+          # Every secret is checked, but only the three signing ones are exported.
+          # Apple asks that a nested layout be notarized once, at the outermost
+          # container, and tauri-bundler submits the .app on its own the moment
+          # it can see APPLE_ID, APPLE_PASSWORD and APPLE_TEAM_ID in the
+          # environment (macos/app.rs notarize_auth). Withholding those three is
+          # what makes `tauri build` sign the app and stop; the disk image is
+          # then the only thing submitted. The steps that do talk to the notary
+          # service take the three from `secrets` directly.
           for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
             var="SECRET_${name}"
             value="${!var:-}"
@@ -566,14 +574,19 @@ jobs:
               echo "ERROR: secret $name contains a line break." >&2
               exit 1
             fi
+            case "$name" in
+              APPLE_ID | APPLE_PASSWORD | APPLE_TEAM_ID) continue ;;
+            esac
             if [[ -n "$value" ]]; then
               printf '%s=%s\n' "$name" "$value" >> "$GITHUB_ENV"
             fi
           done
 
           if [[ "$notarization_set" -eq 3 ]]; then
+            echo "APPLE_NOTARIZATION_CONFIGURED=true" >> "$GITHUB_ENV"
             echo "Developer ID signing + notarization"
           else
+            echo "APPLE_NOTARIZATION_CONFIGURED=false" >> "$GITHUB_ENV"
             echo "Developer ID signing without notarization"
           fi
 
@@ -588,13 +601,16 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --target aarch64-apple-darwin
 
-      # Tauri submits the .app to the notary service from inside `tauri build`
-      # and reports only that notarization failed, never Apple's reasons. That
-      # submission is invisible from here otherwise, so on a failed build read
-      # the queue back and print the log Apple keeps for each entry.
+      # A failed build says nothing about the notary service. Read the queue
+      # back so a rejection explains itself here rather than costing another
+      # hour-long run.
       - name: Read Apple's notarization verdicts after a failed build
-        if: failure() && env.APPLE_SIGNING_CONFIGURED == 'true' && env.APPLE_ID != ''
+        if: failure() && env.APPLE_NOTARIZATION_CONFIGURED == 'true'
         shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -uo pipefail
           history="$(xcrun notarytool history --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
@@ -606,15 +622,20 @@ jobs:
               --team-id "$APPLE_TEAM_ID" 2>&1 | head -120
           done
 
-      # Tauri notarizes and staples the .app but only signs the .dmg
-      # (tauri-bundler crates/tauri-bundler/src/bundle/macos/dmg/mod.rs). The
-      # .dmg is what a browser download hands a new user, and a browser stamps
-      # it com.apple.quarantine, so Gatekeeper assesses the disk image itself
-      # on the first double-click. Notarize it here and staple the ticket so
-      # that assessment succeeds without a network round trip.
+      # Apple: "if you have an app inside an installer package on a disk image,
+      # sign the app, sign the installer package, and sign the disk image, but
+      # only notarize the disk image." The disk image is what a browser download
+      # hands a new user, quarantine attribute and all, so it is also the thing
+      # Gatekeeper assesses on the first double-click. One submission covers the
+      # app nested inside it, and the ticket is stapled so that assessment needs
+      # no network round trip.
       - name: Notarize and staple the DMG
-        if: env.APPLE_SIGNING_CONFIGURED == 'true' && env.APPLE_ID != ''
+        if: env.APPLE_NOTARIZATION_CONFIGURED == 'true'
         shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           bundle_dir="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle"
@@ -641,6 +662,56 @@ jobs:
           xcrun stapler staple "$dmg"
           xcrun stapler validate "$dmg"
 
+      # A .tar.gz cannot hold a stapled ticket, so Apple's rule for archives is
+      # to staple each item you put inside one instead. The updater unpacks this
+      # archive and swaps the app into place, so that app needs a ticket of its
+      # own. The disk-image submission above already covers it: a ticket is a
+      # list of code directory hashes, and the app inside that image is this
+      # same app, so stapling here is a lookup rather than a second submission.
+      # Tauri built the archive before any ticket existed, hence the rebuild.
+      # Re-signing goes through the same helper the bundler itself uses
+      # (tauri-cli signer/sign.rs calls sign_file), so the updater sees exactly
+      # the signature format it expects.
+      - name: Staple the app and rebuild the updater archive
+        if: env.APPLE_NOTARIZATION_CONFIGURED == 'true'
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          bundle_dir="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle"
+          app="$(find "$bundle_dir/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          [[ -n "$app" && -d "$app" ]] || { echo "ERROR: no .app bundle found under $bundle_dir/macos." >&2; exit 1; }
+          archive="$app.tar.gz"
+          [[ -f "$archive" ]] || { echo "ERROR: $archive is missing; the updater bundle did not build." >&2; exit 1; }
+          [[ -s "$archive.sig" ]] || { echo "ERROR: $archive.sig is missing; Tauri did not sign the updater archive." >&2; exit 1; }
+          before_sig="$(cat "$archive.sig")"
+
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+
+          # --no-mac-metadata keeps the AppleDouble "._*" entries out, matching
+          # what the bundler's own tar writer produces today.
+          rm -f "$archive" "$archive.sig"
+          tar --no-mac-metadata -C "$(dirname "$app")" -czf "$archive" "$(basename "$app")"
+          pnpm tauri signer sign "$archive"
+          [[ -s "$archive.sig" ]] || { echo "ERROR: re-signing produced no $archive.sig." >&2; exit 1; }
+          [[ "$(cat "$archive.sig")" != "$before_sig" ]] || { echo "ERROR: $archive.sig is unchanged; the rebuild did not take." >&2; exit 1; }
+
+          # Unpack what the updater will unpack, and assert the app it finds is
+          # the stapled one. A silently broken updater archive is the worst
+          # failure this job could ship, so it fails here instead.
+          unpacked="$RUNNER_TEMP/updater-archive-check"
+          rm -rf "$unpacked"
+          mkdir -p "$unpacked"
+          tar -C "$unpacked" -xzf "$archive"
+          unpacked_app="$(find "$unpacked" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          [[ -n "$unpacked_app" && -d "$unpacked_app" ]] || { echo "ERROR: the rebuilt archive has no .app at its root." >&2; exit 1; }
+          codesign --verify --deep --strict "$unpacked_app"
+          xcrun stapler validate "$unpacked_app"
+          rm -rf "$unpacked"
+
       - name: Verify Apple signature and notarization
         shell: bash
         run: |
@@ -655,13 +726,33 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$app"
           sign_info="$(codesign -dv --verbose=2 "$app" 2>&1)"
           grep -q 'Authority=Developer ID Application' <<<"$sign_info" || { echo "ERROR: app is not signed with a Developer ID Application certificate." >&2; exit 1; }
-          if [[ -n "${APPLE_ID:-}" ]]; then
+          if [[ "${APPLE_NOTARIZATION_CONFIGURED:-false}" == "true" ]]; then
             spctl --assess --type execute --verbose=2 "$app"
             xcrun stapler validate "$app"
             dmg="$(find "$bundle_dir/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
             [[ -n "$dmg" && -f "$dmg" ]] || { echo "ERROR: no .dmg found under $bundle_dir/dmg." >&2; exit 1; }
             xcrun stapler validate "$dmg"
             spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+            # The app the user drags out of the disk image is a copy made before
+            # the ticket existed, so it carries no ticket of its own and
+            # Gatekeeper resolves it against Apple instead. Assert that the
+            # image really does hold a notarized app rather than assuming it.
+            mount="$RUNNER_TEMP/dmg-assess"
+            rm -rf "$mount"
+            hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg"
+            mounted_app="$(find "$mount" -maxdepth 1 -type d -name '*.app' -print -quit)"
+            if [[ -z "$mounted_app" || ! -d "$mounted_app" ]]; then
+              hdiutil detach "$mount" || true
+              echo "ERROR: no .app inside $dmg." >&2
+              exit 1
+            fi
+            assess="$(spctl --assess --type exec --verbose=2 "$mounted_app" 2>&1)" || {
+              echo "$assess"; hdiutil detach "$mount" || true
+              echo "ERROR: Gatekeeper rejected the app inside the disk image." >&2; exit 1; }
+            echo "$assess"
+            hdiutil detach "$mount"
+            grep -q 'source=Notarized Developer ID' <<<"$assess" || {
+              echo "ERROR: the app inside the disk image is not seen as notarized." >&2; exit 1; }
           else
             echo "Notarization not configured (APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID); the app is Developer ID signed but Gatekeeper still blocks the first launch. See docs/code-signing.md."
           fi
