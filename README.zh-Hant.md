@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=dd88d8c8878e94e03957331568237c1818cfd727b7401a6e82efdb4a8441e35d -->
+<!-- README_SYNC: source=README.md sha256=8a1c36df2bd07d9e114840e5a17c6860ddad51936a8826d38c694325a85eee82 -->
 
 <p align="center">
   <picture>
@@ -16,7 +16,7 @@
 <p align="center">
   <a href="https://github.com/7xuanlu/wenlan/actions/workflows/ci.yml?query=branch%3Amain"><img alt="CI" src="https://github.com/7xuanlu/wenlan/actions/workflows/ci.yml/badge.svg?branch=main&event=push"></a>
   <a href="https://github.com/7xuanlu/wenlan/releases/latest"><img alt="最新版本" src="https://img.shields.io/github/v/release/7xuanlu/wenlan?sort=semver&label=release"></a>
-  <a href="#license"><img alt="授權：Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="#license"><img alt="授權：Apache-2.0 與 AGPL-3.0" src="https://img.shields.io/badge/license-Apache--2.0%20%2B%20AGPL--3.0-blue.svg"></a>
 </p>
 
 <p align="center">
@@ -380,7 +380,12 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 
 ## 授權
 
-Wenlan 採用 **Apache-2.0** 授權，包括本 repository 內的 local runtime、CLI、MCP server、shared types，以及 Claude Code/Codex plugin files。
+Wenlan 採用兩種授權，依 repository 的不同部分劃分。
+
+- **Apache-2.0**（[`LICENSE`](LICENSE)）涵蓋 local runtime、CLI、MCP server、shared types，以及 Claude Code 與 Codex 的 plugin files。可以自由基於這些開發。
+- **AGPL-3.0-only**（[`app/LICENSE`](app/LICENSE)）涵蓋桌面 app：`app/` crate 及其附帶的 React 前端。如果你把修改過的 app 作為網路服務運行，AGPL 要求你向使用它的人提供這份修改後的原始碼。
+
+這個劃分是刻意為之。Apache-2.0 的程式碼可以用在 AGPL-3.0 程式裡，所以桌面 app 建立在 runtime 之上，兩種授權都不會被違反。
 
 ---
 
