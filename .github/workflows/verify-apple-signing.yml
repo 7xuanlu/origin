@@ -1,0 +1,220 @@
+name: Notarize the real DMG
+
+# Throwaway, kept off main on purpose. Delete this file and the
+# ci/notarize-real-dmg branch once the first signed release is out.
+#
+# Why this exists: Apple has been holding this account's first notary
+# submissions, and the only ones in the queue are ZIPs of a scratch test app.
+# Those are useless to a support case about shipping Wenlan. This builds the
+# real signed disk image and submits it once, the way release.yml now does, so
+# the support case can name a submission that is actually our product.
+#
+# It doubles as the first end-to-end run of the outermost-container flow:
+# `pnpm tauri build` never sees the notary credentials and so submits nothing,
+# the disk image is the single submission, and the ticket is then stapled to
+# the app and the updater archive is repacked around it.
+#
+# The submission id is printed before any wait, because that id is the point of
+# the run. A submission that never settles still leaves the id in the log.
+
+on:
+  push:
+    branches:
+      - ci/notarize-real-dmg
+
+permissions:
+  contents: read
+
+jobs:
+  notarize:
+    name: Build and submit the real disk image
+    runs-on: macos-14
+    timeout-minutes: 120
+    env:
+      APPLE_SIGNING_CONFIGURED: ${{ secrets.APPLE_CERTIFICATE != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
+        with:
+          toolchain: 1.95.0
+          targets: aarch64-apple-darwin
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download cloudflared sidecar
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/binaries
+          curl -fsSL -o /tmp/cloudflared.tgz \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz
+          tar -xzf /tmp/cloudflared.tgz -C /tmp
+          chmod 755 /tmp/cloudflared
+          xattr -cr /tmp/cloudflared
+          echo "CLOUDFLARED_BIN=/tmp/cloudflared" >> "$GITHUB_ENV"
+
+      # Mirrors release.yml: the three notarization secrets are checked here but
+      # never exported, so `pnpm tauri build` cannot submit the .app on its own.
+      - name: Load Apple signing secrets
+        shell: bash
+        env:
+          SECRET_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          SECRET_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          SECRET_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          SECRET_APPLE_ID: ${{ secrets.APPLE_ID }}
+          SECRET_APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          SECRET_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+            APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            var="SECRET_${name}"
+            if [[ -z "${!var:-}" ]]; then
+              echo "ERROR: secret $name is empty; this run needs all six." >&2
+              exit 1
+            fi
+          done
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY; do
+            var="SECRET_${name}"
+            value="${!var:-}"
+            if [[ "$name" == "APPLE_CERTIFICATE" ]]; then
+              value="$(tr -d '[:space:]' <<<"$value")"
+            fi
+            printf '%s=%s\n' "$name" "$value" >> "$GITHUB_ENV"
+          done
+
+      - name: Build macOS desktop app bundle
+        shell: bash
+        env:
+          CXXFLAGS: "-std=c++17"
+          CLOUDFLARED_BIN: ${{ env.CLOUDFLARED_BIN }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --target aarch64-apple-darwin
+
+      - name: Confirm the bundler submitted nothing
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_dir="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle"
+          app="$(find "$bundle_dir/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          [[ -n "$app" && -d "$app" ]] || { echo "ERROR: no .app under $bundle_dir/macos." >&2; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=2 "$app" 2>&1 | grep -q 'Authority=Developer ID Application' \
+            || { echo "ERROR: app is not Developer ID signed." >&2; exit 1; }
+          # No ticket yet is the expected state: the bundler could not notarize.
+          if xcrun stapler validate "$app" 2>/dev/null; then
+            echo "ERROR: the .app already carries a ticket, so the bundler notarized it." >&2
+            echo "The notary credentials leaked into the build environment." >&2
+            exit 1
+          fi
+          echo "App is signed and unstapled, as expected before the single submission."
+
+      - name: Submit the disk image and report the id
+        id: submit
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          bundle_dir="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle"
+          dmg="$(find "$bundle_dir/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          [[ -n "$dmg" && -f "$dmg" ]] || { echo "ERROR: no .dmg under $bundle_dir/dmg." >&2; exit 1; }
+          ls -lh "$dmg"
+          # No --wait here: the id is what this run exists to produce, so print
+          # it before anything can time out.
+          out="$(xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" 2>&1)"
+          echo "$out"
+          id="$(sed -n 's/^ *id: \([0-9a-f-]*\)$/\1/p' <<<"$out" | head -1)"
+          [[ -n "$id" ]] || { echo "ERROR: notarytool returned no submission id." >&2; exit 1; }
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Notarization submission::$id  ($(basename "$dmg"))"
+          echo "===================================================="
+          echo " SUBMISSION ID FOR THE APPLE SUPPORT CASE: $id"
+          echo " FILE: $(basename "$dmg")"
+          echo "===================================================="
+
+      - name: Wait for Apple, then staple if it settles
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          SUBMISSION_ID: ${{ steps.submit.outputs.id }}
+        run: |
+          set -euo pipefail
+          bundle_dir="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle"
+          dmg="$(find "$bundle_dir/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          app="$(find "$bundle_dir/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+
+          xcrun notarytool wait "$SUBMISSION_ID" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" --timeout 45m || true
+          info="$(xcrun notarytool info "$SUBMISSION_ID" --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" 2>&1)"
+          echo "$info"
+          echo "--- notarytool log ---"
+          xcrun notarytool log "$SUBMISSION_ID" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" 2>&1 | head -200 || true
+
+          if grep -qE '^ *status: (Invalid|Rejected)' <<<"$info"; then
+            echo "ERROR: Apple rejected $SUBMISSION_ID. See the log above." >&2
+            exit 1
+          fi
+          if ! grep -q 'status: Accepted' <<<"$info"; then
+            echo "Apple has not settled $SUBMISSION_ID yet; it is still held."
+            echo "Give this id to Apple Developer Support: $SUBMISSION_ID"
+            echo "Nothing is stapled and nothing is proven; re-run once Apple answers."
+            exit 0
+          fi
+
+          # Accepted: run the rest of the release flow and prove it end to end.
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+
+          archive="$app.tar.gz"
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          rm -f "$archive" "$archive.sig"
+          tar --no-mac-metadata -C "$(dirname "$app")" -czf "$archive" "$(basename "$app")"
+          pnpm tauri signer sign "$archive"
+          [[ -s "$archive.sig" ]] || { echo "ERROR: re-signing produced no $archive.sig." >&2; exit 1; }
+
+          unpacked="$RUNNER_TEMP/updater-archive-check"
+          rm -rf "$unpacked"
+          mkdir -p "$unpacked"
+          tar -C "$unpacked" -xzf "$archive"
+          unpacked_app="$(find "$unpacked" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          [[ -n "$unpacked_app" && -d "$unpacked_app" ]] || { echo "ERROR: rebuilt archive has no .app." >&2; exit 1; }
+          codesign --verify --deep --strict "$unpacked_app"
+          xcrun stapler validate "$unpacked_app"
+
+          mount="$RUNNER_TEMP/dmg-assess"
+          rm -rf "$mount"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg"
+          mounted_app="$(find "$mount" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          assess="$(spctl --assess --type exec --verbose=2 "$mounted_app" 2>&1)" || {
+            echo "$assess"; hdiutil detach "$mount" || true; exit 1; }
+          echo "$assess"
+          hdiutil detach "$mount"
+          grep -q 'source=Notarized Developer ID' <<<"$assess" \
+            || { echo "ERROR: app inside the image is not seen as notarized." >&2; exit 1; }
+
+          echo "Accepted, stapled, and verified end to end. The release flow works."
