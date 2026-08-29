@@ -12,7 +12,7 @@ One thing is automatic, and you switch it on yourself. When you connect a folder
 
 ## Where data is stored
 
-All of your data stays on your machine:
+Your data is stored on your machine:
 
 - `~/.wenlan/pages/` -- wiki pages (Markdown)
 - `~/.wenlan/sessions/` -- session logs (Markdown)
@@ -59,12 +59,12 @@ If a note worries you, remove the image link from it.
 
 ## Sending your content somewhere
 
-These are off until you turn them on. Each one is the only way your captured content leaves your machine.
+These are off until you turn them on. Aside from the remote images described above, which need nothing turned on, they are the ways your captured content leaves your machine that we know of.
 
 - **A cloud AI provider (bring your own key).** If you save an API key and pick that provider for enrichment, Wenlan sends the text of the memory or document being processed, plus its prompt, to that provider. Anthropic goes to `https://api.anthropic.com/v1/messages`. Any other provider goes to the endpoint you entered -- the app offers presets for OpenAI, Google, Groq, OpenRouter, Mistral, DeepSeek and xAI, and an endpoint on your own machine such as Ollama stays local. What that provider does with the text is governed by its own terms. Read them rather than assuming: several of these companies say their consumer privacy policy does not cover text submitted through their API, and point to a separate business or API agreement instead. Your key is stored in the local config and sent only to that provider. Turn it off with `wenlan enrichment disable`, or by clearing the key.
 - **Testing a provider.** The "test endpoint" button sends one fixed sentence, `Say 'hello' and nothing else.`, and the model-list button asks the provider what models it offers. Neither sends anything you captured.
 - **Remote Access (experimental, desktop app only).** When you turn it on, the app runs `cloudflared` to open a tunnel to the local MCP server so Claude.ai and ChatGPT can reach a stable address, and registers that address with Wenlan's relay at `https://origin-relay.originmemory.workers.dev/register`. The registration sends the tunnel address and a random 16-byte identifier that Wenlan generates once and keeps on disk; that identifier is used as both the account name and the shared secret. While it is on, the app checks the tunnel's health every 30 seconds. **The address has no login: anyone who has it can read and write your entire memory** until you turn Remote Access off. Nothing is sent while it is off.
-- **On-device model download.** If you run `wenlan models install` or start the download from Settings, a Qwen model is fetched from `https://huggingface.co`. This is separate from the search model above and does not happen on its own. Once installed, enrichment runs on your machine and nothing leaves it.
+- **On-device model download.** If you run `wenlan models install` or start the download from Settings, a Qwen model is fetched from `https://huggingface.co`. This is separate from the search model above and does not happen on its own. Once installed, enrichment runs on your machine and the text being enriched does not leave it.
 - **Better search ranking.** If you turn on the reranker, its weights are downloaded from `https://huggingface.co` the next time the daemon starts, between roughly 146 MB and 1.1 GB depending on which one you choose. It is off unless you set it.
 
 ## Telemetry
@@ -75,7 +75,7 @@ Opening a window starts the update check listed in the table above about three s
 
 ## The other companies involved
 
-Wenlan reaches these services, so their own terms decide what they do with the request, and we receive nothing back from them about you. One of them is not merely reached: Wenlan's relay runs on Cloudflare Workers, so the project holds a Cloudflare account and is bound by Cloudflare's own terms as a customer.
+Wenlan reaches these services, so their own terms decide what they do with the request. None of them reports back to us about you. The one place the project can see anything at all is Cloudflare's own dashboard for the relay, which shows traffic figures for that service. One of them is not merely reached: Wenlan's relay runs on Cloudflare Workers, so the project holds a Cloudflare account and is bound by Cloudflare's own terms as a customer.
 
 | Service | Why Wenlan reaches it | Their policy |
 | --- | --- | --- |
