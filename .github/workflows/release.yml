@@ -440,10 +440,15 @@ jobs:
     name: Build macOS desktop app bundle
     needs: [resolve-promotion, bind-release-tag]
     runs-on: macos-14
-    # Notarization now waits on Apple's queue twice, once for the .app and once
-    # for the .dmg, and a submission can sit In Progress for a quarter of an
-    # hour with nothing wrong.
-    timeout-minutes: 120
+    # The notary wait is the long pole and it is not the only one: this job
+    # compiles the whole workspace from scratch first (no Cargo cache here,
+    # only pnpm's), then waits up to 90 minutes on Apple's queue, then staples,
+    # repacks the updater archive, verifies and stages. Those have to fit end
+    # to end. At 120 a slow compile could eat the notary step's own budget and
+    # GitHub would hard-kill the job -- no message, no submission id printed,
+    # and the submission left alive in Apple's queue, which is how this account
+    # accumulated unsettled ones. Raise this and `--timeout` together.
+    timeout-minutes: 210
     permissions:
       contents: read
     outputs:

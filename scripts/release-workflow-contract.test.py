@@ -451,10 +451,12 @@ def contract_violations(
         "update-homebrew": 20,
         "docker-manifest": 10,
         "finalize-release": 10,
-        # Raised from 90 when the DMG gained its own notarization submission:
-        # the job now waits on Apple's queue twice, and a single submission has
-        # been observed sitting In Progress for over 40 minutes.
-        "app-bundle": 120,
+        # Raised to 210 when the notary wait went to 90 minutes. The job
+        # compiles the workspace from scratch before it waits, and staples,
+        # repacks and verifies after, so 120 could let a slow compile push the
+        # notarize step past the job's own cap -- a hard kill that never prints
+        # the submission id the operator needs.
+        "app-bundle": 210,
         "app-bundle-windows": 120,
     }.items():
         if not re.search(
