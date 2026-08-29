@@ -1550,8 +1550,23 @@ async fn start_tunnel(
             return Err(format!("cloudflared sidecar not found: {error}"));
         }
     };
+    // `--no-autoupdate` because cloudflared's default is to check for a new
+    // version every 24 hours and then overwrite its own binary and restart.
+    // Inside an installed Wenlan that binary is a bundled sidecar covered by
+    // the app's code signature, so a self-update would silently replace a
+    // signed file with an unsigned one -- Gatekeeper and Authenticode both
+    // stop trusting it, and on Windows that is exactly what the installer
+    // signature is meant to vouch for. It would also add an undisclosed
+    // periodic request to a Cloudflare update host. Wenlan ships cloudflared
+    // on its own release cadence; upgrading it is a Wenlan release, not
+    // something the sidecar decides for itself.
     let (mut tunnel_rx, tunnel_child) = match tunnel_command
-        .args(["tunnel", "--url", &format!("http://localhost:{}", port)])
+        .args([
+            "tunnel",
+            "--no-autoupdate",
+            "--url",
+            &format!("http://localhost:{}", port),
+        ])
         .spawn()
     {
         Ok(child) => child,
@@ -1872,6 +1887,13 @@ mod tests {
         ));
         assert!(is_expected_remote_tunnel_command(
             "/tmp/cloudflared tunnel --url http://localhost:22000",
+            22000,
+        ));
+        // The exact argv `start_remote_access` spawns. If this stops matching,
+        // orphan cleanup no longer recognizes the tunnel it started and leaves
+        // it running after the app quits.
+        assert!(is_expected_remote_tunnel_command(
+            "/tmp/cloudflared-aarch64-apple-darwin tunnel --no-autoupdate --url http://localhost:22000",
             22000,
         ));
         assert!(!is_expected_remote_tunnel_command(
