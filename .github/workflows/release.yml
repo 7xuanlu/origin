@@ -601,27 +601,6 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --target aarch64-apple-darwin
 
-      # A failed build says nothing about the notary service. Read the queue
-      # back so a rejection explains itself here rather than costing another
-      # hour-long run.
-      - name: Read Apple's notarization verdicts after a failed build
-        if: failure() && env.APPLE_NOTARIZATION_CONFIGURED == 'true'
-        shell: bash
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          set -uo pipefail
-          history="$(xcrun notarytool history --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" 2>&1)"
-          echo "$history"
-          for id in $(sed -n 's/^ *id: \([0-9a-f-]*\)$/\1/p' <<<"$history" | head -3); do
-            echo "--- notarytool log for $id ---"
-            xcrun notarytool log "$id" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
-              --team-id "$APPLE_TEAM_ID" 2>&1 | head -120
-          done
-
       # Apple: "if you have an app inside an installer package on a disk image,
       # sign the app, sign the installer package, and sign the disk image, but
       # only notarize the disk image." The disk image is what a browser download
