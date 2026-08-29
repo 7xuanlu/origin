@@ -45,6 +45,13 @@ pub struct OnDeviceModel {
     /// re-distillation). Smaller models produce thin/repetitive output at
     /// high token counts, so this is quality-constrained, not context-constrained.
     pub max_output_tokens: u32,
+    /// True when the model starts every answer in thinking mode unless told
+    /// not to. The prompt then opens with an empty `<think></think>` block so
+    /// the whole output budget goes to the answer. Models without a thinking
+    /// mode must NOT get that block: Qwen3-4B-Instruct-2507 reads it as an
+    /// answer that already ended and, at the title job's sampling
+    /// temperature, stops before its first word (greedy decoding answers).
+    pub thinking_mode: bool,
 }
 
 /// All available on-device models, ordered by size.
@@ -60,6 +67,7 @@ pub const MODELS: &[OnDeviceModel] = &[
         synthesis_token_limit: 6_000, // 32K context, ~19% — conservative for 4B quantized
         context_size: 8_192,          // 25% of 32K. KV cache ~2GB on Metal.
         max_output_tokens: 1_024,     // 4B quality degrades past ~750 words
+        thinking_mode: false,         // Instruct-2507 has no thinking mode
     },
     OnDeviceModel {
         id: "qwen3.5-9b",
@@ -74,6 +82,7 @@ pub const MODELS: &[OnDeviceModel] = &[
         // 6K prompt + 2K output. Same as 4B. Avoids the 4x KV cache
         // overhead of 16K which slows prefill without benefit.
         max_output_tokens: 2_048, // 9B sustains quality up to ~1500 words
+        thinking_mode: true,      // defaults to thinking-on
     },
 ];
 
@@ -81,6 +90,18 @@ pub const MODELS: &[OnDeviceModel] = &[
 /// fall back to `get_default_model()`.
 pub fn get_model(id: &str) -> Option<&'static OnDeviceModel> {
     MODELS.iter().find(|m| m.id == id)
+}
+
+/// Whether prompts for the model file at `path` should open with an empty
+/// think block. Files not in the registry get `false` (no block); see
+/// [`OnDeviceModel::thinking_mode`].
+pub fn thinking_mode_for_model_file(path: &std::path::Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    MODELS
+        .iter()
+        .find(|m| m.filename == name)
+        .map(|m| m.thinking_mode)
+        .unwrap_or(false)
 }
 
 /// Get the default model (smallest tier, runs on any laptop).
@@ -148,6 +169,20 @@ pub fn is_cached(model: &OnDeviceModel) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_mode_follows_the_model_family() {
+        use std::path::Path;
+        assert!(!get_model("qwen3-4b").unwrap().thinking_mode);
+        assert!(get_model("qwen3.5-9b").unwrap().thinking_mode);
+        assert!(!thinking_mode_for_model_file(Path::new(
+            "/x/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+        )));
+        assert!(thinking_mode_for_model_file(Path::new(
+            "/x/Qwen3.5-9B-Q4_K_M.gguf"
+        )));
+        assert!(!thinking_mode_for_model_file(Path::new("/x/unknown.gguf")));
+    }
 
     #[test]
     fn registry_has_two_models() {
