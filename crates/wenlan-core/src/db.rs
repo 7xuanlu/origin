@@ -16831,7 +16831,10 @@ impl MemoryDB {
     /// keys (`citation_backfill_attempts:<page_id>:v...`), predating the
     /// one-row-per-page redesign (`citations::attempt_key`) -- a dead key a
     /// live page can never match again, since every read is gated on the
-    /// current `v{version}:s{source_revision}:` generation prefix. See
+    /// current generation prefix. The `LIKE` pattern cannot say that on its
+    /// own: a page id that itself contains `:v` makes the page's *live* key
+    /// `citation_backfill_attempts:<id>` match the pattern too. So the delete
+    /// also excludes, by exact value, every key a current page owns. See
     /// migrate_126_rearm_empty_citations_and_drop_legacy_attempt_keys.
     async fn migrate_126_rearm_empty_citations_and_drop_legacy_attempt_keys(
         &self,
@@ -16853,7 +16856,11 @@ impl MemoryDB {
                 .map_err(|e| WenlanError::VectorDb(format!("m126 rearm: {e}")))?;
             let legacy_attempt_keys_dropped = conn
                 .execute(
-                    "DELETE FROM app_metadata WHERE key LIKE 'citation_backfill_attempts:%:v%'",
+                    "DELETE FROM app_metadata \
+                     WHERE key LIKE 'citation_backfill_attempts:%:v%' \
+                       AND key NOT IN (\
+                           SELECT 'citation_backfill_attempts:' || id FROM pages\
+                       )",
                     (),
                 )
                 .await

@@ -56898,6 +56898,25 @@ async fn migration_126_rearms_empty_citations_to_null_exactly_once() {
         .await
         .unwrap();
 
+    // A page id that itself contains `:v` makes the page's *live* attempt key
+    // match the legacy `LIKE` pattern. It is still read by the backfill, so
+    // the sweep must exclude it by exact key.
+    db.insert_page(
+        "m126:v-odd-id",
+        "Page whose id contains a colon-v",
+        None,
+        "body",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    db.set_app_metadata(&crate::citations::attempt_key("m126:v-odd-id"), "v2:s1:1")
+        .await
+        .unwrap();
+
     {
         let conn = db.conn.lock().await;
         conn.execute("PRAGMA user_version = 125", ()).await.unwrap();
@@ -56966,6 +56985,16 @@ async fn migration_126_rearms_empty_citations_to_null_exactly_once() {
             .unwrap(),
         Some("v1:s0:2".to_string()),
         "a current-format attempt key (no `:v` suffix) must survive the migration"
+    );
+
+    assert_eq!(
+        db.get_app_metadata(&crate::citations::attempt_key("m126:v-odd-id"))
+            .await
+            .unwrap(),
+        Some("v2:s1:1".to_string()),
+        "a live attempt key whose page id contains `:v` matches the legacy LIKE \
+         pattern, so the sweep must exclude it by exact key or it deletes a \
+         counter the backfill is still reading"
     );
 
     // Idempotency: rewind and replay finds nothing left to re-arm (the
