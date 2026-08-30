@@ -47,14 +47,21 @@ function codeRanges(content: string): Array<[number, number]> {
   return ranges;
 }
 
-/** Mirror the backend's strip_markers: remove [N], collapse doubled spaces. */
+/** Mirror the backend's strip_markers: remove [N], collapse doubled spaces.
+ *  Only eat the space in front of a marker that sits before closing
+ *  punctuation: the distiller often writes "one file [5][13]." and a display
+ *  strip must not show "one file .". Code such as "rm -rf ." keeps its space */
 function stripMarkers(text: string): string {
-  return text.replace(/\[\d+\]/g, "").replace(/ {2,}/g, " ");
+  return text
+    .replace(/ *(?:\[\d+\])+(?=[.,;:!?])/g, "")
+    .replace(/\[\d+\]/g, "")
+    .replace(/ {2,}/g, " ");
 }
 
 /** Remove rewritten citation links from plain-text contexts (TLDR pull-quote). */
 export function stripCitationLinks(text: string): string {
   return text
+    .replace(/ *(?:\[\d+\]\(#citation:\d+\))+(?=[.,;:!?])/g, "")
     .replace(/\[\d+\]\(#citation:\d+\)/g, "")
     .replace(/ {2,}/g, " ")
     .trim();
