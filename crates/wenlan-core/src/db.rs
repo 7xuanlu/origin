@@ -33975,11 +33975,13 @@ impl MemoryDB {
                 idx += 1;
             } else {
                 // NULL means "not yet confirmed" — include both explicit 0 and
-                // NULL. The next two conditions are copied from
+                // NULL. The next two conditions mirror
                 // `list_unconfirmed_memories_scoped`'s WHERE so the two
                 // unconfirmed-review surfaces agree on self-state exclusions:
-                // an `'archive'`/`'evicted'` row is merge or eviction residue,
-                // and a recap is not a capture to review.
+                // `not_self_archived` drops merge and eviction residue while
+                // keeping decisions (the store path stamps every decision
+                // `'archive'` to say how it supersedes, not that it is
+                // archived), and a recap is not a capture to review.
                 //
                 // The two readers are NOT the same set, and never were: this
                 // one additionally drops pending revisions, episode rows, and
@@ -33988,10 +33990,7 @@ impl MemoryDB {
                 // carries no superseder test whatsoever. Do not restore the
                 // "same set" claim that used to sit here.
                 conditions.push("(confirmed = 0 OR confirmed IS NULL)".to_string());
-                conditions.push(
-                    "(supersede_mode IS NULL OR supersede_mode NOT IN ('archive', 'evicted'))"
-                        .to_string(),
-                );
+                conditions.push(not_self_archived("memories"));
                 conditions.push("(is_recap IS NULL OR is_recap != 1)".to_string());
             }
         }
@@ -46729,6 +46728,7 @@ impl MemoryDB {
                     None,
                 ),
             };
+            let live = not_self_archived("memories");
             let sql = format!(
                     "SELECT source_id, title, summary, content, \
                             created_at, last_modified, \
@@ -46741,7 +46741,7 @@ impl MemoryDB {
                             entity_id \
                      FROM memories \
                      WHERE source = 'memory' AND chunk_index = 0 \
-                       AND (supersede_mode IS NULL OR supersede_mode NOT IN ('archive', 'evicted')) \
+                       AND {live} \
                        {scope_sql} \
                      ORDER BY COALESCE(last_modified, created_at) DESC \
                      LIMIT ?1"
@@ -46878,12 +46878,13 @@ impl MemoryDB {
                 None,
             ),
         };
+        let live = not_self_archived("memories");
         let sql = format!(
             "SELECT source_id, title, summary, content, \
                         created_at, last_modified \
                  FROM memories \
                  WHERE source = 'memory' AND chunk_index = 0 \
-                   AND (supersede_mode IS NULL OR supersede_mode NOT IN ('archive', 'evicted')) \
+                   AND {live} \
                    AND (confirmed = 0 OR confirmed IS NULL) \
                    AND (is_recap IS NULL OR is_recap != 1) \
                    {scope_sql} \
@@ -47619,15 +47620,21 @@ impl MemoryDB {
         // in an INTEGER-affinity column, so a SQL `last_accessed < ?epoch`
         // compares TEXT vs INTEGER and never fires. We over-select on confidence
         // and let the pure policy narrow it down.
+        // `not_self_archived` skips rows already evicted or folded away by a
+        // merge; a decision's `'archive'` stamp is superseder behaviour, not
+        // row state, so decisions stay candidates for the policy below.
+        let live = not_self_archived("memories");
         let mut rows = conn
             .query(
-                "SELECT source_id, effective_confidence, CAST(last_accessed AS TEXT), memory_type, space \
-                 FROM memories \
-                 WHERE source = 'memory' AND chunk_index = 0 \
-                   AND confirmed = 0 AND pinned = 0 \
-                   AND supersede_mode NOT IN ('archive', 'evicted') \
-                   AND effective_confidence IS NOT NULL \
-                   AND effective_confidence < ?1",
+                &format!(
+                    "SELECT source_id, effective_confidence, CAST(last_accessed AS TEXT), memory_type, space \
+                     FROM memories \
+                     WHERE source = 'memory' AND chunk_index = 0 \
+                       AND confirmed = 0 AND pinned = 0 \
+                       AND {live} \
+                       AND effective_confidence IS NOT NULL \
+                       AND effective_confidence < ?1"
+                ),
                 libsql::params![cfg.evict_confidence_floor],
             )
             .await
@@ -47657,12 +47664,14 @@ impl MemoryDB {
         if cfg.per_space_cap.is_some() {
             let mut all_rows = conn
                 .query(
-                    "SELECT source_id, effective_confidence, CAST(last_accessed AS TEXT), memory_type, space \
-                     FROM memories \
-                     WHERE source = 'memory' AND chunk_index = 0 \
-                       AND confirmed = 0 AND pinned = 0 \
-                       AND supersede_mode NOT IN ('archive', 'evicted') \
-                       AND effective_confidence IS NOT NULL",
+                    &format!(
+                        "SELECT source_id, effective_confidence, CAST(last_accessed AS TEXT), memory_type, space \
+                         FROM memories \
+                         WHERE source = 'memory' AND chunk_index = 0 \
+                           AND confirmed = 0 AND pinned = 0 \
+                           AND {live} \
+                           AND effective_confidence IS NOT NULL"
+                    ),
                     (),
                 )
                 .await

@@ -24184,6 +24184,140 @@ async fn list_unconfirmed_memories_respects_limit() {
     assert_eq!(items.len(), 2);
 }
 
+// ==================== supersede_mode is not row state ====================
+
+/// Seed the fixture the three regression tests below share: a stored decision
+/// (`make_memory_doc` stamps it `supersede_mode='archive'` exactly as the store
+/// path does), a plain fact, a fact `apply_merge` folded away, and a fact
+/// `evict_stale` soft-evicted. `upsert_documents` overwrites `supersede_mode`
+/// unconditionally, so the two self-state markers are applied afterwards.
+async fn seed_self_state_fixture(db: &MemoryDB) {
+    let docs = [
+        ("selfstate_decision", "decision"),
+        ("selfstate_fact", "fact"),
+        ("selfstate_merged_away", "fact"),
+        ("selfstate_evicted", "fact"),
+    ]
+    .into_iter()
+    .map(|(sid, memory_type)| {
+        make_memory_doc(
+            sid,
+            &format!("Self-state fixture memory content for {sid}"),
+            memory_type,
+            "alpha",
+            "test-agent",
+        )
+    })
+    .collect();
+    db.upsert_documents(docs).await.unwrap();
+
+    let conn = db.conn.lock().await;
+    // `apply_merge` writes this onto each original it folded away.
+    conn.execute(
+        "UPDATE memories SET supersede_mode = 'archive' \
+         WHERE source_id = 'selfstate_merged_away' AND source = 'memory'",
+        (),
+    )
+    .await
+    .unwrap();
+    // `evict_stale` writes this.
+    conn.execute(
+        "UPDATE memories SET supersede_mode = 'evicted' \
+         WHERE source_id = 'selfstate_evicted' AND source = 'memory'",
+        (),
+    )
+    .await
+    .unwrap();
+    // Guard the premise: the decision really does carry the archive stamp, so a
+    // green assertion cannot come from the stamp having quietly changed.
+    let mut rows = conn
+        .query(
+            "SELECT supersede_mode FROM memories \
+             WHERE source_id = 'selfstate_decision' AND source = 'memory' AND chunk_index = 0",
+            (),
+        )
+        .await
+        .unwrap();
+    let mode: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(
+        mode, "archive",
+        "premise: the store path stamps decisions with supersede_mode='archive'"
+    );
+}
+
+fn assert_keeps_decision_drops_residue(ids: &[&str], reader: &str) {
+    assert!(
+        ids.contains(&"selfstate_decision"),
+        "{reader} must keep a stored decision; got {ids:?}"
+    );
+    assert!(
+        ids.contains(&"selfstate_fact"),
+        "{reader} must keep a plain fact; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"selfstate_merged_away"),
+        "{reader} must drop an apply_merge original; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"selfstate_evicted"),
+        "{reader} must drop an evicted row; got {ids:?}"
+    );
+}
+
+/// Regression: the Home recent-activity feed (`GET /api/memory/recent`) tested
+/// `supersede_mode` as row state and dropped every decision, because the store
+/// path stamps every decision `'archive'` to say how it supersedes.
+#[tokio::test]
+async fn list_recent_memories_keeps_decisions_but_not_merge_or_eviction_residue() {
+    let (db, _dir) = test_db().await;
+    seed_self_state_fixture(&db).await;
+
+    let items = db.list_recent_memories(10, None).await.unwrap();
+    let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+    assert_keeps_decision_drops_residue(&ids, "list_recent_memories");
+}
+
+/// Regression: the Home "Worth a glance" strip (`GET /api/memory/unconfirmed`)
+/// read the same column the same way and dropped every unconfirmed decision.
+#[tokio::test]
+async fn list_unconfirmed_memories_keeps_decisions_but_not_merge_or_eviction_residue() {
+    let (db, _dir) = test_db().await;
+    seed_self_state_fixture(&db).await;
+
+    let items = db.list_unconfirmed_memories(10).await.unwrap();
+    let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+    assert_keeps_decision_drops_residue(&ids, "list_unconfirmed_memories");
+}
+
+/// The `confirmed = false` branch of `list_filtered_confirmed_scoped` mirrors
+/// the unconfirmed reader's self-state exclusions. On a fixture with no pending,
+/// episode, or hide-superseded rows (the extra filters only this reader carries)
+/// the two must return the same set, decision included.
+#[tokio::test]
+async fn list_filtered_confirmed_false_agrees_with_unconfirmed_reader_on_decisions() {
+    let (db, _dir) = test_db().await;
+    seed_self_state_fixture(&db).await;
+
+    let filtered = db
+        .list_filtered_confirmed_scoped(Some("memory"), None, &ReadScope::Global, Some(false), 10)
+        .await
+        .unwrap();
+    let mut filtered_ids: Vec<&str> = filtered.iter().map(|r| r.source_id.as_str()).collect();
+    filtered_ids.sort_unstable();
+    assert_keeps_decision_drops_residue(
+        &filtered_ids,
+        "list_filtered_confirmed_scoped(confirmed = false)",
+    );
+
+    let unconfirmed = db.list_unconfirmed_memories(10).await.unwrap();
+    let mut unconfirmed_ids: Vec<&str> = unconfirmed.iter().map(|i| i.id.as_str()).collect();
+    unconfirmed_ids.sort_unstable();
+    assert_eq!(
+        filtered_ids, unconfirmed_ids,
+        "the two unconfirmed-review surfaces must agree on self-state exclusions"
+    );
+}
+
 // ==================== list_recent_pages_with_badges ====================
 
 /// Insert a page row with explicit Unix-second timestamps and version.
