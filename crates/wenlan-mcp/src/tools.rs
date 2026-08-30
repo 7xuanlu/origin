@@ -62,6 +62,34 @@ pub fn effective_space(inbound: &Option<String>) -> Option<String> {
     }
 }
 
+/// Build the daemon search request for `recall`.
+///
+/// `SearchMemoryRequest::source_agent` is a filter on the daemon side
+/// (`c.source_agent = ?` in `search_memory`), not caller attribution.
+/// Recall used to send the caller's own agent name here, which scoped every
+/// MCP recall to rows that same agent had written: a Codex session never saw
+/// what Claude Code captured, and nobody saw folder-ingested or refinery rows.
+/// Attribution for activity logging already travels in the `x-agent-name`
+/// header (`WenlanClient::with_agent_name`), so the body field stays `None`.
+fn recall_search_request(params: RecallParams) -> SearchMemoryRequest {
+    SearchMemoryRequest {
+        query: params.query,
+        // Clamp: an unbounded caller-supplied limit either trips the MCP
+        // client's 8MB response cap (client.rs MAX_RESPONSE_BYTES) as an
+        // opaque transport error, or floods the agent's context window.
+        limit: params.limit.unwrap_or(10).clamp(1, 100),
+        memory_type: params.memory_type,
+        space: effective_space(&params.space),
+        source_agent: None,
+        // Opt-in cross-encoder rerank. Default `false` preserves the
+        // current cost/latency for callers that don't pass the flag.
+        // Requires WENLAN_RERANKER_ENABLED=1 on the daemon to take
+        // effect; otherwise the daemon logs and falls back to plain
+        // hybrid ordering.
+        rerank: params.rerank.unwrap_or(false),
+    }
+}
+
 /// Controls which operations are allowed based on transport.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TransportMode {
@@ -1203,23 +1231,7 @@ impl WenlanMcpServer {
     }
 
     pub async fn recall_impl(&self, params: RecallParams) -> Result<CallToolResult, McpError> {
-        let space_arg = effective_space(&params.space);
-        let req = SearchMemoryRequest {
-            query: params.query,
-            // Clamp: an unbounded caller-supplied limit either trips the MCP
-            // client's 8MB response cap (client.rs MAX_RESPONSE_BYTES) as an
-            // opaque transport error, or floods the agent's context window.
-            limit: params.limit.unwrap_or(10).clamp(1, 100),
-            memory_type: params.memory_type,
-            space: space_arg,
-            source_agent: self.resolve_source_agent(None),
-            // Opt-in cross-encoder rerank. Default `false` preserves the
-            // current cost/latency for callers that don't pass the flag.
-            // Requires WENLAN_RERANKER_ENABLED=1 on the daemon to take
-            // effect; otherwise the daemon logs and falls back to plain
-            // hybrid ordering.
-            rerank: params.rerank.unwrap_or(false),
-        };
+        let req = recall_search_request(params);
 
         let resp: SearchMemoryResponse =
             try_call!(self.client.post("/api/memory/search", &req), "search");
@@ -4989,6 +5001,32 @@ mod tests {
     }
 
     // ===== Recall request construction =====
+
+    #[test]
+    fn test_recall_request_never_filters_by_caller_agent() {
+        // Regression: the daemon treats `source_agent` on a search request as
+        // a filter (`c.source_agent = ?`). Recall used to send the caller's own
+        // agent name, so a Codex session only saw rows Codex had written and
+        // never what Claude Code captured (found filming the launch demo,
+        // 2026-08-30). Attribution goes in the `x-agent-name` header instead.
+        let req = recall_search_request(RecallParams {
+            query: "which database did we pick".into(),
+            limit: Some(5),
+            memory_type: None,
+            space: None,
+            rerank: Some(true),
+        });
+        assert!(
+            req.source_agent.is_none(),
+            "recall must not scope results to the calling agent; got {:?}",
+            req.source_agent
+        );
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json["source_agent"].is_null());
+        assert_eq!(json["query"], "which database did we pick");
+        assert_eq!(json["limit"], 5);
+        assert_eq!(json["rerank"], true);
+    }
 
     #[test]
     fn test_recall_constructs_search_request() {

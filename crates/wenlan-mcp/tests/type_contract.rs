@@ -467,10 +467,14 @@ async fn t4_recall_roundtrip() {
     assert_eq!(body["limit"], serde_json::json!(10));
     assert!(body["memory_type"].is_null());
     assert!(body["space"].is_null());
-    assert_eq!(
-        body["source_agent"],
-        serde_json::json!("test-agent"),
-        "recall should send resolved agent name, not null"
+    // `source_agent` on the search request is a FILTER (`c.source_agent = ?`),
+    // not attribution: sending the caller's own name here hid every memory
+    // written by other agents. Attribution travels in the `x-agent-name`
+    // header, which `origin_client_sends_x_agent_name_header` covers.
+    assert!(
+        body["source_agent"].is_null(),
+        "recall must not filter results to the calling agent; got: {}",
+        body["source_agent"]
     );
 }
 
