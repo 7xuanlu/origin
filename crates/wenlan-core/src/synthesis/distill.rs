@@ -458,6 +458,66 @@ fn estimate_cluster_tokens(contents: &[String]) -> usize {
 /// Returns `Ok(true)` if a page was created, `Ok(false)` if the cluster was skipped.
 /// Extracted from `distill_pages` to enable parallel cluster processing via
 /// `DISTILL_CLUSTER_CONCURRENCY`.
+/// The summary of a distilled page: the first sentence of its first prose
+/// line, skipping headings, blank lines, and everything under an
+/// "Open Questions" heading. Citation markers like `[3]` are removed. A page
+/// with no prose outside "Open Questions" gets no summary rather than a
+/// question standing in for one.
+pub(crate) fn extract_page_summary(content: &str) -> Option<String> {
+    let mut in_open_questions = false;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(heading) = line.strip_prefix('#') {
+            let heading = heading.trim_start_matches('#').trim().to_ascii_lowercase();
+            in_open_questions = heading.starts_with("open question");
+            continue;
+        }
+        if in_open_questions {
+            continue;
+        }
+        let text = line
+            .trim_start_matches("- ")
+            .trim_start_matches("* ")
+            .trim_start_matches("> ")
+            .trim();
+        let sentence = match text.find(". ") {
+            Some(end) => &text[..=end],
+            None => text,
+        };
+        let cleaned = strip_citation_markers(sentence);
+        return (!cleaned.is_empty()).then_some(cleaned);
+    }
+    None
+}
+
+/// Remove `[N]` citation markers and the space that precedes them.
+fn strip_citation_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '[' {
+            let rest = &text[i + 1..];
+            if let Some(close) = rest.find(']') {
+                let inner = &rest[..close];
+                if !inner.is_empty() && inner.chars().all(|d| d.is_ascii_digit()) {
+                    while out.ends_with(' ') {
+                        out.pop();
+                    }
+                    for _ in 0..=close {
+                        chars.next();
+                    }
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub async fn distill_one_cluster(
     db: &MemoryDB,
     llm: &Arc<dyn LlmProvider>,
@@ -726,11 +786,10 @@ async fn distill_one_cluster_with_tuning(
                 None => topic.to_string(),
             };
 
-            // Extract summary from first bullet point
-            let summary = content
-                .lines()
-                .find(|l| l.starts_with("- "))
-                .map(|l| l.trim_start_matches("- ").to_string());
+            // The page opens with a one-sentence TLDR in plain prose; that
+            // sentence is the summary. Bullets only appear in enumerable lists
+            // and under "Open Questions", so they are never the summary.
+            let summary = extract_page_summary(&content);
 
             // Verify [N] markers the LLM emitted against the numbered sources:
             // out-of-range markers are stripped, each remaining occurrence gets
@@ -1486,6 +1545,42 @@ mod distill_truth_test;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn summary_is_the_first_prose_sentence_not_an_open_question() {
+        let content = "Tally stores all data in one SQLite file next to the app [2][6]. \
+The app process is the only writer [3].\n\n## Backup\n\nNightly copy to iCloud Drive [1].\n\n\
+## Open Questions\n- Has an iCloud backup ever failed under network conditions?\n";
+        assert_eq!(
+            extract_page_summary(content).as_deref(),
+            Some("Tally stores all data in one SQLite file next to the app.")
+        );
+    }
+
+    #[test]
+    fn summary_skips_leading_headings_and_blank_lines() {
+        let content = "# Tally\n\n\nSingle-user invoicing on SQLite.\nMore prose.\n";
+        assert_eq!(
+            extract_page_summary(content).as_deref(),
+            Some("Single-user invoicing on SQLite.")
+        );
+    }
+
+    #[test]
+    fn summary_uses_a_leading_bullet_when_the_page_opens_with_a_list() {
+        let content = "- Stripe over PayPal for EU clients [1]. Fees are lower.\n- Second point.\n";
+        assert_eq!(
+            extract_page_summary(content).as_deref(),
+            Some("Stripe over PayPal for EU clients.")
+        );
+    }
+
+    #[test]
+    fn summary_is_none_when_only_open_questions_remain() {
+        let content = "## Open Questions\n- Is there evidence backups ever failed?\n- What if the VPS is unreachable?\n";
+        assert_eq!(extract_page_summary(content), None);
+    }
+
     use super::*;
     use crate::llm_provider::{LlmBackend, LlmError, MockProvider};
     use crate::sources::RawDocument;
