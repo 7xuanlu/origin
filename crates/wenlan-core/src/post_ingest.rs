@@ -163,6 +163,28 @@ pub async fn run_title_enrichment_slice(
     })
 }
 
+/// A memory that matches no growable page is finished for this generation:
+/// record the step as ok at the input's version and report the terminal
+/// no-match. Reached three ways -- nothing matched at all, the matched page
+/// vanished before the reload, and the reloaded page no longer satisfies the
+/// match -- which is why it is one function rather than three copies.
+async fn terminal_no_match(
+    db: &MemoryDB,
+    source_id: &str,
+    version: i64,
+) -> Result<PageGrowthSliceReport, WenlanError> {
+    let committed = db
+        .record_enrichment_step_at_version(source_id, "page_growth", "ok", None, version)
+        .await?;
+    Ok(PageGrowthSliceReport {
+        selected: true,
+        matched: false,
+        terminal_no_match: true,
+        committed,
+        llm_calls: 0,
+    })
+}
+
 /// Advance one restart-safe Page-growth item. Matching is CPU-only and occurs
 /// before admission to the model. A no-match result is terminal for the
 /// current memory generation; a match gets exactly one model request and a
@@ -227,22 +249,7 @@ pub async fn run_page_growth_slice(
         )
         .await?
     else {
-        let committed = db
-            .record_enrichment_step_at_version(
-                &input.source_id,
-                "page_growth",
-                "ok",
-                None,
-                input.version,
-            )
-            .await?;
-        return Ok(PageGrowthSliceReport {
-            selected: true,
-            matched: false,
-            terminal_no_match: true,
-            committed,
-            llm_calls: 0,
-        });
+        return terminal_no_match(db, &input.source_id, input.version).await;
     };
     pause_after_match(&page.id).await;
     let expected_source_revision = db.get_page_source_revision(&page.id).await?;
@@ -254,23 +261,28 @@ pub async fn run_page_growth_slice(
     // or a detach that landed just before the counter read gets baked back
     // into the write it is supposed to prevent.
     let Some(page) = db.get_page(&page.id).await? else {
-        let committed = db
-            .record_enrichment_step_at_version(
-                &input.source_id,
-                "page_growth",
-                "ok",
-                None,
-                input.version,
-            )
-            .await?;
-        return Ok(PageGrowthSliceReport {
-            selected: true,
-            matched: false,
-            terminal_no_match: true,
-            committed,
-            llm_calls: 0,
-        });
+        return terminal_no_match(db, &input.source_id, input.version).await;
     };
+
+    // The reload refreshes the row, not the decision. `find_matching_page_scoped`
+    // also reads `review_status`, `space` and page ownership, and any of those can
+    // move in the match-to-reload window: a human takes the page over, it is sent
+    // back for review, it is moved to another space. Ask the same question again
+    // against the current rows and stop when this page is no longer the answer,
+    // rather than spending a model call on a write the fences would refuse.
+    if db
+        .find_matching_page_scoped(
+            input.entity_id.as_deref(),
+            &mem_embedding,
+            growth_threshold,
+            input.space.as_deref(),
+            false,
+        )
+        .await?
+        .is_none_or(|matched| matched.id != page.id)
+    {
+        return terminal_no_match(db, &input.source_id, input.version).await;
+    }
 
     let clean_current = crate::citations::strip_markers(&page.content);
     let evidence = db.get_page_evidence(&page.id).await.unwrap_or_default();
@@ -917,6 +929,17 @@ pub(crate) async fn grow_page(
     let Some(page) = db.get_page(&page.id).await? else {
         return Ok(false);
     };
+
+    // Same recheck as `run_page_growth_slice`, same reason: the reload refreshes
+    // the row but not the decision, and a page that stopped being a legal dedup
+    // target in the match-to-reload window must not reach the model.
+    if db
+        .find_matching_page_scoped(entity_id, mem_embedding, growth_threshold, space, true)
+        .await?
+        .is_none_or(|matched| matched.id != page.id)
+    {
+        return Ok(false);
+    }
 
     // (a) Input hygiene — strip stale [N] markers from the current body before
     // it goes into the prompt (⚖ §4). The old markers pointed at a numbered
@@ -2249,6 +2272,108 @@ mod tests {
             .contains(&"match-reload-a".to_string()));
     }
 
+    /// The reload after the counter read refreshes the matched row but never
+    /// re-asks whether that row is still a legal growth target. A human taking
+    /// the page over in the match-to-reload window leaves a page
+    /// `find_matching_page_scoped` would now refuse, and the slice would still
+    /// spend a model call on it. Mutation check: delete the post-reload match
+    /// recheck and this test sees `llm_calls == 1`.
+    #[tokio::test]
+    async fn page_growth_slice_skips_a_page_that_stopped_matching_before_the_reload() {
+        let (db, _dir) = test_db().await;
+        let db = Arc::new(db);
+        let entity_id = db
+            .create_entity("Post Reload Recheck", "Topic", Some("work"))
+            .await
+            .unwrap();
+        insert_growth_page(
+            &db,
+            "recheck-page",
+            &entity_id,
+            "work",
+            "page before the human took it over",
+        )
+        .await;
+        seed_page_growth_memory(
+            &db,
+            "recheck-source",
+            "source evidence for the post-reload recheck",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+        db.link_page_source("recheck-page", "recheck-source", "test_source")
+            .await
+            .unwrap();
+        seed_page_growth_memory(
+            &db,
+            "recheck-trigger",
+            "new evidence that triggers page growth",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+
+        let stub = Arc::new(CapturingStubProvider {
+            response: "growth that must never be generated.[1][2]".to_string(),
+            captured_prompt: std::sync::Mutex::new(None),
+        });
+        let llm: Arc<dyn LlmProvider> = stub.clone();
+
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel();
+        *POST_MATCH_PAUSE_GATE.lock().unwrap() =
+            Some(("recheck-page".to_string(), parked_tx, go_rx));
+
+        let prompts = PromptRegistry::default();
+        let slice = run_page_growth_slice(&db, &llm, &prompts, 2.0, None);
+        let take_over = async {
+            parked_rx
+                .await
+                .expect("growth slice must reach the post-match pause");
+            let page = db.get_page("recheck-page").await.unwrap().unwrap();
+            assert!(db
+                .try_update_page_content_with_changelog_at_version(
+                    "recheck-page",
+                    "the human owns this page now",
+                    &["recheck-source"],
+                    "fs_edit",
+                    "[]",
+                    None,
+                    page.version,
+                    None,
+                )
+                .await
+                .unwrap());
+            go_tx.send(()).expect("growth slice must still be parked");
+        };
+
+        let (report, _) = tokio::join!(slice, take_over);
+        let report = report.unwrap();
+
+        assert!(report.selected);
+        assert!(
+            !report.matched,
+            "a page that no longer satisfies the match predicate is not a match"
+        );
+        assert!(report.terminal_no_match);
+        assert!(
+            report.committed,
+            "the memory is done for this generation, so its receipt must land"
+        );
+        assert_eq!(
+            report.llm_calls, 0,
+            "the recheck must land before the model call, not after it"
+        );
+        assert!(
+            stub.captured_prompt.lock().unwrap().is_none(),
+            "no prompt may be built for a page that stopped matching"
+        );
+        let page = db.get_page("recheck-page").await.unwrap().unwrap();
+        assert_eq!(page.content, "the human owns this page now");
+        assert!(page.user_edited);
+    }
+
     #[tokio::test]
     async fn page_growth_slice_rejects_page_changed_during_inference() {
         let (db, _dir) = test_db().await;
@@ -2668,6 +2793,91 @@ mod tests {
         assert!(page
             .source_memory_ids
             .contains(&"grow-page-match-reload-a".to_string()));
+    }
+
+    /// The same post-reload recheck on the legacy `grow_page` entrypoint.
+    /// `grow_page` matches with `allow_user_edited = true`, so what bites there
+    /// is a page sent back for review: `review_status` leaves `confirmed` in the
+    /// match-to-reload window and the page stops being a dedup target. Mutation
+    /// check: delete the recheck and `grow_page` generates and writes anyway.
+    #[tokio::test]
+    async fn grow_page_skips_a_page_that_stopped_matching_before_the_reload() {
+        let (db, _dir) = test_db().await;
+        let entity_id = db
+            .create_entity("Grow Page Post Reload Recheck", "Topic", Some("work"))
+            .await
+            .unwrap();
+        insert_growth_page(
+            &db,
+            "grow-recheck-page",
+            &entity_id,
+            "work",
+            "page before it left the confirmed set",
+        )
+        .await;
+        seed_page_growth_memory(
+            &db,
+            "grow-recheck-source",
+            "source evidence for the grow_page recheck",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+        db.link_page_source("grow-recheck-page", "grow-recheck-source", "test_source")
+            .await
+            .unwrap();
+        seed_page_growth_memory(
+            &db,
+            "grow-recheck-trigger",
+            "new evidence that triggers page growth",
+            Some(&entity_id),
+            Some("work"),
+        )
+        .await;
+
+        let stub = std::sync::Arc::new(CapturingStubProvider {
+            response: "growth that must never be generated.[1][2]".to_string(),
+            captured_prompt: std::sync::Mutex::new(None),
+        });
+        let llm: std::sync::Arc<dyn LlmProvider> = stub.clone();
+
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel();
+        *POST_MATCH_PAUSE_GATE.lock().unwrap() =
+            Some(("grow-recheck-page".to_string(), parked_tx, go_rx));
+
+        let prompts = crate::prompts::PromptRegistry::default();
+        let grow = grow_page(
+            &db,
+            "grow-recheck-trigger",
+            "new evidence that triggers page growth",
+            Some(&entity_id),
+            Some("work"),
+            Some(&llm),
+            &prompts,
+            2.0,
+        );
+        let unconfirm = async {
+            parked_rx
+                .await
+                .expect("grow_page must reach the post-match pause");
+            db.set_page_review_status("grow-recheck-page", "unconfirmed")
+                .await
+                .unwrap();
+            go_tx.send(()).expect("grow_page must still be parked");
+        };
+
+        let (grew, _) = tokio::join!(grow, unconfirm);
+        assert!(
+            !grew.unwrap(),
+            "a page that left the confirmed set must not be grown"
+        );
+        assert!(
+            stub.captured_prompt.lock().unwrap().is_none(),
+            "no prompt may be built for a page that stopped matching"
+        );
+        let page = db.get_page("grow-recheck-page").await.unwrap().unwrap();
+        assert_eq!(page.content, "page before it left the confirmed set");
     }
 
     /// Spec §5.1 (True source kinds): `grow_page`'s numbered-source list must
