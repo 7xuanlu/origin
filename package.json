@@ -1,7 +1,7 @@
 {
   "name": "wenlan-app",
   "private": true,
-  "version": "0.17.4",
+  "version": "0.17.5",
   "type": "module",
   "license": "AGPL-3.0-only",
   "packageManager": "pnpm@10.28.2",
