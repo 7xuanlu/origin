@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.5](https://github.com/7xuanlu/wenlan/compare/v0.17.4...v0.17.5) (2026-08-30)
+
+
+### Bug Fixes
+
+* **security:** stop writing the Remote Access secret into the app log ([3cf40d8](https://github.com/7xuanlu/wenlan/commit/3cf40d8d9667d7b091b1ad230d874f6c3fcf6d69))
+
 ## [0.17.4](https://github.com/7xuanlu/wenlan/compare/v0.17.3...v0.17.4) (2026-08-30)
 
 
