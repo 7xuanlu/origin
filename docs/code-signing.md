@@ -86,6 +86,8 @@ Two consequences of choosing the Foundation tier, both worth knowing before appl
 
 ### After acceptance
 
+**Ask them one question before building any of this.** SignPath also offers a Windows Key Storage Provider, which would let the build sign the installer in place through Tauri's own `bundle.windows.signCommand` hook. That path skips steps 2, 3 and 4 below outright: nothing is uploaded and re-downloaded, so the updater signature and the checksums are computed once, over the already-signed bytes. The catch is that it produces no GitHub workflow artifact, and origin verification, which the free tier requires, appears to need one. SignPath has not ruled the combination out in writing, so ask; a yes removes most of the work on this page.
+
 Signing is a submission from inside the workflow, not a local `signtool` call: [`signpath/github-action-submit-signing-request`](https://github.com/SignPath/github-action-submit-signing-request) uploads the built installer, waits for the approval, and downloads the signed file. The pieces to add to `app-bundle-windows` in `release.yml`, in order:
 
 1. Upload `*-setup.exe` as a GitHub artifact and submit it, guarded on a `SIGNPATH_CONFIGURED` flag the way the macOS steps are guarded by `APPLE_SIGNING_CONFIGURED`, so a fork without the secret still builds. Raise the action's `wait-for-completion-timeout-in-seconds` past its 600-second default, because it is waiting for a person.
