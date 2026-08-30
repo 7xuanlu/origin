@@ -24318,6 +24318,112 @@ async fn list_filtered_confirmed_false_agrees_with_unconfirmed_reader_on_decisio
     );
 }
 
+/// `apply_merge_with_title` stamps EVERY original it folds away with
+/// `supersede_mode = 'archive'`, but it writes a `supersedes` link for
+/// `source_ids[0]` alone. Production always calls it with a whole cluster
+/// (`synthesis/distill.rs`), so originals past the first end up with no
+/// superseder row anywhere, and the surfaces that read the same row disagree:
+///
+///   * search self-excludes only `'evicted'` and hides a row only when some
+///     `'hide'`-mode superseder names it, so a merged-away original past the
+///     first is still returned;
+///   * every list reader and the distillation pool go through
+///     `not_self_archived`, which reads `'archive'` on a non-decision as the
+///     merge marker and drops the same row.
+///
+/// A merged-away DECISION past the first is worse: `not_self_archived`
+/// deliberately keeps `'archive'` on a decision, so nothing drops it and the
+/// content the merge folded up stays fully live everywhere.
+///
+/// Ignored: the fix does not fit in `apply_merge_with_title`. `memories.supersedes`
+/// is a single TEXT column on the superseder row, compared with `=` by
+/// `superseder_not_exists` and by the chunk triggers, so one merged row cannot
+/// name N predecessors without a schema change plus a matching update to every
+/// reader's superseder test.
+#[tokio::test]
+#[ignore = "confirmed bug: apply_merge links only source_ids[0]; the fix needs a multi-predecessor link, not a local edit"]
+async fn apply_merge_leaves_originals_past_the_first_without_a_superseder_link() {
+    let (db, _dir) = test_db().await;
+
+    let originals = ["merge_link_a", "merge_link_b", "merge_link_c"];
+    let docs = originals
+        .iter()
+        .map(|sid| {
+            make_memory_doc(
+                sid,
+                &format!("Ferris the crab guards memory safety, note {sid}"),
+                "fact",
+                "eng",
+                "claude",
+            )
+        })
+        .collect();
+    db.upsert_documents(docs).await.unwrap();
+
+    let source_ids: Vec<String> = originals.iter().map(|s| s.to_string()).collect();
+    let merged_id = db
+        .apply_merge(
+            &source_ids,
+            "Ferris the crab guards memory safety across all three notes",
+        )
+        .await
+        .unwrap();
+
+    // Premise: the merge stamped all three originals but linked only the first.
+    {
+        let conn = db.conn.lock().await;
+        for sid in originals {
+            let mut rows = conn
+                .query(
+                    "SELECT supersede_mode FROM memories \
+                     WHERE source_id = ?1 AND source = 'memory' AND chunk_index = 0",
+                    libsql::params![sid],
+                )
+                .await
+                .unwrap();
+            let mode: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(mode, "archive", "{sid} must carry the merge stamp");
+        }
+        let mut rows = conn
+            .query(
+                "SELECT supersedes FROM memories \
+                 WHERE source_id = ?1 AND source = 'memory' AND chunk_index = 0",
+                libsql::params![merged_id.as_str()],
+            )
+            .await
+            .unwrap();
+        let supersedes: Option<String> = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            supersedes.as_deref(),
+            Some("merge_link_a"),
+            "premise: the merged row names exactly one predecessor"
+        );
+    }
+
+    // The invariant a merge is supposed to establish: nothing it folded away is
+    // still reachable. `merge_link_b` and `merge_link_c` still are.
+    let results = db
+        .search_memory(
+            "Ferris crab memory safety",
+            20,
+            None,
+            &ReadScope::Global,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let hits: Vec<&str> = results.iter().map(|r| r.source_id.as_str()).collect();
+    for sid in originals {
+        assert!(
+            !hits.contains(&sid),
+            "search must not return {sid} after apply_merge folded it away; got {hits:?}"
+        );
+    }
+}
+
 // ==================== list_recent_pages_with_badges ====================
 
 /// Insert a page row with explicit Unix-second timestamps and version.
