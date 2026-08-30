@@ -179,6 +179,8 @@ export default function CitationPopover({
         left: pos?.left ?? -9999,
         width: `${WIDTH}px`,
         zIndex: 50,
+        // A chip inside the italic pull quote must not hand its slant down.
+        fontStyle: "normal",
         backgroundColor: "var(--mem-surface)",
         border: "1px solid var(--mem-border)",
         boxShadow: "0 4px 12px rgba(0,0,0,0.3)",

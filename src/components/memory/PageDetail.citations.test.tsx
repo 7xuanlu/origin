@@ -243,6 +243,10 @@ describe("PageDetail citations", () => {
     expect(within(lede).getByRole("button", { name: /mem-2/ })).toBeInTheDocument();
     expect(screen.getAllByText(/Tally stores all data in one SQLite file/)).toHaveLength(1);
     expect(screen.getByText(/The app process is the only writer\./)).toBeInTheDocument();
+    // The pull quote is italic; the popover that opens from its chip is not.
+    fireEvent.focus(within(lede).getByRole("button", { name: /mem-1/ }));
+    const popover = await screen.findByRole("tooltip");
+    expect(popover.style.fontStyle).toBe("normal");
   });
 
   it("renders a hand-set summary plain and keeps the first sentence in the body", async () => {
