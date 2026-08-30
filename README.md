@@ -291,7 +291,7 @@ Full workflow reference: [plugin/skills](plugin/skills/README.md). Technical mod
 
 Nothing is locked in. Pages and session notes are Markdown under `~/.wenlan/`; memories live in one libSQL database under the platform data directory (`~/Library/Application Support/wenlan/` on macOS, `~/.local/share/wenlan/` on Linux, `%LOCALAPPDATA%\wenlan\` on Windows). Copy those two folders to back up or move a Wenlan. An install upgraded from Origin still holds a full copy of its data in `~/.origin/` and in the sibling `origin` data folder (`~/Library/Application Support/origin/` on macOS, `~/.local/share/origin/` on Linux, `%LOCALAPPDATA%\origin\` on Windows); delete or copy those two as well.
 
-To uninstall: the app's *Run Wenlan in background at login* toggle removes the launch registration — turn it off, quit, and delete `Wenlan.app` or run the Windows uninstaller, then delete the folders above. `wenlan background off` only stops the daemon and disables autostart; it does not remove the launch registration, so a CLI-only install should instead follow the daemon uninstall bullet in [PRIVACY.md](PRIVACY.md). Every path Wenlan writes is listed there.
+To uninstall: the app's *Run Wenlan in background at login* toggle removes the launch registration — turn it off, quit, and delete `Wenlan.app` or run the Windows uninstaller, then delete the folders above. `wenlan background off` only stops the daemon and disables autostart; it does not remove the launch registration, so a CLI-only install should instead follow the daemon uninstall bullet in [PRIVACY.md](PRIVACY.md). The paths Wenlan writes are listed there.
 
 ---
 

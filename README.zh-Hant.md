@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=f1012091058402c7d36676def6995936ea9d51e3096c713dd8357319e2926295 -->
+<!-- README_SYNC: source=README.md sha256=88d923d235219b5c409efc4a64626449317121e7c636a66097b86407e6beff65 -->
 
 <p align="center">
   <picture>
@@ -293,7 +293,7 @@ a1b2c3d distill: 4 pages
 
 沒有任何鎖定。頁面和工作階段筆記是 `~/.wenlan/` 下的 Markdown；記憶保存在平台資料目錄下的一個 libSQL 資料庫中（macOS 為 `~/Library/Application Support/wenlan/`，Linux 為 `~/.local/share/wenlan/`，Windows 為 `%LOCALAPPDATA%\wenlan\`）。複製這兩個資料夾即可備份或搬移你的 Wenlan。如果這次安裝是從 Origin 升級而來，仍會在 `~/.origin/` 和同層的 `origin` 資料資料夾中（macOS 為 `~/Library/Application Support/origin/`，Linux 為 `~/.local/share/origin/`，Windows 為 `%LOCALAPPDATA%\origin\`）各保留一份完整資料；這兩個資料夾也請一併刪除或複製。
 
-移除：app 中「登入時在背景執行文瀾」開關會移除開機註冊——關閉它並結束程式，刪除 `Wenlan.app` 或執行 Windows 解除安裝程式，然後刪除上述資料夾。`wenlan background off` 只會停止守護程序並關閉開機自動啟動，不會移除開機註冊；僅使用 CLI 的安裝請改為參照 [PRIVACY.md](PRIVACY.md) 中守護程序的解除安裝項目。Wenlan 寫入的所有路徑都列在其中。
+移除：app 中「登入時在背景執行文瀾」開關會移除開機註冊——關閉它並結束程式，刪除 `Wenlan.app` 或執行 Windows 解除安裝程式，然後刪除上述資料夾。`wenlan background off` 只會停止守護程序並關閉開機自動啟動，不會移除開機註冊；僅使用 CLI 的安裝請改為參照 [PRIVACY.md](PRIVACY.md) 中守護程序的解除安裝項目。Wenlan 寫入的路徑列在其中。
 
 ---
 

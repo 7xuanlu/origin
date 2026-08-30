@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=f1012091058402c7d36676def6995936ea9d51e3096c713dd8357319e2926295 -->
+<!-- README_SYNC: source=README.md sha256=88d923d235219b5c409efc4a64626449317121e7c636a66097b86407e6beff65 -->
 
 <p align="center">
   <picture>
@@ -291,7 +291,7 @@ Referencia completa del flujo de trabajo: [plugin/skills](plugin/skills/README.m
 
 Nada queda encerrado. Las páginas y las notas de sesión son Markdown en `~/.wenlan/`; las memorias viven en una base de datos libSQL dentro del directorio de datos de la plataforma (`~/Library/Application Support/wenlan/` en macOS, `~/.local/share/wenlan/` en Linux, `%LOCALAPPDATA%\wenlan\` en Windows). Copia esas dos carpetas para hacer una copia de seguridad o mover tu Wenlan. Si esta instalación se actualizó desde Origin, todavía conserva una copia completa de sus datos en `~/.origin/` y en la carpeta hermana de datos `origin` (`~/Library/Application Support/origin/` en macOS, `~/.local/share/origin/` en Linux, `%LOCALAPPDATA%\origin\` en Windows); borra o copia también esas dos.
 
-Para desinstalar: el interruptor *Ejecutar Wenlan en segundo plano al iniciar sesión* de la app elimina el registro de arranque — desactívalo, cierra la app y borra `Wenlan.app` o ejecuta el desinstalador de Windows, y después borra las carpetas anteriores. `wenlan background off` solo detiene el daemon y desactiva el arranque automático; no elimina el registro de arranque, así que una instalación solo de CLI debe seguir en su lugar el punto de desinstalación del daemon en [PRIVACY.md](PRIVACY.md). Todas las rutas que Wenlan escribe están ahí.
+Para desinstalar: el interruptor *Ejecutar Wenlan en segundo plano al iniciar sesión* de la app elimina el registro de arranque — desactívalo, cierra la app y borra `Wenlan.app` o ejecuta el desinstalador de Windows, y después borra las carpetas anteriores. `wenlan background off` solo detiene el daemon y desactiva el arranque automático; no elimina el registro de arranque, así que una instalación solo de CLI debe seguir en su lugar el punto de desinstalación del daemon en [PRIVACY.md](PRIVACY.md). Las rutas que Wenlan escribe están ahí.
 
 ---
 

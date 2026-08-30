@@ -6,7 +6,11 @@ Wenlan is a local-first personal memory system. This policy covers everything th
 
 Only what you explicitly capture: decisions, lessons, observations, project context, and wiki pages synthesized from those memories. Wenlan does not monitor or scrape your machine for material to store.
 
-It does keep a local record of its own use. Every search writes a row holding the query you typed, which agent ran it, which memories came back, the time, and the result count; every result also gets a row saying which memory was read and when. Both live in the same local database as your memories, both are what the app's activity views read, and nothing prunes them, so this history accumulates for the life of the install. Deleting the database, as described under "Data deletion" below, deletes it too.
+It does keep a local record of its own use, in two tables of the same database that holds your memories. One table logs actions: searching, storing, refining, and forgetting. Each row names the action, which agent did it, when, which memories were involved, and a short description.
+
+Two of those descriptions carry your own words. A search stores the query you typed. Forgetting a memory stores its title, deliberately, because the memory itself is gone by then and the title could not be looked up later. The other table records which memory was read and when; results that are pages rather than memories are left out of both.
+
+Some of this is cleared as you go: deleting a memory removes its read records, and `wenlan cleanup-legacy-captures` clears both tables. Nothing expires rows with age, so otherwise this history grows for the life of the install. Deleting the database, as described under "Data deletion" below, deletes it too.
 
 One thing is automatic, and you switch it on yourself. When you connect a folder as a source, Wenlan watches it and reads changed files without asking again for each one -- it syncs that folder once at startup and then whenever a file in it changes. Choosing the folder is the consent; each individual file is not a separate prompt.
 
@@ -20,6 +24,7 @@ Your data is stored on your machine:
 - `~/.wenlan/spaces.toml` -- Space mapping config
 - `~/.wenlan/db/` -- symlink to the platform data directory (macOS: `~/Library/Application Support/wenlan/`; Linux: `~/.local/share/wenlan/`; Windows: `%LOCALAPPDATA%\wenlan\`), with the libSQL database at `<data dir>/memorydb/`
 - `~/.wenlan/bin/` -- installed binaries
+- The desktop app's log, `wenlan.log`, outside all of the above: `~/Library/Logs/com.wenlan.desktop/` on macOS, `~/.local/share/wenlan/logs/` on Linux, `%LOCALAPPDATA%\wenlan\logs\` on Windows. It is a single file that is never rotated or trimmed. It holds diagnostics rather than your memories, but two things in it are sensitive: paths of files it has trouble indexing, and, if you have ever turned on Remote Access, the full relay address including the identifier that section calls the shared secret. Treat this file the way you would treat a password when sharing it in a bug report.
 
 The daemon listens on `127.0.0.1:7878`, which is your own machine only. Nothing you capture -- no memory, page, source, or search -- is sent anywhere unless you turn on one of the features in "Sending your content somewhere" below.
 
@@ -29,7 +34,7 @@ One exception needs nothing turned on. If a note contains a remote image, displa
 
 Wenlan is not fully offline. Three things happen on their own, and each tells the other end your IP address. The first is a download rather than a single request: it fetches the model file plus its tokenizer and configuration files, so expect several requests. Only one of the three has an off switch, noted in the table.
 
-Separately, displaying a note that contains remote images may reach those image hosts. That is described under "Images in your notes reach their host" below. Two more requests happen only when you press something: installing an optional model, covered in "Sending your content somewhere", and installing the Claude Code or Codex plugin from Settings, which runs that client's own CLI and clones this repository's plugin marketplace from GitHub.
+Separately, displaying a note that contains remote images may reach those image hosts. That is described under "Images in your notes reach their host" below. Two more requests happen only when you press something: installing an optional model, covered in "Sending your content somewhere", and installing the Claude Code or Codex plugin from Settings, which runs that client's own CLI and clones this repository's plugin marketplace from GitHub. One more can happen without you pressing anything, in another program: when no `wenlan-mcp` binary is installed, Wenlan writes an `npx -y wenlan-mcp` command into your AI client's configuration, and that client fetches the package from npm the first time it starts.
 
 | What | When | Where | What it sends |
 | --- | --- | --- | --- |
@@ -69,9 +74,13 @@ These are off until you turn them on. Aside from the remote images described abo
 
 ## Telemetry
 
-None is sent anywhere. Wenlan runs no analytics service, files no crash reports, and sends no diagnostics. We have added no analytics or crash-reporting library, and the app's fonts are bundled rather than fetched. The one thing it does record about your use is the local search and access history described under "What data Wenlan stores", which stays in the database on your machine.
+None is sent anywhere. No analytics or crash reporting runs in a build you install: Wenlan operates no analytics service, files no crash reports, and sends no diagnostics. The app's fonts are bundled rather than fetched.
 
-Opening a window starts the update check listed in the table above about three seconds later, and does nothing else on the network by itself -- but see "Images in your notes reach their host" above, because the note you open can.
+One caveat about the dependency list, since it is public and you may read it. A development-only profiling tool, React Scan, pulls crash-reporting packages into the lock file. It is loaded only in a development build, behind two environment flags, and is not part of a release.
+
+The one thing Wenlan does record about your use is the local activity history described under "What data Wenlan stores", which stays in the database on your machine.
+
+Opening a window starts the update check listed in the table above about three seconds later. On a first run it also triggers the search model download in that table, and if you left Remote Access on, it reopens that tunnel. Beyond those, see "Images in your notes reach their host" above, because the note you open can reach the network on its own.
 
 ## The other companies involved
 
@@ -81,6 +90,7 @@ Wenlan reaches these services, so their own terms decide what they do with the r
 | --- | --- | --- |
 | GitHub | The two version checks, downloading a release, and installing the Claude Code or Codex plugin from Settings, which clones this repository's plugin marketplace | [GitHub Privacy Statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement) |
 | Hugging Face | Downloading the search model, and any optional model you install | [Hugging Face Privacy Policy](https://huggingface.co/privacy) |
+| npm, which GitHub operates | Only when no `wenlan-mcp` binary is installed, in which case your AI client runs `npx` to fetch it | [GitHub Privacy Statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement) |
 | Cloudflare | Only if you turn on Remote Access, which runs `cloudflared` to open the tunnel | [Cloudflare Privacy Policy](https://www.cloudflare.com/privacypolicy/) |
 | The host of a remote image in one of your notes | Displaying a note whose Markdown points at a remote image | Whoever runs that host. Wenlan cannot know who that is |
 
@@ -101,7 +111,7 @@ None of these is contacted unless you save a key and choose that provider for en
 | DeepSeek | [DeepSeek Privacy Policy](https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html) |
 | xAI | [xAI Privacy Policy](https://x.ai/legal/privacy-policy) |
 
-Wenlan also offers presets for Ollama and LM Studio, which run on your own machine and reach no network outside it, and a custom option where you type the address yourself. For a custom address, the policy is whatever the operator of that address publishes.
+Wenlan also offers presets for Ollama and LM Studio. Wenlan sends those requests to an address on your own machine, so nothing you capture leaves it by that route; what those two programs do on their own is up to them, not something this project can promise. There is also a custom option where you type the address yourself. For a custom address, the policy is whatever the operator of that address publishes.
 
 Wenlan's own relay, at `origin-relay.originmemory.workers.dev`, is run by this project rather than a third party. It is meant to hold the tunnel address you register and the random identifier described above, and nothing more. Its source is not part of this repository, so that is a statement of intent you cannot check against the code here. It runs on Cloudflare Workers, so Cloudflare sees the requests as the platform underneath it.
 
@@ -113,6 +123,9 @@ Wenlan's own relay, at `origin-relay.originmemory.workers.dev`, is run by this p
   - `~/.config/wenlan-mcp/` holds the Remote Access identifier, which doubles as that feature's shared secret, and the MCP bearer token if you generated one. Neither is removed with the folders above.
   - If you pointed the knowledge or page path at a folder of your own, your pages are in that folder, not under `~/.wenlan/`.
   - Registering a Remote Access tunnel leaves a record on the relay. Turning Remote Access off stops the tunnel on your machine; the app sends no request to remove the registration. Open an issue if you want it deleted.
+  - The log file listed under "Where data is stored" is in none of those folders and is not removed with them.
+  - Wenlan writes an entry for itself into the configuration of each AI client you connect -- Claude Desktop, Claude Code, Cursor, Gemini, Codex. Those entries stay after uninstall, and the client will keep trying to launch Wenlan. Remove them by hand. The command-line tool also leaves a timestamped backup of each file it edited, beside the original.
+  - An install upgraded from Origin may also have `~/.config/origin-mcp/`, holding that version's identifier and token.
 - Uninstall the daemon: run `wenlan background off` to stop it and disable autostart (this is a reversible runtime stop, not an uninstall), then remove the service registration for your platform -- `~/Library/LaunchAgents/com.wenlan.server.plist` (macOS), `~/.config/systemd/user/wenlan-server.service` (Linux), or the `WenlanServer` scheduled task (Windows) -- and delete `~/.wenlan/bin/`.
 - **Uninstall the desktop app:** turn off *Run Wenlan in background at login* in Settings and quit the app (this removes `~/Library/LaunchAgents/com.wenlan.server.plist` and `com.wenlan.desktop.plist` on macOS), then delete `Wenlan.app`; on Windows run the uninstaller from Apps & features. The data folders above stay until you delete them.
 
