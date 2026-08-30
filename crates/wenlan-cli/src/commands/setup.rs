@@ -3,6 +3,7 @@
 
 use clap::{Subcommand, ValueEnum};
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use wenlan_core::{config, on_device_models};
 
 use crate::client::origin_host_from_env;
@@ -244,6 +245,7 @@ pub async fn run_reranker(mode: RerankerModeArg) -> anyhow::Result<()> {
 pub async fn run_doctor() -> anyhow::Result<()> {
     println!("Wenlan doctor");
     println!();
+    print_data_root();
     print_daemon_health().await;
     #[cfg(target_os = "macos")]
     print_daemon_log_paths();
@@ -259,6 +261,41 @@ pub async fn run_doctor() -> anyhow::Result<()> {
     print_space_resolution(&cwd);
 
     Ok(())
+}
+
+/// The store the daemon and CLI resolve to — the same `WENLAN_DATA_DIR`-aware
+/// lookup the daemon uses at startup.
+fn print_data_root() {
+    let root = config::data_root();
+    println!("Data root: {}", root.display());
+    let tmpdir = std::env::var_os("TMPDIR").map(PathBuf::from);
+    if let Some(warning) = scratch_data_root_warning(&root, tmpdir.as_deref()) {
+        println!("{warning}");
+    }
+}
+
+/// Warns when the data root sits in a directory the OS may empty on its own.
+/// A daemon pointed at scratch space comes up serving an empty store while the
+/// real memories stay where they were, and nothing else says so: on 2026-08-09
+/// a `WENLAN_DATA_DIR` under `/private/tmp` served 0 memories and 0 spaces
+/// against a store holding about 3,000.
+///
+/// An empty or root `TMPDIR` is ignored — every path starts with those.
+fn scratch_data_root_warning(root: &Path, tmpdir: Option<&Path>) -> Option<String> {
+    let mut scratch_roots = vec![Path::new("/tmp"), Path::new("/private/tmp")];
+    if let Some(tmpdir) = tmpdir.filter(|dir| dir.parent().is_some()) {
+        scratch_roots.push(tmpdir);
+    }
+    scratch_roots
+        .iter()
+        .any(|scratch| root.starts_with(scratch))
+        .then(|| {
+            "  WARNING: that is a temporary directory. The OS can empty it at any time, so the \
+             daemon can come up serving an empty store while your real memories stay where they \
+             were.\n  WENLAN_DATA_DIR is what points here: clear it from your shell and from the \
+             background service registration to go back to the default store."
+                .to_string()
+        })
 }
 
 /// Where the daemon logs when its data root is not writable (mirrors
@@ -992,7 +1029,10 @@ fn prompt_secret(prompt: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod doctor_tests {
-    use super::{last_daemon_error, last_daemon_error_since, strip_ansi};
+    use super::{
+        last_daemon_error, last_daemon_error_since, scratch_data_root_warning, strip_ansi,
+    };
+    use std::path::Path;
 
     #[test]
     fn last_daemon_error_since_ignores_errors_written_before_the_mark() {
@@ -1085,5 +1125,49 @@ mod doctor_tests {
     fn strip_ansi_leaves_plain_text_alone() {
         assert_eq!(strip_ansi("plain ERROR line"), "plain ERROR line");
         assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn a_scratch_data_root_is_warned_about() {
+        for root in ["/tmp/wenlan", "/private/tmp/wenlan-scratch"] {
+            let warning = scratch_data_root_warning(Path::new(root), None)
+                .unwrap_or_else(|| panic!("{root} must be warned about"));
+            assert!(warning.contains("temporary directory"), "{warning}");
+            assert!(warning.contains("WENLAN_DATA_DIR"), "{warning}");
+        }
+        assert!(
+            scratch_data_root_warning(
+                Path::new("/var/folders/ab/T/wenlan"),
+                Some(Path::new("/var/folders/ab/T")),
+            )
+            .is_some(),
+            "a data root under $TMPDIR is scratch space too"
+        );
+    }
+
+    #[test]
+    fn a_real_data_root_is_not_warned_about() {
+        assert_eq!(
+            scratch_data_root_warning(
+                Path::new("/Users/someone/Library/Application Support/wenlan"),
+                Some(Path::new("/var/folders/ab/T")),
+            ),
+            None
+        );
+    }
+
+    /// An unset or degenerate TMPDIR must not turn every store into a warning.
+    #[test]
+    fn an_empty_or_root_tmpdir_matches_nothing() {
+        for tmpdir in ["", "/"] {
+            assert_eq!(
+                scratch_data_root_warning(
+                    Path::new("/Users/someone/Library/Application Support/wenlan"),
+                    Some(Path::new(tmpdir)),
+                ),
+                None,
+                "TMPDIR={tmpdir:?}"
+            );
+        }
     }
 }

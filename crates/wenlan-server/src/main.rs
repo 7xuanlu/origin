@@ -729,7 +729,14 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
     // Data directory. `WENLAN_DATA_DIR` (set by `--data-dir` flag) overrides the
     // default, enabling isolated dev/demo runs (e.g. `--data-dir /tmp/wenlan-demo`).
     let data_dir = wenlan_root.join("memorydb");
-    tracing::info!("Wenlan data root: {}", wenlan_root.display());
+    // First thing after the version banner, and the line `wenlan doctor` sends
+    // people to: a daemon pointed at the wrong store looks healthy otherwise.
+    // The file name mirrors `MemoryDB` in wenlan-core (`db.rs`).
+    tracing::info!(
+        "Wenlan data root: {} (database {})",
+        wenlan_root.display(),
+        data_dir.join("origin_memory.db").display()
+    );
     let _data_root_lock = DaemonDataLock::acquire(&wenlan_root, startup_repair_claimed)?;
 
     let startup::PreparedStartupState {
