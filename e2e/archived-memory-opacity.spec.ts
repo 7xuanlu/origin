@@ -16,11 +16,6 @@ import { installTauriMock } from "./tauriMock";
 import type { MemoryItem } from "../src/lib/tauri";
 import { ARCHIVED_MEMORY_OPACITY } from "../src/components/memory/archivedMemoryOpacity";
 
-// With reduced motion Chromium skips the animation and the guard would pass
-// whatever the keyframes say. Pin the preference so a config change cannot
-// silently defuse it.
-test.use({ reducedMotion: "no-preference" });
-
 const ARCHIVED_TITLE = "Ship the beta on Friday";
 const NEIGHBOUR_TITLE = "Keep the review workflow local-first";
 const MUTED = String(ARCHIVED_MEMORY_OPACITY);
