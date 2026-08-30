@@ -3229,7 +3229,7 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        1041,
+        1046,
         "PR-D integration must expose the frozen 967 support calls, the 6 PR-D test identities, \
          the 5 M5 derivation-marker fixture calls, the 10 M6 shadow-promoter fixture calls, \
          the 7 G6 BindPageLink repair-test calls (G6 Stage 2 PR 2b, item 3: \
@@ -3348,7 +3348,13 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
          synthesis/distill.rs's new refresh_page_rebuilds_the_summary_from_the_new_body \
          contributes test_primary_session|1 and TestDbSession::execute|1 (the raw UPDATE that \
          plants an old first-bullet summary on the page before the refresh re-derives it from \
-         the new body)"
+         the new body); plus the 5 PR #598 follow-up calls in \
+         post_write::tests::\
+         accept_pending_revision_discards_a_page_card_staged_before_source_revision_fencing, \
+         which ages a staged page card back to its pre-#598 shape to prove the accept path \
+         refuses it: test_primary_session|1, TestDbSession::query|1, TestDbRows::next|1 and \
+         TestDbRow::get|1 read the card's structured_fields, TestDbSession::execute|1 writes \
+         them back with source_revision removed"
     );
 }
 

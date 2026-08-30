@@ -66,9 +66,9 @@ async fn resolve_page_revision_card(
     // only decodes two legacy shapes: cards staged before the field existed
     // at all (missing key), and cards staged in the window where the field
     // existed but callers could still pass `None` through it (a literal JSON
-    // `null`). Both are treated the same as a pre-versioning `page_version`:
-    // accepted on the version fence alone rather than inventing a base to
-    // check.
+    // `null`). Both are stale by construction, and
+    // `accept_page_revision_card` refuses them -- see the rejection there for
+    // why a missing base cannot be substituted with the version fence.
     let source_revision = structured.get("source_revision").and_then(|v| v.as_i64());
 
     Ok(Some(PageRevisionCard {
@@ -81,15 +81,40 @@ async fn resolve_page_revision_card(
     }))
 }
 
-// Current PageWrite cards record the Page version they were staged from, and
-// `try_accept_page_revision` checks it atomically with card consumption.
-// Legacy cards without `page_version` remain accepted for compatibility; their
-// missing base is explicit in `PageRevisionCard` rather than silently invented.
+// Current PageWrite cards record the Page version *and* the source revision
+// they were staged from, and `try_accept_page_revision` checks both atomically
+// with card consumption. A card carrying no `source_revision` is refused
+// outright and its page re-queued; a card carrying no `page_version` still
+// accepts on the source-revision fence, which is the stronger of the two.
 async fn accept_page_revision_card(
     db: &MemoryDB,
     card: PageRevisionCard,
     knowledge_path: Option<&Path>,
 ) -> Result<wenlan_types::RevisionAcceptResponse, WenlanError> {
+    // A card staged before source-revision fencing (PR #598) records no base
+    // to check its evidence against. `version` alone cannot stand in: it does
+    // not move when a source is attached to or detached from the page, so a
+    // card compiled from evidence the page no longer holds would still pass
+    // the version fence and write prose citing sources that are gone. Nothing
+    // on the row can tell us whether that happened. So refuse the card,
+    // delete it, and mark the page stale -- `"source_updated"` is the reason
+    // string every stale-page consumer queries -- so the refresh lane
+    // regenerates a fenced card from the evidence the page holds now.
+    //
+    // Stale first, delete second: if the delete fails the page is merely
+    // re-queued twice, whereas the other order can drop the card while
+    // leaving the page unqueued, with nothing left to rebuild it from.
+    if card.source_revision.is_none() {
+        db.set_page_stale(&card.page_id, "source_updated").await?;
+        db.delete_by_source_id("memory", &card.revision_id).await?;
+        return Err(WenlanError::Conflict(format!(
+            "revision card {} for page {} was staged before source-revision fencing, so it \
+             cannot be checked against the page's current sources. The card has been \
+             discarded and the page re-queued to be regenerated from the sources it holds now.",
+            card.revision_id, card.page_id
+        )));
+    }
+
     let current = db
         .get_page(&card.page_id)
         .await?
