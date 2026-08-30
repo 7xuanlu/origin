@@ -33770,6 +33770,14 @@ async fn user_version(db: &MemoryDB) -> i64 {
     rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
 }
 
+async fn incarnation_of(db: &MemoryDB, page_id: &str) -> String {
+    db.try_get_page_fence(page_id)
+        .await
+        .unwrap()
+        .expect("page exists")
+        .incarnation
+}
+
 async fn pages_has_column(db: &MemoryDB, column: &str) -> bool {
     let conn = db.conn.lock().await;
     let mut rows = conn
@@ -53620,6 +53628,7 @@ async fn set_page_citations_with_changelog_at_version_rejects_stale_source_revis
 
     // The stale writer's CAS must not match: version still matches, but
     // source_revision has moved on.
+    let incarnation = incarnation_of(&db, "page_source_cas").await;
     let stale_changelog =
         r#"[{"edited_by":"citation_backfill","at":1,"citations_summary":"stale write"}]"#;
     let wrote_stale = db
@@ -53629,6 +53638,7 @@ async fn set_page_citations_with_changelog_at_version_rejects_stale_source_revis
             stale_changelog,
             version,
             stale_source_revision,
+            &incarnation,
         )
         .await
         .unwrap();
@@ -53667,6 +53677,7 @@ async fn set_page_citations_with_changelog_at_version_rejects_stale_source_revis
             current_changelog,
             version,
             current_source_revision,
+            &incarnation,
         )
         .await
         .unwrap();
@@ -53735,6 +53746,7 @@ async fn combine_version_and_source_revision_cas_rejected_for_non_growth_non_bac
             None,
             Some(version),
             Some(source_revision),
+            None,
             None,
             None,
             None,
@@ -53828,6 +53840,7 @@ async fn citation_backfill_combined_cas_writes_on_match_and_rejects_stale_source
         .unwrap();
     let stale_source_revision = current_source_revision + 1;
 
+    let incarnation = incarnation_of(&db, "page_combine_backfill").await;
     let wrote_stale = db
         .try_update_page_content_with_changelog_at_versions(
             "page_combine_backfill",
@@ -53837,6 +53850,7 @@ async fn citation_backfill_combined_cas_writes_on_match_and_rejects_stale_source
             None,
             version,
             stale_source_revision,
+            &incarnation,
             None,
         )
         .await
@@ -53864,6 +53878,7 @@ async fn citation_backfill_combined_cas_writes_on_match_and_rejects_stale_source
             None,
             version,
             current_source_revision,
+            &incarnation,
             None,
         )
         .await
@@ -53948,6 +53963,7 @@ async fn combined_cas_read_order_rejects_write_racing_a_mid_read_attach() {
             Some("[]"),
             page.version,
             source_revision,
+            &incarnation_of(&db, "page_read_order").await,
             None,
         )
         .await
@@ -56966,6 +56982,211 @@ async fn migration_126_rearms_empty_citations_to_null_exactly_once() {
     assert_eq!(
         citations_of(&db, "m126-archived-pill").await,
         Some("[]".to_string())
+    );
+}
+
+/// Migration 128: every existing page row is stamped with a distinct
+/// incarnation token; a row that already carries one keeps it (idempotent
+/// replay), and a fresh insert mints its own without the migration.
+#[tokio::test]
+async fn migration_128_stamps_every_existing_page_with_a_distinct_incarnation() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for id in ["m127-a", "m127-b", "m127-keep"] {
+        db.insert_page(id, "T", None, "body", None, None, &[], &now)
+            .await
+            .unwrap();
+    }
+    assert!(pages_has_column(&db, "incarnation").await);
+    let keep_before = incarnation_of(&db, "m127-keep").await;
+    assert_eq!(
+        keep_before.len(),
+        32,
+        "a fresh insert mints its own token: {keep_before:?}"
+    );
+
+    // Pre-127 shape: rows carrying only the column DEFAULT.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET incarnation = '' WHERE id IN ('m127-a', 'm127-b')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("PRAGMA user_version = 126", ()).await.unwrap();
+    }
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .unwrap();
+    assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+
+    let a = incarnation_of(&db, "m127-a").await;
+    let b = incarnation_of(&db, "m127-b").await;
+    assert_eq!(a.len(), 32, "16 random bytes as lower-case hex: {a:?}");
+    assert!(
+        a.bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "lower-case hex: {a:?}"
+    );
+    assert_ne!(a, b, "every row must get its own token");
+    assert_eq!(
+        incarnation_of(&db, "m127-keep").await,
+        keep_before,
+        "an already-stamped row keeps its token"
+    );
+
+    // Replay: nothing left to stamp, every token unchanged.
+    {
+        let conn = db.conn.lock().await;
+        conn.execute("PRAGMA user_version = 126", ()).await.unwrap();
+    }
+    db.run_migrations(&crate::events::NoopEmitter)
+        .await
+        .expect("re-running migration 128 must be a no-op");
+    assert_eq!(incarnation_of(&db, "m127-a").await, a);
+    assert_eq!(incarnation_of(&db, "m127-b").await, b);
+    assert_eq!(incarnation_of(&db, "m127-keep").await, keep_before);
+}
+
+/// Delete-and-recreate ABA: `version` and `source_revision` both restart at
+/// their initial values when a page is deleted and re-created under the same
+/// id, so both fences a backfill writer captured against the OLD row still
+/// match the NEW row. The incarnation token is what tells them apart: a
+/// write carrying the old token must be refused at both terminal CAS entry
+/// points, and the same write carrying the new token must land.
+#[tokio::test]
+async fn page_cas_writes_carrying_a_previous_incarnation_are_refused_after_delete_and_recreate() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_page(
+        "page_aba",
+        "T",
+        None,
+        "body",
+        None,
+        None,
+        &["mem_seed"],
+        &now,
+    )
+    .await
+    .unwrap();
+    let old = db.try_get_page_fence("page_aba").await.unwrap().unwrap();
+    let old_version = db.get_page("page_aba").await.unwrap().unwrap().version;
+
+    db.delete_page("page_aba").await.unwrap();
+    assert!(
+        db.try_get_page_fence("page_aba").await.unwrap().is_none(),
+        "sanity: the row is gone"
+    );
+    db.insert_page(
+        "page_aba",
+        "T",
+        None,
+        "body",
+        None,
+        None,
+        &["mem_seed"],
+        &now,
+    )
+    .await
+    .unwrap();
+    let new = db.try_get_page_fence("page_aba").await.unwrap().unwrap();
+    let new_version = db.get_page("page_aba").await.unwrap().unwrap().version;
+    assert_eq!(
+        (new_version, new.source_revision),
+        (old_version, old.source_revision),
+        "sanity: both counters restart on re-create -- that IS the ABA hazard"
+    );
+    assert_ne!(
+        new.incarnation, old.incarnation,
+        "sanity: the re-created row must carry a fresh token"
+    );
+
+    // Citation-only terminal write (the give-up / poison-pill path).
+    let wrote_stale = db
+        .set_page_citations_with_changelog_at_version(
+            "page_aba",
+            Some("[]"),
+            "[]",
+            old_version,
+            old.source_revision,
+            &old.incarnation,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !wrote_stale,
+        "a citations write carrying the old incarnation must be refused"
+    );
+    assert!(
+        db.get_pages_missing_citations(10)
+            .await
+            .unwrap()
+            .contains(&"page_aba".to_string()),
+        "the refused write must not have knocked the re-created page out of the queue"
+    );
+    let wrote_current = db
+        .set_page_citations_with_changelog_at_version(
+            "page_aba",
+            Some("[]"),
+            "[]",
+            new_version,
+            new.source_revision,
+            &new.incarnation,
+        )
+        .await
+        .unwrap();
+    assert!(
+        wrote_current,
+        "the same write with the current token must land"
+    );
+
+    // Content-rewriting terminal write (the annotate path).
+    let wrote_stale = db
+        .try_update_page_content_with_changelog_at_versions(
+            "page_aba",
+            "stale body",
+            &["mem_seed"],
+            "[]",
+            Some("[]"),
+            old_version,
+            old.source_revision,
+            &old.incarnation,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !wrote_stale,
+        "a content write carrying the old incarnation must be refused"
+    );
+    assert_eq!(
+        db.get_page("page_aba").await.unwrap().unwrap().content,
+        "body",
+        "the refused write must not have landed"
+    );
+    let wrote_current = db
+        .try_update_page_content_with_changelog_at_versions(
+            "page_aba",
+            "annotated body",
+            &["mem_seed"],
+            "[]",
+            Some("[]"),
+            new_version,
+            new.source_revision,
+            &new.incarnation,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        wrote_current,
+        "the same write with the current token must land"
+    );
+    assert_eq!(
+        db.get_page("page_aba").await.unwrap().unwrap().content,
+        "annotated body"
     );
 }
 

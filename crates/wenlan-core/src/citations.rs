@@ -339,9 +339,11 @@ pub(crate) fn attempt_key(page_id: &str) -> String {
 /// `source_revision`, leaving `version` unchanged, so matching on `version`
 /// alone would let failed attempts against the OLD evidence set carry over
 /// and poison-pill a page that has since gained fresh, never-tried
-/// evidence.
-fn attempt_generation(page_version: i64, source_revision: i64) -> String {
-    format!("v{page_version}:s{source_revision}:")
+/// evidence. Keyed on the page `incarnation` too: a page deleted and
+/// re-created under the same id restarts both counters, so without it the
+/// old row's failures would count toward poison-pilling the new one.
+fn attempt_generation(incarnation: &str, page_version: i64, source_revision: i64) -> String {
+    format!("i{incarnation}:v{page_version}:s{source_revision}:")
 }
 
 /// Parse the attempt count out of a stored `app_metadata` value, but only
@@ -392,12 +394,13 @@ async fn build_backfill_changelog(
 async fn record_annotate_failure(
     db: &MemoryDB,
     page_id: &str,
+    incarnation: &str,
     page_version: i64,
     expected_source_revision: i64,
     giveup_reason: &str,
 ) -> Result<(), WenlanError> {
     let key = attempt_key(page_id);
-    let generation = attempt_generation(page_version, expected_source_revision);
+    let generation = attempt_generation(incarnation, page_version, expected_source_revision);
     let attempts = db
         .get_app_metadata(&key)
         .await?
@@ -413,6 +416,7 @@ async fn record_annotate_failure(
                 &changelog,
                 page_version,
                 expected_source_revision,
+                incarnation,
             )
             .await?;
         if landed {
@@ -496,10 +500,14 @@ async fn run_citation_backfill_with_page_limit(
         // deleted between selection (`get_pages_missing_citations`, above)
         // and this read must skip like the `get_page` miss right below it,
         // not abort the whole slice with `get_page_source_revision`'s
-        // does-not-exist error.
-        let Some(source_revision) = db.try_get_page_source_revision(&page_id).await? else {
+        // does-not-exist error. The fence also carries the row's
+        // incarnation: a page deleted and re-created under this id between
+        // here and the write restarts both counters, and only the token
+        // tells the new row from the old.
+        let Some(fence) = db.try_get_page_fence(&page_id).await? else {
             continue;
         };
+        let source_revision = fence.source_revision;
         let Some(page) = db.get_page(&page_id).await? else {
             continue;
         };
@@ -532,6 +540,7 @@ async fn run_citation_backfill_with_page_limit(
                     &changelog,
                     page.version,
                     source_revision,
+                    &fence.incarnation,
                 )
                 .await?;
             if landed {
@@ -545,7 +554,7 @@ async fn run_citation_backfill_with_page_limit(
                 let _ = db
                     .delete_app_metadata_if_value_starts_with(
                         &attempt_key(&page_id),
-                        &attempt_generation(page.version, source_revision),
+                        &attempt_generation(&fence.incarnation, page.version, source_revision),
                     )
                     .await;
             }
@@ -610,6 +619,7 @@ async fn run_citation_backfill_with_page_limit(
                     &changelog,
                     page.version,
                     source_revision,
+                    &fence.incarnation,
                 )
                 .await?;
             if landed {
@@ -618,7 +628,7 @@ async fn run_citation_backfill_with_page_limit(
                 let _ = db
                     .delete_app_metadata_if_value_starts_with(
                         &attempt_key(&page_id),
-                        &attempt_generation(page.version, source_revision),
+                        &attempt_generation(&fence.incarnation, page.version, source_revision),
                     )
                     .await;
             }
@@ -647,6 +657,7 @@ async fn run_citation_backfill_with_page_limit(
                 record_annotate_failure(
                     db,
                     &page_id,
+                    &fence.incarnation,
                     page.version,
                     source_revision,
                     "citation backfill gave up: provider error after 3 attempts",
@@ -674,6 +685,7 @@ async fn run_citation_backfill_with_page_limit(
                 record_annotate_failure(
                     db,
                     &page_id,
+                    &fence.incarnation,
                     page.version,
                     source_revision,
                     "citation backfill gave up: zero markers after 3 attempts",
@@ -703,6 +715,7 @@ async fn run_citation_backfill_with_page_limit(
                         Some(&json),
                         page.version,
                         source_revision,
+                        &fence.incarnation,
                         None,
                     )
                     .await?;
@@ -715,7 +728,7 @@ async fn run_citation_backfill_with_page_limit(
                     let _ = db
                         .delete_app_metadata_if_value_starts_with(
                             &attempt_key(&page_id),
-                            &attempt_generation(page.version, source_revision),
+                            &attempt_generation(&fence.incarnation, page.version, source_revision),
                         )
                         .await;
                 }
@@ -724,6 +737,7 @@ async fn run_citation_backfill_with_page_limit(
             record_annotate_failure(
                 db,
                 &page_id,
+                &fence.incarnation,
                 page.version,
                 source_revision,
                 "citation backfill gave up: annotate guard rejected 3x",
@@ -977,6 +991,14 @@ mod tests {
 
     const BACKFILL_BODY: &str = "The daemon binds to port 7878 by default.";
     const BACKFILL_MEM_CONTENT: &str = "The daemon binds to port 7878 by default";
+
+    async fn incarnation_of(db: &crate::db::MemoryDB, page_id: &str) -> String {
+        db.try_get_page_fence(page_id)
+            .await
+            .unwrap()
+            .expect("page exists")
+            .incarnation
+    }
 
     async fn seed_backfill_page(db: &crate::db::MemoryDB, page_id: &str, with_evidence: bool) {
         let now = chrono::Utc::now().to_rfc3339();
@@ -1301,7 +1323,17 @@ mod tests {
         let attempts = db.get_app_metadata(&attempt_key("p_guard")).await.unwrap();
         assert_eq!(
             attempts.as_deref(),
-            Some(format!("{}1", attempt_generation(version, source_revision)).as_str())
+            Some(
+                format!(
+                    "{}1",
+                    attempt_generation(
+                        &incarnation_of(&db, "p_guard").await,
+                        version,
+                        source_revision
+                    )
+                )
+                .as_str()
+            )
         );
     }
 
@@ -1421,7 +1453,14 @@ mod tests {
         // than deleting nothing.
         db.set_app_metadata(
             &attempt_key("p_cleanup_success"),
-            &format!("{}1", attempt_generation(version, source_revision)),
+            &format!(
+                "{}1",
+                attempt_generation(
+                    &incarnation_of(&db, "p_cleanup_success").await,
+                    version,
+                    source_revision
+                )
+            ),
         )
         .await
         .unwrap();
@@ -1531,7 +1570,8 @@ mod tests {
         // generation -- the call below is the 3rd, reaching the poison
         // threshold and attempting the terminal CAS write.
         let key = attempt_key("p_poison_cas_rejected");
-        let generation = attempt_generation(version, stale_source_revision);
+        let incarnation = incarnation_of(&db, "p_poison_cas_rejected").await;
+        let generation = attempt_generation(&incarnation, version, stale_source_revision);
         db.set_app_metadata(&key, &format!("{generation}2"))
             .await
             .unwrap();
@@ -1555,6 +1595,7 @@ mod tests {
         record_annotate_failure(
             &db,
             "p_poison_cas_rejected",
+            &incarnation,
             version,
             stale_source_revision,
             "citation backfill gave up: test",
@@ -1594,7 +1635,14 @@ mod tests {
             .unwrap();
         db.set_app_metadata(
             &attempt_key("p_giveup_cleanup"),
-            &format!("{}1", attempt_generation(page.version, source_revision)),
+            &format!(
+                "{}1",
+                attempt_generation(
+                    &incarnation_of(&db, "p_giveup_cleanup").await,
+                    page.version,
+                    source_revision
+                )
+            ),
         )
         .await
         .unwrap();
@@ -1658,10 +1706,36 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some(format!("{}1", attempt_generation(version, new_source_revision)).as_str()),
+            Some(
+                format!(
+                    "{}1",
+                    attempt_generation(
+                        &incarnation_of(&db, "p_rollover").await,
+                        version,
+                        new_source_revision
+                    )
+                )
+                .as_str()
+            ),
             "the rolled-over generation's count must start fresh at 1, overwriting the old \
              generation's value in place"
         );
+    }
+
+    /// Delete-and-recreate ABA at the counter: a re-created page restarts at
+    /// the same `version`/`source_revision` the old row started at, so the
+    /// generation prefix must carry the incarnation too, or failures
+    /// recorded against the OLD row would count toward poison-pilling the
+    /// NEW one. A pre-127 value (no incarnation) is a foreign generation for
+    /// the same reason.
+    #[test]
+    fn attempts_recorded_against_a_previous_incarnation_count_as_zero() {
+        let old = attempt_generation("0123", 1, 0);
+        let new = attempt_generation("89ab", 1, 0);
+        assert_ne!(old, new);
+        assert_eq!(parse_attempts(&format!("{old}2"), &new), 0);
+        assert_eq!(parse_attempts(&format!("{new}2"), &new), 2);
+        assert_eq!(parse_attempts("v1:s0:2", &new), 0);
     }
 
     /// Round-5 finding F2/F3, citations-level: the same guarantee
@@ -1672,8 +1746,8 @@ mod tests {
     async fn terminal_cleanup_does_not_touch_a_newer_generation() {
         let (db, _dir) = crate::db::tests::test_db().await;
         let key = attempt_key("p_generation_race");
-        let older = attempt_generation(1, 1);
-        let newer = attempt_generation(1, 2);
+        let older = attempt_generation("same", 1, 1);
+        let newer = attempt_generation("same", 1, 2);
         db.set_app_metadata(&key, &format!("{newer}1"))
             .await
             .unwrap();
@@ -1720,7 +1794,14 @@ mod tests {
         let key = attempt_key("p_provider_error");
         db.set_app_metadata(
             &key,
-            &format!("{}2", attempt_generation(version, source_revision)),
+            &format!(
+                "{}2",
+                attempt_generation(
+                    &incarnation_of(&db, "p_provider_error").await,
+                    version,
+                    source_revision
+                )
+            ),
         )
         .await
         .unwrap();
@@ -1820,7 +1901,17 @@ mod tests {
         let attempts = db.get_app_metadata(&attempt_key("p_zero")).await.unwrap();
         assert_eq!(
             attempts.as_deref(),
-            Some(format!("{}1", attempt_generation(version, source_revision)).as_str())
+            Some(
+                format!(
+                    "{}1",
+                    attempt_generation(
+                        &incarnation_of(&db, "p_zero").await,
+                        version,
+                        source_revision
+                    )
+                )
+                .as_str()
+            )
         );
 
         // Two more zero-marker ticks trigger the poison-pill.
@@ -1882,7 +1973,17 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some(format!("{}2", attempt_generation(version, original_source_revision)).as_str()),
+            Some(
+                format!(
+                    "{}2",
+                    attempt_generation(
+                        &incarnation_of(&db, "p_budget_reset").await,
+                        version,
+                        original_source_revision
+                    )
+                )
+                .as_str()
+            ),
             "sanity: two consecutive rejections must have recorded 2 attempts \
              against the original generation"
         );
@@ -1925,7 +2026,17 @@ mod tests {
             .unwrap();
         assert_eq!(
             attempts_after.as_deref(),
-            Some(format!("{}1", attempt_generation(version, new_source_revision)).as_str()),
+            Some(
+                format!(
+                    "{}1",
+                    attempt_generation(
+                        &incarnation_of(&db, "p_budget_reset").await,
+                        version,
+                        new_source_revision
+                    )
+                )
+                .as_str()
+            ),
             "the new generation's attempt count must start fresh at 1, overwriting the old \
              generation's value in place -- exactly one app_metadata row for this page, ever"
         );
