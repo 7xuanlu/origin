@@ -249,6 +249,46 @@ describe("PageDetail citations", () => {
     expect(popover.style.fontStyle).toBe("normal");
   });
 
+  it("keeps a long first sentence in the lede when its citation links are what pushed it past the cap", async () => {
+    const sentence =
+      "Tally stores all data in one SQLite file next to the application, with automated nightly backups to iCloud Drive and manual restoration procedures, magic link authentication for the single user, fourteen day payment terms with overdue reminders at days seven and fourteen, and no Kubernetes or Postgres anywhere in the stack because the requirements stay deliberately minimal [1][2].";
+    // The regression: the cap was measured after the markers became links, so
+    // a sentence a reader sees as 376 characters counted as 409 and lost its
+    // place in the quote.
+    expect(sentence.replace(/ ?\[\d+\]/g, "").length).toBeLessThan(400);
+    expect(sentence.replace(/\[(\d+)\]/g, "[$1](#citation:$1)").length).toBeGreaterThan(400);
+    tauriMocks.getPage.mockResolvedValue({
+      ...BASE_PAGE,
+      summary: null,
+      content: `# Cited Page\n\n${sentence} The app process is the only writer.`,
+      citations: [cite(1, 1), cite(2, 2)],
+    });
+    renderPage();
+    expect(await screen.findByText("Cited Page")).toBeInTheDocument();
+    const lede = document.querySelector(".page-detail-lede") as HTMLElement;
+    expect(within(lede).getByRole("button", { name: /mem-1/ })).toBeInTheDocument();
+    expect(within(lede).getByRole("button", { name: /mem-2/ })).toBeInTheDocument();
+    expect(screen.getAllByText(/deliberately minimal/)).toHaveLength(1);
+  });
+
+  it("drops a TLDR label the model wrote, in the quote and in the body", async () => {
+    tauriMocks.getPage.mockResolvedValue({
+      ...BASE_PAGE,
+      // What a daemon without the matching core fix stored.
+      summary: "TLDR: Tally stores all data in one SQLite file next to the app.",
+      content:
+        "# Cited Page\n\nTLDR: Tally stores all data in one SQLite file next to the app [1][2]. The app process is the only writer.",
+      citations: [cite(1, 1), cite(2, 2)],
+    });
+    renderPage();
+    expect(await screen.findByText("Cited Page")).toBeInTheDocument();
+    const lede = document.querySelector(".page-detail-lede") as HTMLElement;
+    expect(lede.textContent).not.toContain("TLDR");
+    expect(within(lede).getByRole("button", { name: /mem-1/ })).toBeInTheDocument();
+    // The sentence moved up into the quote instead of being repeated below it.
+    expect(screen.getAllByText(/Tally stores all data in one SQLite file/)).toHaveLength(1);
+  });
+
   it("renders a hand-set summary plain and keeps the first sentence in the body", async () => {
     tauriMocks.getPage.mockResolvedValue({
       ...BASE_PAGE,

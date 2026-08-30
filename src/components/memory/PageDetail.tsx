@@ -38,6 +38,7 @@ import PageInfo from "./page/PageInfo";
 import { pageReviewNotice, type PageReviewNotice } from "./page/pageReviewNotice";
 import { RailPanelTitle } from "./MemoryDetailPrimitives";
 import { processCitations, stripCitationLinks } from "../../lib/pageCitations";
+import { stripLedeLabel } from "../../lib/pageLede";
 import CitationChip from "./page/CitationChip";
 import PageCanvas from "./PageCanvas";
 import {
@@ -1286,16 +1287,25 @@ export default function PageDetail({
       .map((cs) => [cs.source.memory_source_id, cs.memory]),
   );
 
-  // Extract TLDR (first sentence) for native rendering under title.
+  // Extract the lede (first sentence) for native rendering under title.
   // Match first sentence ending with ". " or ".\n" — but not inside [[wikilinks]] or after abbreviations.
   // Scan starts after any leading heading lines so a body that opens with
   // "## Section" doesn't leak raw markdown into the plain-text lede.
   const leadingHeadings = cleanedContent.match(/^(?:#{1,6}[^\n]*\n+)+/)?.[0].length ?? 0;
   const bodyAfterHeadings = cleanedContent.slice(leadingHeadings);
   const sentenceEnd = bodyAfterHeadings.search(/\.\s/);
-  const tldr = sentenceEnd > 0 && sentenceEnd < 400
-    ? stripCitationLinks(bodyAfterHeadings.slice(0, sentenceEnd + 1).trim())
-    : "";
+  // The first sentence in two forms: markdown, with its citation links intact
+  // for the quote, and the plain text a reader sees. A leading "TLDR:" label
+  // is not part of the sentence, so it comes off both. The length cap is
+  // measured on the plain text, because the markers here have already been
+  // rewritten to `[1](#citation:1)` links: a short sentence carrying a few of
+  // them was pushed past the cap and dropped out of the lede, which left the
+  // quote without its chips and repeated the sentence in the body.
+  const firstSentenceMarkdown =
+    sentenceEnd > 0 ? stripLedeLabel(bodyAfterHeadings.slice(0, sentenceEnd + 1).trim()) : "";
+  const firstSentenceText = stripCitationLinks(firstSentenceMarkdown);
+  const tldr =
+    firstSentenceText.length > 0 && firstSentenceText.length < 400 ? firstSentenceText : "";
   // The lede shows the page summary when there is one; the first sentence is
   // cut from the body only when it is what the lede shows (no summary, or a
   // summary that repeats it). Cutting it under a different summary dropped
@@ -1303,15 +1313,14 @@ export default function PageDetail({
   // Markers sit before the period ("... setup [1][2]."), so stripping them
   // leaves " ." behind; drop that space with the period before comparing.
   const normalizeSentence = (s: string) =>
-    s.replace(/\[\d+\]/g, "").replace(/\s+/g, " ").trim().replace(/\s*\.$/, "").toLowerCase();
-  const ledeText = page.summary || tldr;
+    stripLedeLabel(s)
+      .replace(/\[\d+\]/g, "").replace(/\s+/g, " ").trim().replace(/\s*\.$/, "").toLowerCase();
+  const ledeText = page.summary ? stripLedeLabel(page.summary) : tldr;
   const ledeIsFirstSentence =
     !page.summary || (tldr !== "" && normalizeSentence(page.summary) === normalizeSentence(tldr));
   // When the lede is the first sentence, render that sentence with its
   // citation links so the chips move up with it instead of disappearing.
-  const ledeMarkdown = tldr && ledeIsFirstSentence
-    ? bodyAfterHeadings.slice(0, sentenceEnd + 1).trim()
-    : "";
+  const ledeMarkdown = tldr && ledeIsFirstSentence ? firstSentenceMarkdown : "";
   const displayContent = tldr && ledeIsFirstSentence
     ? (cleanedContent.slice(0, leadingHeadings) + bodyAfterHeadings.slice(sentenceEnd + 1).trimStart()).trim()
     : cleanedContent;
