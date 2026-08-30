@@ -88,6 +88,12 @@ describe("processCitations", () => {
     const r = processCitations("A. [1] middle [2] B.", []);
     expect(r.content).toBe("A. middle B.");
   });
+
+  it("drops the space a marker before the period leaves behind, but not one inside code", () => {
+    const r = processCitations("Stores all data in one file [5][13]. Run `rm -rf .` first [2].", []);
+    expect(r.state).toBe("stripped-empty");
+    expect(r.content).toBe("Stores all data in one file. Run `rm -rf .` first.");
+  });
 });
 
 describe("stripCitationLinks", () => {
@@ -96,6 +102,7 @@ describe("stripCitationLinks", () => {
       "First claim done.",
     );
     expect(stripCitationLinks("Tail.[2](#citation:2)")).toBe("Tail.");
+    expect(stripCitationLinks("One file [5](#citation:5)[13](#citation:13).")).toBe("One file.");
   });
 });
 

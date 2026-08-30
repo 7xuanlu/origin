@@ -1300,14 +1300,35 @@ export default function PageDetail({
   // cut from the body only when it is what the lede shows (no summary, or a
   // summary that repeats it). Cutting it under a different summary dropped
   // that sentence, and its citations, from the page.
+  // Markers sit before the period ("... setup [1][2]."), so stripping them
+  // leaves " ." behind; drop that space with the period before comparing.
   const normalizeSentence = (s: string) =>
-    s.replace(/\[\d+\]/g, "").replace(/\s+/g, " ").trim().replace(/\.$/, "").toLowerCase();
+    s.replace(/\[\d+\]/g, "").replace(/\s+/g, " ").trim().replace(/\s*\.$/, "").toLowerCase();
   const ledeText = page.summary || tldr;
   const ledeIsFirstSentence =
     !page.summary || (tldr !== "" && normalizeSentence(page.summary) === normalizeSentence(tldr));
+  // When the lede is the first sentence, render that sentence with its
+  // citation links so the chips move up with it instead of disappearing.
+  const ledeMarkdown = tldr && ledeIsFirstSentence
+    ? bodyAfterHeadings.slice(0, sentenceEnd + 1).trim()
+    : "";
   const displayContent = tldr && ledeIsFirstSentence
     ? (cleanedContent.slice(0, leadingHeadings) + bodyAfterHeadings.slice(sentenceEnd + 1).trimStart()).trim()
     : cleanedContent;
+
+  const renderCitation = (k: number) => {
+    const c = processed.byOccurrence.get(k);
+    if (!c) return null;
+    return (
+      <CitationChip
+        occurrence={k}
+        citation={c}
+        sourceMemory={sourceMemoryByLocator.get(c.locator) ?? null}
+        sourcesLoading={pageSources === undefined}
+        onOpenMemory={onMemoryClick}
+      />
+    );
+  };
 
   // Intercept page/memory link clicks in rendered content (capture phase beats target="_blank")
   const handleContentClick = (e: React.MouseEvent) => {
@@ -2092,25 +2113,21 @@ export default function PageDetail({
           <div className="page-detail-prose" onClickCapture={handleContentClick}>
             {ledeText && (
               <div className="page-detail-lede">
-                <p>{ledeText}</p>
+                {ledeMarkdown ? (
+                  <ContentRenderer
+                    content={ledeMarkdown}
+                    variant="lede"
+                    renderCitation={renderCitation}
+                  />
+                ) : (
+                  <p>{ledeText}</p>
+                )}
               </div>
             )}
             <ContentRenderer
               content={displayContent}
               variant="detail"
-              renderCitation={(k) => {
-                const c = processed.byOccurrence.get(k);
-                if (!c) return null;
-                return (
-                  <CitationChip
-                    occurrence={k}
-                    citation={c}
-                    sourceMemory={sourceMemoryByLocator.get(c.locator) ?? null}
-                    sourcesLoading={pageSources === undefined}
-                    onOpenMemory={onMemoryClick}
-                  />
-                );
-              }}
+              renderCitation={renderCitation}
             />
           </div>
           {hasRail && (

@@ -2707,7 +2707,10 @@ html[data-theme="light"] {
   padding: 2px 0 2px 18px;
 }
 
-.page-detail-lede p {
+/* Only the pull quote's own paragraphs: a citation popover opened from a
+   lede chip renders inside this block and must keep its upright type. */
+.page-detail-lede > p,
+.page-detail-lede > .content-renderer > p {
   margin: 0;
   color: var(--mem-text-secondary);
   font-family: var(--mem-font-heading);
