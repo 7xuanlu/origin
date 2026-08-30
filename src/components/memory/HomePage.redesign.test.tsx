@@ -716,6 +716,53 @@ describe("HomePage redesign", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("opens the dialog on the decisions the rail counted, not the merged queue", async () => {
+    const user = userEvent.setup();
+    vi.mocked(tauri.listPages).mockResolvedValue([
+      page({ id: "page-current", title: "Current page" }),
+    ]);
+    vi.mocked(tauri.listPendingRevisions).mockResolvedValue([
+      {
+        target_source_id: "mem-a",
+        revision_source_id: "mem-a-rev",
+        revision_content: "Proposed wording",
+        source_agent: "claude-code",
+        last_modified: 1_782_365_076,
+        target_kind: "memory" as const,
+      },
+    ]);
+    vi.mocked(tauri.listUnconfirmedMemories).mockResolvedValue([
+      {
+        kind: "memory",
+        id: "mem-capture-1",
+        title: "First new memory",
+        snippet: "Captured a moment ago.",
+        timestamp_ms: 1_782_365_080_000,
+        badge: { kind: "needs_review" },
+      },
+      {
+        kind: "memory",
+        id: "mem-capture-2",
+        title: "Second new memory",
+        snippet: "Captured a moment ago.",
+        timestamp_ms: 1_782_365_081_000,
+        badge: { kind: "needs_review" },
+      },
+    ]);
+
+    renderHome({ onOpenDistillReview: vi.fn() });
+
+    const rail = await screen.findByTestId("wiki-page-updates");
+    await within(rail).findByText("1");
+    await user.click(await screen.findByRole("button", { name: /Target memory/ }));
+
+    // The header counter walks the rail's one decision; the two captures in
+    // the merged queue never make it "1 of 3" beside a badge that says 1.
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("1 of 1")).toBeInTheDocument();
+    expect(within(dialog).queryByText("First new memory")).not.toBeInTheDocument();
+  });
+
   it("opens the contradiction dialog with before/after panes and resolves it", async () => {
     const user = userEvent.setup();
     vi.mocked(tauri.listRefinements).mockResolvedValue({
