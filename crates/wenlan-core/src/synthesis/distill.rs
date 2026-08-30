@@ -460,9 +460,11 @@ fn estimate_cluster_tokens(contents: &[String]) -> usize {
 /// `DISTILL_CLUSTER_CONCURRENCY`.
 /// The summary of a distilled page: the first sentence of its first prose
 /// line, skipping headings, blank lines, and everything under an
-/// "Open Questions" heading. Citation markers like `[3]` are removed. A page
-/// with no prose outside "Open Questions" gets no summary rather than a
-/// question standing in for one.
+/// "Open Questions" heading. Citation markers like `[3]` are removed, and so
+/// is a leading "TLDR:" label when the model wrote one: the label is not part
+/// of the sentence and reads as noise in the app's pull quote. A page with no
+/// prose outside "Open Questions" gets no summary rather than a question
+/// standing in for one.
 pub(crate) fn extract_page_summary(content: &str) -> Option<String> {
     let mut in_open_questions = false;
     for raw in content.lines() {
@@ -483,6 +485,7 @@ pub(crate) fn extract_page_summary(content: &str) -> Option<String> {
             .trim_start_matches("* ")
             .trim_start_matches("> ")
             .trim();
+        let text = strip_summary_label(text);
         let sentence = match text.find(". ") {
             Some(end) => &text[..=end],
             None => text,
@@ -491,6 +494,34 @@ pub(crate) fn extract_page_summary(content: &str) -> Option<String> {
         return (!cleaned.is_empty()).then_some(cleaned);
     }
     None
+}
+
+/// Remove a leading "TLDR:" label, with any markdown emphasis around it, so a
+/// labelled opener does not put the label in the page summary. The label must
+/// be followed by a separator, so prose that merely starts with the letters
+/// ("TLDRs are no substitute for the page") is left alone.
+fn strip_summary_label(text: &str) -> &str {
+    let rest = text.trim_start().trim_start_matches(['*', '_']);
+    let lower = rest.to_ascii_lowercase();
+    let Some(label_len) = ["tl;dr", "tldr"]
+        .into_iter()
+        .find(|label| lower.starts_with(label))
+        .map(str::len)
+    else {
+        return text;
+    };
+    let after = rest[label_len..]
+        .trim_start_matches(['*', '_'])
+        .trim_start();
+    let Some(after) = after.strip_prefix([':', '-', '\u{2013}', '\u{2014}']) else {
+        return text;
+    };
+    let after = after.trim_start_matches(['*', '_']).trim_start();
+    if after.is_empty() {
+        text
+    } else {
+        after
+    }
 }
 
 /// Remove `[N]` citation markers and the space that precedes them.
@@ -1580,6 +1611,33 @@ The app process is the only writer [3].\n\n## Backup\n\nNightly copy to iCloud D
         assert_eq!(
             extract_page_summary(content).as_deref(),
             Some("Stripe over PayPal for EU clients.")
+        );
+    }
+
+    #[test]
+    fn summary_drops_a_tldr_label_the_model_wrote() {
+        let content = "TLDR: Tally stores all data in one SQLite file [2]. More prose.\n";
+        assert_eq!(
+            extract_page_summary(content).as_deref(),
+            Some("Tally stores all data in one SQLite file.")
+        );
+    }
+
+    #[test]
+    fn summary_drops_a_bold_tl_dr_label_with_a_dash() {
+        let content = "**TL;DR** \u{2014} Stripe over PayPal for EU clients. Fees are lower.\n";
+        assert_eq!(
+            extract_page_summary(content).as_deref(),
+            Some("Stripe over PayPal for EU clients.")
+        );
+    }
+
+    #[test]
+    fn summary_keeps_prose_that_merely_starts_with_those_letters() {
+        let content = "TLDRs are no substitute for the page. More prose.\n";
+        assert_eq!(
+            extract_page_summary(content).as_deref(),
+            Some("TLDRs are no substitute for the page.")
         );
     }
 

@@ -176,7 +176,7 @@ Compile these memories into a wiki-style knowledge page.\n\
 \n\
 Format:\n\
 Do NOT start with a title heading (# Title) -- the title is displayed separately by the UI.\n\
-Start directly with a one-sentence TLDR summary.\n\
+Start directly with a one-sentence summary of the topic, with no label in front of it.\n\
 \n\
 Then write the body organized with short topical headers (## Header) and prose paragraphs under each, \
 like a Wikipedia article with sections. \
@@ -202,7 +202,7 @@ the wiki currently covers, not a deep-dive page.\n\
 \n\
 Format:\n\
 Do NOT start with a title heading (# Title) -- the title is displayed separately by the UI.\n\
-Start directly with a one-sentence TLDR describing the wiki's current focus.\n\
+Start directly with a one-sentence summary of the wiki's current focus, with no label in front of it.\n\
 \n\
 Then, for the sources given, write ONE short entry per DISTINCT topic they represent -- \
 naming the topic and summarizing what it covers in a sentence or two. Group sources that \
@@ -222,7 +222,7 @@ Do not remove existing content unless it is explicitly superseded.\n\
 Do NOT include a title heading (# Title) -- the title is displayed separately by the UI.\n\
 Cite each factual claim by appending [N] immediately after it, where N is the number of the supporting source in the numbered source list. Attach the marker to the exact sentence that states the fact — never at the end of a paragraph, and never on a sentence that only explains or elaborates. A claim drawing on several sources may carry several markers, like [1][3]. Use only numbers that appear in the list. Do NOT add a sources or citations section — the system renders citations from the markers.\n\
 Do not write HTML comments (the <!-- ... --> form) anywhere in the page.\n\
-Output the complete updated page in the same format (TLDR, prose paragraphs, Open Questions).";
+Output the complete updated page in the same format (opening summary sentence, prose paragraphs, Open Questions).";
 
 pub(crate) const ANNOTATE_CITATIONS: &str = "\
 You annotate an existing wiki page with citations. You are given the page body \
@@ -284,6 +284,18 @@ mod tests {
         assert!(DISTILL_PAGE.contains("appending [N]"));
         // HTML comments banned so the LLM can't forge the delimiter.
         assert!(DISTILL_PAGE.contains("HTML comment"));
+    }
+
+    #[test]
+    fn page_prompts_do_not_ask_for_a_labelled_opener() {
+        // A literal "TLDR:" opener lands in the page summary and in the app's
+        // pull quote under the title. Naming the label even in a negative
+        // instruction invites it, so the word stays out of the prompts.
+        for prompt in [DISTILL_PAGE, OVERVIEW_SUMMARY, UPDATE_PAGE] {
+            let upper = prompt.to_ascii_uppercase();
+            assert!(!upper.contains("TLDR"));
+            assert!(!upper.contains("TL;DR"));
+        }
     }
 
     #[test]
