@@ -4,7 +4,7 @@ What ships today, and what it takes to make the installers trusted by the OS.
 
 | Artifact | Today | What the OS shows | Fix |
 | --- | --- | --- | --- |
-| `Wenlan_<ver>_aarch64.dmg`, `Wenlan_aarch64.app.tar.gz` | ad-hoc signed (`"signingIdentity": "-"` in `app/tauri.conf.json`; `APPLE_SIGNING_IDENTITY` falls back to `-` in `release.yml`), not notarized | Gatekeeper: "Wenlan cannot be opened" (first-run gauntlet finding F11, `spctl --assess` → `rejected`) | Developer ID certificate + notarization, section 1 |
+| `Wenlan_<ver>_aarch64.dmg`, `Wenlan_aarch64.app.tar.gz` | Developer ID signed and notarized, ticket stapled, from v0.17.4 | None. The first-run gauntlet on v0.17.4 reports `spctl --assess` as `accepted`, `source=Notarized Developer ID` | Done |
 | `Wenlan_<ver>_x64-setup.exe` | unsigned; the READMEs walk the user through the warning | SmartScreen: "Windows protected your PC", unknown publisher | a free SignPath Foundation certificate, section 2; the warning itself fades only as that publisher identity earns reputation |
 | `*.sig` next to the app bundles | signed with the Tauri updater key (`TAURI_SIGNING_PRIVATE_KEY`) | nothing; this is what the in-app updater verifies | already done; unrelated to Gatekeeper and SmartScreen |
 | CLI tarballs, `wenlan-windows-x64.zip` | unsigned; `install.sh` strips quarantine and verifies `SHA256SUMS` | none for a terminal install | not needed for launch |
@@ -13,7 +13,7 @@ The Tauri updater signature protects updates after the first install. Gatekeeper
 
 ## 1. macOS: Developer ID and notarization
 
-The workflow is already wired: once the secrets below exist, the next release is signed and notarized with no code change. Without them the build stays ad-hoc and the verify step says so.
+The workflow is already wired, and the secrets are in place: releases from v0.17.4 are signed and notarized. If the secrets are ever removed, the build falls back to ad-hoc signing and the verify step says so.
 
 ### One-time setup (about an hour, plus Apple's review of the membership)
 
@@ -53,7 +53,7 @@ The workflow is already wired: once the secrets below exist, the next release is
    3. *Notarize and staple the DMG* makes the single submission and staples the ticket to the disk image.
    4. *Staple the app and rebuild the updater archive* staples the same ticket to the `.app` (a lookup, not a second submission), rebuilds `Wenlan_aarch64.app.tar.gz` from the stapled app, and re-signs it with `tauri signer sign`.
    5. *Verify Apple signature and notarization* fails the job unless `codesign --verify --deep --strict` passes and the signing authority is a Developer ID Application certificate, and — when the notarization secrets are set — `spctl --assess --type execute` and `xcrun stapler validate` pass on the `.app`, `stapler validate` plus `spctl --assess --type open` pass on the `.dmg`, and the app mounted from inside the disk image assesses as `source=Notarized Developer ID`.
-7. **Prove it from a user's seat.** Run the first-run gauntlet on the new tag (`gh workflow run first-run-gauntlet.yml --ref main -f release_tag=vX.Y.Z -f channels=macos-app`). Its macOS leg stamps the quarantine attribute a browser would set, then requires `dmg-stapled`, `dmg-gatekeeper`, `dmg-developer-id`, `dmg-codesign-valid`, and `app-gatekeeper` (which must report `source=Notarized Developer ID`) to pass. Then delete the "ad-hoc signed and not notarized" paragraph from the four READMEs (`README.md`, `README.es-ES.md`, `README.zh-Hans.md`, `README.zh-Hant.md`) and close F11 in the gauntlet report.
+7. **Prove it from a user's seat.** Run the first-run gauntlet on the new tag (`gh workflow run first-run-gauntlet.yml --ref main -f release_tag=vX.Y.Z -f channels=macos-app`). Its macOS leg stamps the quarantine attribute a browser would set, then requires `dmg-stapled`, `dmg-gatekeeper`, `dmg-developer-id`, `dmg-codesign-valid`, and `app-gatekeeper` (which must report `source=Notarized Developer ID`) to pass. Then delete the "ad-hoc signed and not notarized" paragraph from the four READMEs (`README.md`, `README.es-ES.md`, `README.zh-Hans.md`, `README.zh-Hant.md`) and close F11 in the gauntlet report. Done for v0.17.4: run 33287491599 passed all five checks, with both Gatekeeper legs reporting `accepted`, `source=Notarized Developer ID`, `origin=Developer ID Application: Qi-Xuan Lu (TDFFZXRF3D)`.
 
 ### Things to know
 

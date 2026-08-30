@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=88d923d235219b5c409efc4a64626449317121e7c636a66097b86407e6beff65 -->
+<!-- README_SYNC: source=README.md sha256=a7f245c59fc508721b4e1de6c76c629fdef5956542440925d317f76bc84877b3 -->
 
 <p align="center">
   <picture>
@@ -55,7 +55,7 @@ Wenlan 以单个本地 daemon 运行。桌面 app 内置这个 daemon；无 GUI 
 
 不需要再安装别的东西。App 内已打包 daemon、CLI 与 MCP 连接器，启动时会自动运行 daemon，并会为检测到的 AI 客户端提供接入：Claude Code 与 Codex 安装 plugin，其余客户端写入 MCP 配置。之后你就可以阅读 Page、检查任一引用背后的 Source，并整理整个知识体系。
 
-这个预览版只做了 ad-hoc 签名、未经 Apple notarization，首次启动会被 macOS 拦下：可能提示 Wenlan「无法打开」，或者无法检查它是否包含恶意软件。关掉这个提示，再到「系统设置」的「隐私与安全性」里点一次「仍要打开」即可。一条命令可以跳过这一步：它会用 GitHub 发布的 SHA-256 核对下载文件，只为这一个 app 清除 quarantine，不会更改任何 macOS 安全设置。
+这个版本使用 Apple Developer ID 证书签名，并通过了 Apple 的 notarization（公证），首次启动不会再被 macOS 拦下，也不需要额外点击确认。如果你更习惯用命令行安装，一条命令会下载它、用 GitHub 发布的 SHA-256 核对下载文件，并把它放进「应用程序」。
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"

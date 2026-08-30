@@ -53,7 +53,7 @@ Wenlan runs as one local daemon. The desktop app carries that daemon inside it; 
 
 Nothing else to install. The app bundles the daemon, CLI, and MCP connector, starts the daemon on launch, and offers to connect the AI clients it detects: the plugin for Claude Code and Codex, an MCP entry for the rest. From there you read Pages, inspect the Source behind any citation, and curate the knowledge system.
 
-This preview is ad-hoc signed and not notarized, so macOS blocks the first launch: it may say Wenlan "cannot be opened" or that it could not check it for malicious software. Close that dialog, then allow the app once under System Settings, Privacy & Security, "Open Anyway". One command skips that step: it verifies the download against GitHub's published SHA-256, clears quarantine for this app alone, and changes no macOS security settings.
+The app is signed with an Apple Developer ID certificate and notarized by Apple, so macOS opens it on a first launch with no warning to click through. If you would rather install it from the terminal, one command downloads it, checks it against GitHub's published SHA-256, and moves it into Applications.
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
