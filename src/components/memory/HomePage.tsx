@@ -367,7 +367,9 @@ function WikiHome({
   } = useReviewQueue();
   const [openReviewId, setOpenReviewId] = useState<string | null>(null);
   // New-memory captures are inflow, not decisions — they're unconfirmed but
-  // already live (recalled, feeding pages), so they stay out of the rail.
+  // already live (recalled, feeding pages), so they stay out of the rail AND
+  // out of the dialog the rail opens: its "n of total" header must walk the
+  // same list the badge counted, or "1 of 33" sits beside a badge that says 5.
   const decisionItems = reviewItems.filter((item) => item.kind !== "capture");
   return (
     <div
@@ -427,7 +429,7 @@ function WikiHome({
       </div>
 
       <ReviewDialog
-        items={reviewItems}
+        items={decisionItems}
         openId={openReviewId}
         onOpenChange={setOpenReviewId}
         onResolve={resolve}
