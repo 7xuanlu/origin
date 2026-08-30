@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=a7f245c59fc508721b4e1de6c76c629fdef5956542440925d317f76bc84877b3 -->
+<!-- README_SYNC: source=README.md sha256=23240a69a98330b13102549c9b2d900a3485adf87f46c70b320c06baa529bde2 -->
 
 <p align="center">
   <picture>
@@ -323,6 +323,13 @@ a1b2c3d distill: 4 pages
 - [开始使用](https://wenlan.app/docs/get-started)：安装并验证第一个本地循环。
 - [日常工作流程](https://wenlan.app/docs/daily-workflow)：brief、capture、recall、handoff、distill、lint 与 curate。
 - [MCP 客户端](https://wenlan.app/docs/mcp-clients)：连接 Claude Code、Codex、Cursor、Claude Desktop 与其他工具。
+
+### 工作流指南
+
+- [为咨询项目建立客户知识库](https://wenlan.app/zh-CN/learn/build-client-project-knowledge-base-for-consulting)
+- [建立有来源支撑的投资研究知识库](https://wenlan.app/zh-CN/learn/build-investment-research-knowledge-base)
+- [在撰写 PRD 前建立产品研究知识库](https://wenlan.app/zh-CN/learn/build-product-research-knowledge-base-for-prd)
+- [用运行手册与故障复盘建立 SRE 故障知识库](https://wenlan.app/zh-CN/learn/build-sre-incident-knowledge-base)
 
 ### 概念
 
