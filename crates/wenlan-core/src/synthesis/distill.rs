@@ -1436,6 +1436,7 @@ pub(crate) async fn refresh_page_with_prompt(
     // NOT NULL`, so a concurrent agent PUT that cleared staleness wins the race
     // without TOCTOU.
     let citations_json = serde_json::to_string(&cites).unwrap_or_else(|_| "[]".to_string());
+    let summary = extract_page_summary(&content);
     let result = crate::post_write::update_page_at_source_revision(
         db,
         page_id,
@@ -1453,6 +1454,13 @@ pub(crate) async fn refresh_page_with_prompt(
         Some((citations_json, stats.summary())),
     )
     .await?;
+
+    // The one-line summary is derived from the body, so a rebuilt body gets
+    // a rebuilt summary; otherwise the pull quote outlives the prose it
+    // summarised. A gated or unchanged outcome leaves the stored page alone.
+    if result.wrote {
+        db.update_page_summary(page_id, summary.as_deref()).await?;
+    }
 
     Ok(RefreshOutcome {
         wrote: result.wrote,
@@ -2176,6 +2184,60 @@ The app process is the only writer [3].\n\n## Backup\n\nNightly copy to iCloud D
         assert!(
             latest.get("citations_summary").is_some(),
             "citations committed atomically with the content bump"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_page_rebuilds_the_summary_from_the_new_body() {
+        let (db, _db_dir) = crate::db::tests::test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let now_ts = chrono::Utc::now().timestamp();
+        {
+            let conn = db.test_primary_session().await;
+            conn.execute(
+                "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
+                 VALUES (?1, ?1, ?1, 'Tokio is an async runtime for Rust programs', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
+                libsql::params!["mem_seed".to_string(), now_ts],
+            )
+            .await
+            .unwrap();
+        }
+        // The stored summary is the pre-#642 symptom: an open question that
+        // used to be the page's first bullet.
+        db.insert_page(
+            "page_m",
+            "Tokio",
+            Some("Does Tokio scale past one core?"),
+            "original body\n\n## Open Questions\n- Does Tokio scale past one core?",
+            None,
+            None,
+            &["mem_seed"],
+            &now,
+        )
+        .await
+        .unwrap();
+        db.set_page_stale("page_m", "source_updated").await.unwrap();
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(
+            "Tokio is an async runtime for Rust programs [1]",
+        ));
+        let outcome = refresh_page(
+            &db,
+            &llm,
+            &PromptRegistry::default(),
+            "page_m",
+            RefreshReason::SourceChanged,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.wrote);
+
+        let page = db.get_page("page_m").await.unwrap().unwrap();
+        assert_eq!(
+            page.summary.as_deref(),
+            Some("Tokio is an async runtime for Rust programs"),
+            "a rebuilt body gets a rebuilt summary"
         );
     }
 
