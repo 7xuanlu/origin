@@ -1296,7 +1296,16 @@ export default function PageDetail({
   const tldr = sentenceEnd > 0 && sentenceEnd < 400
     ? stripCitationLinks(bodyAfterHeadings.slice(0, sentenceEnd + 1).trim())
     : "";
-  const displayContent = tldr
+  // The lede shows the page summary when there is one; the first sentence is
+  // cut from the body only when it is what the lede shows (no summary, or a
+  // summary that repeats it). Cutting it under a different summary dropped
+  // that sentence, and its citations, from the page.
+  const normalizeSentence = (s: string) =>
+    s.replace(/\[\d+\]/g, "").replace(/\s+/g, " ").trim().replace(/\.$/, "").toLowerCase();
+  const ledeText = page.summary || tldr;
+  const ledeIsFirstSentence =
+    !page.summary || (tldr !== "" && normalizeSentence(page.summary) === normalizeSentence(tldr));
+  const displayContent = tldr && ledeIsFirstSentence
     ? (cleanedContent.slice(0, leadingHeadings) + bodyAfterHeadings.slice(sentenceEnd + 1).trimStart()).trim()
     : cleanedContent;
 
@@ -2081,9 +2090,9 @@ export default function PageDetail({
       ) : (
         <div className={hasRail ? "page-detail-grid" : undefined}>
           <div className="page-detail-prose" onClickCapture={handleContentClick}>
-            {(page.summary || tldr) && (
+            {ledeText && (
               <div className="page-detail-lede">
-                <p>{page.summary || tldr}</p>
+                <p>{ledeText}</p>
               </div>
             )}
             <ContentRenderer
