@@ -115,6 +115,26 @@ fn get_or_create_relay_id() -> Result<String, String> {
     Ok(id)
 }
 
+/// The stable MCP endpoint the relay serves for one relay ID.
+fn relay_mcp_url_for(relay_id: &str) -> String {
+    format!("{RELAY_URL}/{relay_id}/mcp")
+}
+
+/// What `register_with_relay` writes to the log when the relay accepts a
+/// registration.
+///
+/// It deliberately names no URL and no identifier. The ID in that URL's path is
+/// the same value the request posts as `secret`, so the URL is a credential:
+/// anyone holding it can read and write the whole memory store until Remote
+/// Access is turned off. The desktop log is a single file that is never rotated
+/// or trimmed (`tracing_appender::rolling::never` in `lib.rs`), and users attach
+/// it to bug reports, so a URL written here leaves the machine with the report.
+/// Someone who needs the real URL reads it from Settings, where the app shows
+/// it, or from `~/.config/wenlan-mcp/relay_id`.
+fn relay_registration_log_line() -> &'static str {
+    "[remote-access] Registered with relay"
+}
+
 /// Register the current tunnel URL with the relay for a stable MCP endpoint.
 async fn register_with_relay(tunnel_url: &str) -> Option<String> {
     let relay_id = match get_or_create_relay_id() {
@@ -149,8 +169,8 @@ async fn register_with_relay(tunnel_url: &str) -> Option<String> {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            let relay_mcp_url = format!("{}/{}/mcp", RELAY_URL, relay_id);
-            log::warn!("[remote-access] Registered with relay: {}", relay_mcp_url);
+            let relay_mcp_url = relay_mcp_url_for(&relay_id);
+            log::warn!("{}", relay_registration_log_line());
             Some(relay_mcp_url)
         }
         Ok(resp) => {
@@ -2161,6 +2181,26 @@ mod tests {
 
         assert!(relay_id_is_current(&id), "unexpected shape: {id}");
         assert_eq!(id.len(), 33, "u + 32 hex characters: {id}");
+    }
+
+    #[test]
+    fn the_registration_log_line_names_no_secret() {
+        // The relay ID is the whole protection on a public endpoint, and it is
+        // also the path segment of the URL. Until this test existed the success
+        // path logged that URL in full, at warning level, into a file that never
+        // rotates -- so every user who attached `wenlan.log` to a bug report
+        // handed over read and write access to their memory.
+        let id = new_relay_id().unwrap();
+        let url = relay_mcp_url_for(&id);
+        assert!(url.contains(&id), "the URL really does carry the secret");
+
+        let line = relay_registration_log_line();
+        assert!(!line.contains(&id), "log line leaks the relay ID: {line}");
+        assert!(!line.contains(&url), "log line leaks the relay URL: {line}");
+        assert!(
+            !line.contains(RELAY_URL),
+            "log line names the relay endpoint: {line}"
+        );
     }
 
     #[test]
