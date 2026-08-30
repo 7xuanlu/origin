@@ -36,6 +36,9 @@ export const REGION_NAME_LIFT_MAX_PX = 60;
  *  land in the viewport: zoomed in, a dozen big regions off to the side must
  *  not spend the cap and leave the regions in view nameless. */
 export const MAX_REGION_LABELS = 12;
+/** A name closer than this (CSS px) to a member that is NOT the region's hub
+ *  reads as that node's caption. Such a name moves onto its hub instead. */
+export const REGION_NAME_KEEP_OUT_PX = 36;
 
 /** Clear air demanded around a candidate label before it may sit next to an
  *  already-placed one. */
@@ -300,6 +303,14 @@ export function regionLeader<T extends { id: string; name: string; degree: numbe
 export interface Region {
   /** Highest-degree member's name — the region's label. */
   name: string;
+  /** The member the region is named after: its GRAPH position and CSS-px
+   *  radius. When sigma draws this node's own label the place is already
+   *  named, so the region name yields; and when the lifted centroid would
+   *  sit on some other member, the name sits above this node instead. */
+  hub: { id: string; x: number; y: number; size: number };
+  /** Every other member's GRAPH position and CSS-px radius — what the name
+   *  keeps REGION_NAME_KEEP_OUT_PX clear of. */
+  otherMembers: { x: number; y: number; size: number }[];
   memberCount: number;
   /** Mean of member GRAPH positions — where the name sits. */
   centroid: { x: number; y: number };
@@ -341,9 +352,21 @@ export function communityRegions(graph: Graph, communities: Map<string, string>)
     let sumY = 0;
     const bounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
     let island = true;
+    const hub = { id: hubId, x: 0, y: 0, size: 0 };
+    const otherMembers: Region["otherMembers"] = [];
     for (const id of ids) {
       const x = graph.getNodeAttribute(id, "x") as number;
       const y = graph.getNodeAttribute(id, "y") as number;
+      // Node sizes are true CSS px at every zoom (AtlasView's
+      // zoomToSizeRatioFunction), so a radius here is a screen radius.
+      const size = (graph.getNodeAttribute(id, "size") as number | undefined) ?? 0;
+      if (id === hubId) {
+        hub.x = x;
+        hub.y = y;
+        hub.size = size;
+      } else {
+        otherMembers.push({ x, y, size });
+      }
       if (graph.getNodeAttribute(id, "island") !== true) island = false;
       sumX += x;
       sumY += y;
@@ -354,6 +377,8 @@ export function communityRegions(graph: Graph, communities: Map<string, string>)
     }
     regions.push({
       name: graph.getNodeAttribute(hubId, "label") as string,
+      hub,
+      otherMembers,
       memberCount: ids.length,
       centroid: { x: sumX / ids.length, y: sumY / ids.length },
       bounds,
@@ -399,17 +424,27 @@ export interface PlacedLabel {
  * MAX_REGION_LABELS. Because on-screen span grows with zoom, more names
  * appear as you approach. With a `viewport` (CSS px), a name whose box lies
  * wholly outside it is skipped without counting toward the cap.
+ *
+ * A region is named after its hub node, so the name never doubles that
+ * node's own label: a hub in `labelledNodes` (the nodes sigma drew a label
+ * for this paint) costs its region the name, again without counting toward
+ * the cap. And a name that would land within REGION_NAME_KEEP_OUT_PX of a
+ * member that is not the hub — where it reads as that node's caption —
+ * sits just above the hub instead.
  */
 export function placeRegionLabels(
   scene: CartographyScene,
   project: (pos: { x: number; y: number }) => { x: number; y: number },
   measure: (text: string, size: number) => number,
   viewport?: { width: number; height: number },
+  labelledNodes?: ReadonlySet<string>,
 ): PlacedLabel[] {
   const placed: PlacedLabel[] = [];
   const boxes: { left: number; right: number; top: number; bottom: number }[] = [];
   for (const region of scene.regions) {
     if (placed.length >= MAX_REGION_LABELS) break;
+    // The hub's own label is on screen: the place already has its name.
+    if (labelledNodes?.has(region.hub.id)) continue;
     const { bounds } = region;
     // Project all four corners: the camera may rotate, so a graph-space width
     // is not a screen width.
@@ -428,15 +463,34 @@ export function placeRegionLabels(
       Math.max(REGION_NAME_LIFT_MIN_PX, REGION_NAME_LIFT_FRACTION * (Math.max(...ys) - Math.min(...ys))),
     );
     // Viewport y grows downward, so "above" is smaller y.
-    const at = { x: centroid.x, y: centroid.y - lift };
+    let at = { x: centroid.x, y: centroid.y - lift };
     const size = placed.length === 0 ? 15 : 12;
     const halfWidth = measure(region.name, size) / 2;
-    const box = {
-      left: at.x - halfWidth,
-      right: at.x + halfWidth,
-      top: at.y - size / 2,
-      bottom: at.y + size / 2,
-    };
+    const boxAround = (p: { x: number; y: number }) => ({
+      left: p.x - halfWidth,
+      right: p.x + halfWidth,
+      top: p.y - size / 2,
+      bottom: p.y + size / 2,
+    });
+    let box = boxAround(at);
+    // Beside some other member the name reads as that node's caption (the
+    // region "sqlite" once sat right over the node "tally"). The name is the
+    // hub's, so put it on the hub — just above its disc, like its own label.
+    const captionsAnotherNode = region.otherMembers.some((member) => {
+      const p = project(member);
+      const reach = member.size + REGION_NAME_KEEP_OUT_PX;
+      return (
+        p.x - reach < box.right &&
+        box.left < p.x + reach &&
+        p.y - reach < box.bottom &&
+        box.top < p.y + reach
+      );
+    });
+    if (captionsAnotherNode) {
+      const hub = project(region.hub);
+      at = { x: hub.x, y: hub.y - region.hub.size - LABEL_BOX_PAD - size / 2 };
+      box = boxAround(at);
+    }
     if (
       viewport &&
       (box.right < 0 || box.left > viewport.width || box.bottom < 0 || box.top > viewport.height)
@@ -473,6 +527,7 @@ export function drawRegionNames(
   project: (pos: { x: number; y: number }) => { x: number; y: number },
   palette: GraphPalette,
   viewport?: { width: number; height: number },
+  labelledNodes?: ReadonlySet<string>,
 ): void {
   const measure = (text: string, size: number): number => {
     ctx.font = regionLabelFont(size);
@@ -488,7 +543,7 @@ export function drawRegionNames(
   ctx.lineWidth = LABEL_HALO_WIDTH;
   ctx.strokeStyle = palette.surface;
   ctx.fillStyle = palette.labelMuted;
-  for (const label of placeRegionLabels(scene, project, measure, viewport)) {
+  for (const label of placeRegionLabels(scene, project, measure, viewport, labelledNodes)) {
     ctx.font = regionLabelFont(label.size);
     // Same tracking the measurement used; jsdom's mock ctx simply ignores it.
     ctx.letterSpacing = regionLabelTracking(label.size);
