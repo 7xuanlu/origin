@@ -47,6 +47,9 @@ pub struct SearchMemoryRequest {
     pub memory_type: Option<String>,
     #[serde(default, alias = "domain")]
     pub space: Option<String>,
+    /// Filter: return only memories written by this agent. This is not
+    /// caller attribution (that travels in the `x-agent-name` header); a
+    /// client that puts its own name here sees nothing but its own rows.
     #[serde(default)]
     pub source_agent: Option<String>,
     /// When `true` AND the daemon has a reranker wired (via
