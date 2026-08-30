@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.17.4](https://github.com/7xuanlu/wenlan/compare/v0.17.3...v0.17.4) (2026-08-30)
+
+
+### Bug Fixes
+
+* **app:** show and open the file path behind a document citation ([#633](https://github.com/7xuanlu/wenlan/issues/633)) ([ec417dc](https://github.com/7xuanlu/wenlan/commit/ec417dc87bcb82004e5b579e375a1ba39ec7975f))
+* **app:** stop cloudflared from replacing its own signed binary ([#631](https://github.com/7xuanlu/wenlan/issues/631)) ([ff49403](https://github.com/7xuanlu/wenlan/commit/ff4940303b51ccfc4478e6a95cc2e6b745eb94b7))
+* **core:** stop sending an empty think block to models without a thinking mode ([#634](https://github.com/7xuanlu/wenlan/issues/634)) ([93aea07](https://github.com/7xuanlu/wenlan/commit/93aea07cfb1c7664a02223b32eaf9ffc6ca2c0e3))
+* **deps:** raise five transitive npm packages past their advisories ([#621](https://github.com/7xuanlu/wenlan/issues/621)) ([3e24993](https://github.com/7xuanlu/wenlan/commit/3e2499306a534005283adc2642ce2f0fe520a74b))
+* **gauntlet:** wait for the launch agent plists instead of testing once ([#620](https://github.com/7xuanlu/wenlan/issues/620)) ([f3739b1](https://github.com/7xuanlu/wenlan/commit/f3739b1ff2f3a1280c1c573f0becae67475de810))
+* **release:** notarize the DMG so a first launch shows no dialog ([#627](https://github.com/7xuanlu/wenlan/issues/627)) ([34f280b](https://github.com/7xuanlu/wenlan/commit/34f280beb8bdae972ead78430b43a0d80560faea))
+* **security:** close the three remaining audit findings on the open and relay paths ([#623](https://github.com/7xuanlu/wenlan/issues/623)) ([173a649](https://github.com/7xuanlu/wenlan/commit/173a64967910030938bf1cf8a9e3ed22969f4f70))
+
 ## [0.17.3](https://github.com/7xuanlu/wenlan/compare/v0.17.2...v0.17.3) (2026-08-27)
 
 
