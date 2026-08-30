@@ -1,0 +1,64 @@
+# Ask Apple about one notarization submission, without building anything.
+#
+# `verify-apple-signing` answers the same question but rebuilds the whole app
+# first, which costs about an hour. Almost every check we actually want is
+# "has Apple finished with the submission we already sent", and that needs no
+# artifact at all -- only the notarization credentials and the submission id.
+name: Notarization status
+
+on:
+  workflow_dispatch:
+    inputs:
+      submission_id:
+        description: Submission UUID from `notarytool submit`. Leave empty to list recent submissions instead.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    # notarytool ships with Xcode, so this has to be a macOS runner.
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Ask Apple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SUBMISSION_ID: ${{ inputs.submission_id }}
+        run: |
+          set -euo pipefail
+
+          for name in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "ERROR: secret $name is not set; cannot query Apple." >&2
+              exit 1
+            fi
+          done
+
+          # Credentials go in a keychain profile rather than on every command
+          # line, so they cannot land in the process list or in `set -x` output.
+          xcrun notarytool store-credentials wenlan-ci \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_PASSWORD" >/dev/null
+
+          if [[ -z "${SUBMISSION_ID:-}" ]]; then
+            echo "== Recent submissions =="
+            xcrun notarytool history --keychain-profile wenlan-ci
+            exit 0
+          fi
+
+          echo "== Submission $SUBMISSION_ID =="
+          xcrun notarytool info "$SUBMISSION_ID" --keychain-profile wenlan-ci
+
+          echo
+          echo "== Log =="
+          # The log only exists once Apple has finished. A submission still in
+          # the queue returns an error here, which is an answer, not a failure.
+          if ! xcrun notarytool log "$SUBMISSION_ID" --keychain-profile wenlan-ci; then
+            echo "No log yet -- Apple has not finished with this submission."
+          fi
