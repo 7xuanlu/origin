@@ -24,7 +24,10 @@ Never read, edit, or overwrite that receipt as authority.
 
 ```bash
 handoff_arg="<the Space name passed to /handoff, empty when none>"
-resolved="$(plugin-codex/bin/resolve-space.sh --cwd "$PWD" --arg "$handoff_arg" --new-repo-fallback 2>/dev/null)"
+# The resolver ships inside the installed plugin; the relative path only
+# exists in a wenlan checkout.
+resolver="$(find "$HOME/.codex/plugins/cache" -path '*/wenlan/*/bin/resolve-space.sh' 2>/dev/null | head -1)"
+resolved="$("${resolver:-plugin-codex/bin/resolve-space.sh}" --cwd "$PWD" --arg "$handoff_arg" --new-repo-fallback 2>/dev/null)"
 space="$(printf '%s\n' "$resolved" | cut -f1)"
 source_layer="$(printf '%s\n' "$resolved" | cut -f2)"
 ```
