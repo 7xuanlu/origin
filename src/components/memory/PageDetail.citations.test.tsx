@@ -191,4 +191,19 @@ describe("PageDetail citations", () => {
     expect(screen.queryByRole("button", { name: /mem-1/ })).toBeNull();
     expect(screen.getByRole("button", { name: /mem-2/ })).toBeInTheDocument();
   });
+
+  it("keeps the first sentence and its chip in the body when the summary is the lede", async () => {
+    tauriMocks.getPage.mockResolvedValue({
+      ...BASE_PAGE,
+      summary: "One-line summary of the page.",
+      content:
+        "# Cited Page\n\nThe daemon is local-first.[1] It stays fast under load. Second paragraph here.[2]",
+    });
+    renderPage();
+    expect(await screen.findByText("Cited Page")).toBeInTheDocument();
+    expect(screen.getByText("One-line summary of the page.")).toBeInTheDocument();
+    expect(screen.getByText(/The daemon is local-first\./)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /mem-1/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /mem-2/ })).toBeInTheDocument();
+  });
 });
