@@ -17,8 +17,11 @@ not exist.
 
 For `global`, omit `space`. For `uncategorized`, pass
 `space="uncategorized"`. For `space:<name>`, pass that name. With no explicit
-scope, call `plugin-codex/bin/resolve-space.sh --cwd "$PWD"`; use a non-empty
-result, otherwise omit `space`. Bash is allowed only for that exact resolver.
+scope, call the installed resolver with `--cwd "$PWD"`: locate it with
+`find "$HOME/.codex/plugins/cache" -path '*/wenlan/*/bin/resolve-space.sh'`
+and fall back to `plugin-codex/bin/resolve-space.sh` only inside a wenlan
+checkout. Use a non-empty result, otherwise omit `space`. Bash is allowed only
+for that exact resolver.
 CLI fallback: `wenlan lint --profile deep --agent-assist` (submissions via
 `--agent-submission <file>`); the MCP repair-manifest tools have no CLI
 equivalent yet.

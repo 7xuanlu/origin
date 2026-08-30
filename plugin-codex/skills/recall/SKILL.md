@@ -31,7 +31,10 @@ If `query` is empty, ask the user what they want to search for.
 Call the Codex resolver:
 
 ```bash
-resolved="$(plugin-codex/bin/resolve-space.sh --cwd "$PWD" ${space_arg:+--arg "$space_arg"} 2>/dev/null)"
+# The resolver ships inside the installed plugin; the relative path only
+# exists in a wenlan checkout.
+resolver="$(find "$HOME/.codex/plugins/cache" -path '*/wenlan/*/bin/resolve-space.sh' 2>/dev/null | head -1)"
+resolved="$("${resolver:-plugin-codex/bin/resolve-space.sh}" --cwd "$PWD" ${space_arg:+--arg "$space_arg"} 2>/dev/null)"
 space="$(printf '%s\n' "$resolved" | cut -f1)"
 source_layer="$(printf '%s\n' "$resolved" | cut -f2)"
 ```

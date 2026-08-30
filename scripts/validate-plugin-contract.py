@@ -27,6 +27,11 @@ CODEX_SKILLS_USING_RESOLVER = {
     "lint",
     "recall",
 }
+# Installed plugins live under ~/.codex/plugins/cache/<marketplace>/wenlan/<version>/;
+# the checkout-relative `plugin-codex/bin/...` path only resolves inside this repo.
+CODEX_RESOLVER_LOCATOR = (
+    "find \"$HOME/.codex/plugins/cache\" -path '*/wenlan/*/bin/resolve-space.sh'"
+)
 CODEX_REQUIRED_GUARDRAILS = {
     "forget": [
         "cannot be undone",
@@ -695,8 +700,14 @@ def validate_skill_surface(
             )
             if name not in CODEX_SKILLS_WITHOUT_MCP_REFERENCE and expected_prefix not in text:
                 fail(f"{rel(root, skill_path)} must use MCP prefix {expected_prefix!r}")
-            if name in CODEX_SKILLS_USING_RESOLVER and "plugin-codex/bin/resolve-space.sh" not in text:
-                fail(f"{rel(root, skill_path)} must use plugin-codex/bin/resolve-space.sh")
+            if name in CODEX_SKILLS_USING_RESOLVER:
+                if "plugin-codex/bin/resolve-space.sh" not in text:
+                    fail(f"{rel(root, skill_path)} must use plugin-codex/bin/resolve-space.sh")
+                if CODEX_RESOLVER_LOCATOR not in text:
+                    fail(
+                        f"{rel(root, skill_path)} must locate the installed resolver with "
+                        f"{CODEX_RESOLVER_LOCATOR}"
+                    )
             for needle in CODEX_REQUIRED_GUARDRAILS.get(name, []):
                 if needle not in text:
                     fail(f"{rel(root, skill_path)} must contain guardrail {needle!r}")
