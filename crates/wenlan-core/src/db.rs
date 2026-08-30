@@ -58,6 +58,7 @@ mod migrations_v004_v009;
 mod onboarding_milestones;
 mod page_drafts;
 pub mod page_map;
+mod page_summary_backfill;
 mod presence_review;
 pub(crate) mod repair_deterministic;
 mod repair_memory_cas;

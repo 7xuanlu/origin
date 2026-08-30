@@ -3229,7 +3229,7 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
     );
     assert_eq!(
         analysis.support_calls.len(),
-        1039,
+        1041,
         "PR-D integration must expose the frozen 967 support calls, the 6 PR-D test identities, \
          the 5 M5 derivation-marker fixture calls, the 10 M6 shadow-promoter fixture calls, \
          the 7 G6 BindPageLink repair-test calls (G6 Stage 2 PR 2b, item 3: \
@@ -3344,7 +3344,11 @@ fn repository_module_graph_matches_r4_25_group_6_census() {
          (round 5, F1 revision-card source_revision fencing) contributes \
          TestDbSession::query|1, TestDbRows::next|1, TestDbRow::get|1, and \
          test_primary_session|1 reading the page back after a fenced update to assert \
-         source_revision landed"
+         source_revision landed; plus the fix/page-summary-follows-content +2: \
+         synthesis/distill.rs's new refresh_page_rebuilds_the_summary_from_the_new_body \
+         contributes test_primary_session|1 and TestDbSession::execute|1 (the raw UPDATE that \
+         plants an old first-bullet summary on the page before the refresh re-derives it from \
+         the new body)"
     );
 }
 

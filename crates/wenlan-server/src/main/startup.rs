@@ -132,6 +132,16 @@ pub(super) async fn prepare_startup_state(
             m55.event_dates_scanned,
             m55.entity_links_inserted
         );
+        // Pages distilled before the first-sentence summary rule still carry
+        // their first bullet, often an open question. Reconcile once; the
+        // pass is idempotent and skips human-edited pages.
+        match db_arc.backfill_page_summaries().await {
+            Ok(0) => {}
+            Ok(changed) => tracing::info!(
+                "[pages] rewrote {changed} page summaries to the first prose sentence"
+            ),
+            Err(error) => tracing::warn!("[pages] summary backfill failed: {error}"),
+        }
     }
 
     // Requeue any document-enrichment rows left `in_progress` by a previous run
