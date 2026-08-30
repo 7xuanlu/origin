@@ -597,7 +597,14 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       const lod = lodRef.current;
       // A dim island carries no name yet; its name comes up with its colour.
       const named = lod.islandsSolid ? scene : { regions: scene.regions.filter((r) => !r.island) };
-      drawRegionNames(ctx, named, project, paletteRef.current, { width, height });
+      // Sigma (3.0.3) keeps the nodes it drew a label for this paint on a
+      // private field with no public getter. A region is named after its
+      // hub, so while the hub's own label is on screen the region name would
+      // print the same word twice; the placer skips it. If a later sigma
+      // drops the field the names simply stay on, as before.
+      const labelledNodes = (renderer as unknown as { displayedNodeLabels?: ReadonlySet<string> })
+        .displayedNodeLabels;
+      drawRegionNames(ctx, named, project, paletteRef.current, { width, height }, labelledNodes);
       drawDustCounts(
         ctx,
         graph,

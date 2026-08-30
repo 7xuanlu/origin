@@ -13,6 +13,7 @@ import {
   MAX_REGION_LABELS,
   MIN_LABELLED_SPAN_PX,
   REGION_NAME_LIFT_MIN_PX,
+  REGION_NAME_KEEP_OUT_PX,
 } from "./cartography";
 import type { CartographyScene, Region } from "./cartography";
 
@@ -533,12 +534,18 @@ describe("communitiesFor", () => {
 });
 
 function graphOf(
-  nodes: { id: string; x: number; y: number; label: string; entityType?: string }[],
+  nodes: { id: string; x: number; y: number; label: string; entityType?: string; size?: number }[],
   edges: [string, string][] = [],
 ): Graph {
   const graph = new Graph({ multi: true });
   for (const n of nodes) {
-    graph.addNode(n.id, { x: n.x, y: n.y, label: n.label, ...(n.entityType ? { entityType: n.entityType } : {}) });
+    graph.addNode(n.id, {
+      x: n.x,
+      y: n.y,
+      label: n.label,
+      ...(n.entityType ? { entityType: n.entityType } : {}),
+      ...(n.size !== undefined ? { size: n.size } : {}),
+    });
   }
   edges.forEach(([source, target], i) => graph.addEdgeWithKey(`e${i}`, source, target));
   return graph;
@@ -548,8 +555,8 @@ describe("communityRegions", () => {
   it("measures communities of 3+, names them after the highest-degree member, and sorts largest-first", () => {
     const graph = graphOf(
       [
-        { id: "a1", x: 0, y: 0, label: "Wenlan" },
-        { id: "a2", x: 10, y: 0, label: "Tauri" },
+        { id: "a1", x: 0, y: 0, label: "Wenlan", size: 9 },
+        { id: "a2", x: 10, y: 0, label: "Tauri", size: 4 },
         { id: "a3", x: 0, y: 10, label: "React" },
         { id: "a4", x: 10, y: 10, label: "Rust" },
         { id: "b1", x: 50, y: 50, label: "Claude Code" },
@@ -581,6 +588,14 @@ describe("communityRegions", () => {
     expect(regions[0].memberCount).toBe(4);
     expect(regions[0].centroid).toEqual({ x: 5, y: 5 });
     expect(regions[0].bounds).toEqual({ minX: 0, maxX: 10, minY: 0, maxY: 10 });
+    // The hub carries its own position and px radius; the rest are what the
+    // name must keep clear of. A node without a size counts as a point.
+    expect(regions[0].hub).toEqual({ id: "a1", x: 0, y: 0, size: 9 });
+    expect(regions[0].otherMembers).toEqual([
+      { x: 10, y: 0, size: 4 },
+      { x: 0, y: 10, size: 0 },
+      { x: 10, y: 10, size: 0 },
+    ]);
     expect(regions[1].name).toBe("Claude Code");
     expect(regions[1].memberCount).toBe(3);
   });
@@ -671,6 +686,8 @@ describe("drawRegionNames", () => {
   function region(name: string, centroidX: number, centroidY: number, spanX = 200): Region {
     return {
       name,
+      hub: { id: name, x: centroidX, y: centroidY, size: 0 },
+      otherMembers: [],
       memberCount: 3,
       island: false,
       centroid: { x: centroidX, y: centroidY },
@@ -713,6 +730,15 @@ describe("drawRegionNames", () => {
     ]);
     expect(drawOrder).toEqual(["stroke:Wenlan", "fill:Wenlan", "stroke:Tauri", "fill:Tauri"]);
   });
+
+  it("leaves out the name of a region whose hub sigma already labelled", () => {
+    const { ctx, texts } = mockCtx();
+    const scene: CartographyScene = {
+      regions: [region("Wenlan", 100, 100), region("Tauri", 600, 300)],
+    };
+    drawRegionNames(ctx, scene, identity, PALETTE, undefined, new Set(["Wenlan"]));
+    expect(texts.map((t) => t.text)).toEqual(["Tauri"]);
+  });
 });
 
 describe("placeRegionLabels", () => {
@@ -725,6 +751,8 @@ describe("placeRegionLabels", () => {
   function boxRegion(name: string, x: number, y: number, width: number, members = 3): Region {
     return {
       name,
+      hub: { id: name, x: x + width / 2, y: y + 10, size: 0 },
+      otherMembers: [],
       memberCount: members,
       island: false,
       centroid: { x: x + width / 2, y: y + 10 },
@@ -809,6 +837,8 @@ describe("placeRegionLabels", () => {
     // A tall region lifts by a share of its on-screen height instead.
     const tall: Region = {
       name: "Tall",
+      hub: { id: "Tall", x: 100, y: 200, size: 0 },
+      otherMembers: [],
       memberCount: 5,
       island: false,
       centroid: { x: 100, y: 200 },
@@ -816,6 +846,41 @@ describe("placeRegionLabels", () => {
     };
     const [label] = placeRegionLabels(sceneOf([tall]), identity, measure);
     expect(label.y).toBe(200 - 0.3 * 200);
+  });
+
+  it("skips a region whose hub's own label is on screen, without spending a slot", () => {
+    // Both regions are placeable and far apart; only the hub label decides.
+    const first = boxRegion("Wenlan", 0, 100, 200, 9);
+    const second = boxRegion("Tauri", 0, 400, 200, 4);
+    const placed = placeRegionLabels(sceneOf([first, second]), identity, measure, undefined, new Set(["Wenlan"]));
+    expect(placed.map((label) => label.name)).toEqual(["Tauri"]);
+    // The skipped region did not take the dominant slot with it.
+    expect(placed[0].size).toBe(15);
+    // Some other node's label on screen changes nothing.
+    expect(
+      placeRegionLabels(sceneOf([first, second]), identity, measure, undefined, new Set(["Rust"])).map((l) => l.name),
+    ).toEqual(["Wenlan", "Tauri"]);
+  });
+
+  it("moves the name onto its hub when the lifted centroid would caption another member", () => {
+    // The lifted spot is (110, 210 - 18) = (110, 192). A member sitting
+    // 30px below that box's bottom edge is within the keep-out; the hub sits
+    // well to the right.
+    const region: Region = {
+      ...boxRegion("sqlite", 40, 200, 140),
+      hub: { id: "sqlite", x: 400, y: 210, size: 8 },
+      otherMembers: [{ x: 110, y: 192 + 7.5 + 30, size: 5 }],
+    };
+    const [label] = placeRegionLabels(sceneOf([region]), identity, measure);
+    expect(label.x).toBe(400);
+    expect(label.y).toBe(210 - 8 - 4 - 7.5);
+    // The same member just beyond its reach leaves the name on the land.
+    const clear: Region = {
+      ...region,
+      otherMembers: [{ x: 110, y: 192 + 7.5 + REGION_NAME_KEEP_OUT_PX + 5 + 1, size: 5 }],
+    };
+    const [onLand] = placeRegionLabels(sceneOf([clear]), identity, measure);
+    expect(onLand).toEqual({ name: "sqlite", x: 110, y: 192, size: 15 });
   });
 });
 
@@ -831,6 +896,8 @@ describe("region label measurement includes its tracking", () => {
   function twoWideRegions(gap: number): CartographyScene {
     const region = (name: string, centroidX: number): Region => ({
       name,
+      hub: { id: name, x: centroidX, y: 0, size: 0 },
+      otherMembers: [],
       memberCount: 3,
       island: false,
       centroid: { x: centroidX, y: 0 },
