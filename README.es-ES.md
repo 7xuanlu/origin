@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=9c35d476caf5741fa3ccb413e186705c7aacaf8a9c6621e29c91f7553f2fc3b8 -->
+<!-- README_SYNC: source=README.md sha256=88d923d235219b5c409efc4a64626449317121e7c636a66097b86407e6beff65 -->
 
 <p align="center">
   <picture>
@@ -16,7 +16,7 @@ El trabajo útil con IA no debería desaparecer cuando termina una conversación
 <p align="center">
   <a href="https://github.com/7xuanlu/wenlan/actions/workflows/ci.yml?query=branch%3Amain"><img alt="CI" src="https://github.com/7xuanlu/wenlan/actions/workflows/ci.yml/badge.svg?branch=main&event=push"></a>
   <a href="https://github.com/7xuanlu/wenlan/releases/latest"><img alt="Última versión" src="https://img.shields.io/github/v/release/7xuanlu/wenlan?sort=semver&label=release"></a>
-  <a href="#license"><img alt="Licencia: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="#license"><img alt="Licencia: Apache-2.0 y AGPL-3.0" src="https://img.shields.io/badge/license-Apache--2.0%20%2B%20AGPL--3.0-blue.svg"></a>
 </p>
 
 <p align="center">
@@ -291,7 +291,7 @@ Referencia completa del flujo de trabajo: [plugin/skills](plugin/skills/README.m
 
 Nada queda encerrado. Las páginas y las notas de sesión son Markdown en `~/.wenlan/`; las memorias viven en una base de datos libSQL dentro del directorio de datos de la plataforma (`~/Library/Application Support/wenlan/` en macOS, `~/.local/share/wenlan/` en Linux, `%LOCALAPPDATA%\wenlan\` en Windows). Copia esas dos carpetas para hacer una copia de seguridad o mover tu Wenlan. Si esta instalación se actualizó desde Origin, todavía conserva una copia completa de sus datos en `~/.origin/` y en la carpeta hermana de datos `origin` (`~/Library/Application Support/origin/` en macOS, `~/.local/share/origin/` en Linux, `%LOCALAPPDATA%\origin\` en Windows); borra o copia también esas dos.
 
-Para desinstalar: el interruptor *Ejecutar Wenlan en segundo plano al iniciar sesión* de la app elimina el registro de arranque — desactívalo, cierra la app y borra `Wenlan.app` o ejecuta el desinstalador de Windows, y después borra las carpetas anteriores. `wenlan background off` solo detiene el daemon y desactiva el arranque automático; no elimina el registro de arranque, así que una instalación solo de CLI debe seguir en su lugar el punto de desinstalación del daemon en [PRIVACY.md](PRIVACY.md). Todas las rutas que Wenlan escribe están ahí.
+Para desinstalar: el interruptor *Ejecutar Wenlan en segundo plano al iniciar sesión* de la app elimina el registro de arranque — desactívalo, cierra la app y borra `Wenlan.app` o ejecuta el desinstalador de Windows, y después borra las carpetas anteriores. `wenlan background off` solo detiene el daemon y desactiva el arranque automático; no elimina el registro de arranque, así que una instalación solo de CLI debe seguir en su lugar el punto de desinstalación del daemon en [PRIVACY.md](PRIVACY.md). Las rutas que Wenlan escribe están ahí.
 
 ---
 
@@ -358,11 +358,34 @@ pnpm build:all
 
 ---
 
+<a id="code-signing-policy"></a>
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+- **Autores:** [@7xuanlu](https://github.com/7xuanlu), que puede hacer commit en este repositorio sin una revisión adicional.
+- **Revisores:** [@7xuanlu](https://github.com/7xuanlu). Todo cambio de alguien que no sea committer llega como pull request y se revisa antes de fusionarse.
+- **Aprobadores:** [@7xuanlu](https://github.com/7xuanlu), que aprueba cada solicitud de firma y así decide qué versión se firma.
+
+La autenticación multifactor es obligatoria para cada mantenedor, en GitHub y en SignPath, y nadie se añade a ninguno de los dos sin ella. Las versiones se compilan únicamente con el workflow de release por etiqueta de este repositorio, en runners alojados por GitHub, desde el commit al que apunta la etiqueta.
+
+**Política de privacidad:** [PRIVACY.md](PRIVACY.md) — qué guarda Wenlan, dónde lo guarda y cada caso que conocemos en que accede a la red. Cómo se firma cada plataforma: [docs/code-signing.md](docs/code-signing.md).
+
+La solicitud a SignPath está pendiente. Los instaladores de Windows aún no están firmados.
+
+---
+
 <a id="license"></a>
 
 ## Licencia
 
-Wenlan tiene licencia bajo **Apache-2.0**. Esto incluye el runtime local, la CLI, el servidor MCP, los tipos compartidos y los archivos del plugin de Claude Code/Codex en este repositorio.
+Wenlan usa dos licencias, una por cada parte del repositorio.
+
+- **Apache-2.0** ([`LICENSE`](LICENSE)) cubre el runtime local, la CLI, el servidor MCP, los tipos compartidos y los archivos del plugin de Claude Code y Codex. Constrúyelo libremente sobre esto.
+- **AGPL-3.0-only** ([`app/LICENSE`](app/LICENSE)) cubre la aplicación de escritorio: el crate `app/` y el frontend de React que incluye. Si ejecutas una versión modificada de la aplicación como servicio en red, la AGPL te pide ofrecer ese código modificado a sus usuarios.
+
+La separación es deliberada. El código Apache-2.0 puede usarse dentro de un programa AGPL-3.0, así que la aplicación de escritorio se apoya en el runtime sin que ninguna de las dos licencias se incumpla.
 
 ---
 

@@ -14,7 +14,7 @@ Useful work with AI shouldn't disappear when a conversation ends. Wenlan builds 
 <p align="center">
   <a href="https://github.com/7xuanlu/wenlan/actions/workflows/ci.yml?query=branch%3Amain"><img alt="CI" src="https://github.com/7xuanlu/wenlan/actions/workflows/ci.yml/badge.svg?branch=main&event=push"></a>
   <a href="https://github.com/7xuanlu/wenlan/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/7xuanlu/wenlan?sort=semver&label=release"></a>
-  <a href="#license"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="#license"><img alt="License: Apache-2.0 and AGPL-3.0" src="https://img.shields.io/badge/license-Apache--2.0%20%2B%20AGPL--3.0-blue.svg"></a>
 </p>
 
 <p align="center">
@@ -291,7 +291,7 @@ Full workflow reference: [plugin/skills](plugin/skills/README.md). Technical mod
 
 Nothing is locked in. Pages and session notes are Markdown under `~/.wenlan/`; memories live in one libSQL database under the platform data directory (`~/Library/Application Support/wenlan/` on macOS, `~/.local/share/wenlan/` on Linux, `%LOCALAPPDATA%\wenlan\` on Windows). Copy those two folders to back up or move a Wenlan. An install upgraded from Origin still holds a full copy of its data in `~/.origin/` and in the sibling `origin` data folder (`~/Library/Application Support/origin/` on macOS, `~/.local/share/origin/` on Linux, `%LOCALAPPDATA%\origin\` on Windows); delete or copy those two as well.
 
-To uninstall: the app's *Run Wenlan in background at login* toggle removes the launch registration — turn it off, quit, and delete `Wenlan.app` or run the Windows uninstaller, then delete the folders above. `wenlan background off` only stops the daemon and disables autostart; it does not remove the launch registration, so a CLI-only install should instead follow the daemon uninstall bullet in [PRIVACY.md](PRIVACY.md). Every path Wenlan writes is listed there.
+To uninstall: the app's *Run Wenlan in background at login* toggle removes the launch registration — turn it off, quit, and delete `Wenlan.app` or run the Windows uninstaller, then delete the folders above. `wenlan background off` only stops the daemon and disables autostart; it does not remove the launch registration, so a CLI-only install should instead follow the daemon uninstall bullet in [PRIVACY.md](PRIVACY.md). The paths Wenlan writes are listed there.
 
 ---
 
@@ -358,11 +358,34 @@ pnpm build:all
 
 ---
 
+<a id="code-signing-policy"></a>
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+- **Authors:** [@7xuanlu](https://github.com/7xuanlu), who may commit to this repository without a further review.
+- **Reviewers:** [@7xuanlu](https://github.com/7xuanlu). Every change from someone who is not a committer arrives as a pull request and is reviewed before it merges.
+- **Approvers:** [@7xuanlu](https://github.com/7xuanlu), who approves each signing request and so decides which release is signed.
+
+Multi-factor authentication is required of every maintainer, on GitHub and on SignPath, and nobody is added to either without it. Releases are built only by the tagged release workflow in this repository, on GitHub-hosted runners, from the commit the tag points at.
+
+**Privacy policy:** [PRIVACY.md](PRIVACY.md) — what Wenlan stores, where it stores it, and each case we know of in which it reaches the network. How each platform is signed: [docs/code-signing.md](docs/code-signing.md).
+
+The SignPath application is pending. Windows installers are not signed yet.
+
+---
+
 <a id="license"></a>
 
 ## License
 
-Wenlan is licensed under **Apache-2.0**. This includes the local runtime, CLI, MCP server, shared types, and Claude Code/Codex plugin files in this repository.
+Wenlan uses two licenses, one per part of the repository.
+
+- **Apache-2.0** ([`LICENSE`](LICENSE)) covers the local runtime, CLI, MCP server, shared types, and the Claude Code and Codex plugin files. Build on these freely.
+- **AGPL-3.0-only** ([`app/LICENSE`](app/LICENSE)) covers the desktop app: the `app/` crate and the React frontend it ships. If you run a modified version of the app as a network service, the AGPL asks you to offer that modified source to its users.
+
+The split is deliberate. Apache-2.0 code may be used inside an AGPL-3.0 program, so the desktop app builds on the runtime without either license being violated.
 
 ---
 

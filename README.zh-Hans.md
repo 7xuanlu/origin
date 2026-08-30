@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=9c35d476caf5741fa3ccb413e186705c7aacaf8a9c6621e29c91f7553f2fc3b8 -->
+<!-- README_SYNC: source=README.md sha256=88d923d235219b5c409efc4a64626449317121e7c636a66097b86407e6beff65 -->
 
 <p align="center">
   <picture>
@@ -16,7 +16,7 @@
 <p align="center">
   <a href="https://github.com/7xuanlu/wenlan/actions/workflows/ci.yml?query=branch%3Amain"><img alt="CI" src="https://github.com/7xuanlu/wenlan/actions/workflows/ci.yml/badge.svg?branch=main&event=push"></a>
   <a href="https://github.com/7xuanlu/wenlan/releases/latest"><img alt="最新版本" src="https://img.shields.io/github/v/release/7xuanlu/wenlan?sort=semver&label=release"></a>
-  <a href="#license"><img alt="许可证：Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="#license"><img alt="许可证：Apache-2.0 与 AGPL-3.0" src="https://img.shields.io/badge/license-Apache--2.0%20%2B%20AGPL--3.0-blue.svg"></a>
 </p>
 
 <p align="center">
@@ -293,7 +293,7 @@ a1b2c3d distill: 4 pages
 
 没有任何锁定。页面和会话笔记是 `~/.wenlan/` 下的 Markdown；记忆保存在平台数据目录下的一个 libSQL 数据库中（macOS 为 `~/Library/Application Support/wenlan/`，Linux 为 `~/.local/share/wenlan/`，Windows 为 `%LOCALAPPDATA%\wenlan\`）。复制这两个文件夹即可备份或迁移你的 Wenlan。如果这次安装是从 Origin 升级而来，仍会在 `~/.origin/` 和同级的 `origin` 数据文件夹中（macOS 为 `~/Library/Application Support/origin/`，Linux 为 `~/.local/share/origin/`，Windows 为 `%LOCALAPPDATA%\origin\`）各保留一份完整数据；这两个文件夹也请一并删除或复制。
 
-卸载：app 中「登录时在后台运行文澜」开关会移除开机注册——关闭它并退出，删除 `Wenlan.app` 或运行 Windows 卸载程序，然后删除上述文件夹。`wenlan background off` 只会停止守护进程并关闭开机自启，不会移除开机注册；仅使用 CLI 的安装请改为参照 [PRIVACY.md](PRIVACY.md) 中守护进程的卸载条目。Wenlan 写入的所有路径都列在其中。
+卸载：app 中「登录时在后台运行文澜」开关会移除开机注册——关闭它并退出，删除 `Wenlan.app` 或运行 Windows 卸载程序，然后删除上述文件夹。`wenlan background off` 只会停止守护进程并关闭开机自启，不会移除开机注册；仅使用 CLI 的安装请改为参照 [PRIVACY.md](PRIVACY.md) 中守护进程的卸载条目。Wenlan 写入的路径列在其中。
 
 ---
 
@@ -360,11 +360,34 @@ pnpm build:all
 
 ---
 
+<a id="code-signing-policy"></a>
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+- **Authors：**[@7xuanlu](https://github.com/7xuanlu)，可直接向本 repository 提交 commit，无需额外 review。
+- **Reviewers：**[@7xuanlu](https://github.com/7xuanlu)。非 committer 的每一处改动都以 pull request 形式提交，合并前先经过 review。
+- **Approvers：**[@7xuanlu](https://github.com/7xuanlu)，审批每一次签名请求，决定哪一个 release 被签名。
+
+本项目要求每位 maintainer 在 GitHub 与 SignPath 上都启用多因素认证；未启用者不会被加入其中任何一方。Release 只由本 repository 的 tag release workflow 构建，运行在 GitHub 托管的 runner 上，来源是该 tag 指向的 commit。
+
+**隐私政策：**[PRIVACY.md](PRIVACY.md) —— Wenlan 保存什么、保存在哪里，以及我们已知它会访问网络的各种情况。各平台的签名方式见 [docs/code-signing.md](docs/code-signing.md)。
+
+SignPath 的申请正在审核中，Windows 安装包尚未签名。
+
+---
+
 <a id="license"></a>
 
 ## 许可
 
-Wenlan 采用 **Apache-2.0** 许可，包括本 repository 内的 local runtime、CLI、MCP server、shared types，以及 Claude Code/Codex plugin files。
+Wenlan 采用两种许可，按 repository 的不同部分划分。
+
+- **Apache-2.0**（[`LICENSE`](LICENSE)）覆盖 local runtime、CLI、MCP server、shared types，以及 Claude Code 与 Codex 的 plugin files。可以自由基于这些开发。
+- **AGPL-3.0-only**（[`app/LICENSE`](app/LICENSE)）覆盖桌面 app：`app/` crate 及其附带的 React 前端。如果你把修改过的 app 作为网络服务运行，AGPL 要求你向使用它的人提供这份修改后的源码。
+
+这个划分是有意为之。Apache-2.0 的代码可以用在 AGPL-3.0 程序里，所以桌面 app 建立在 runtime 之上，两种许可都不会被违反。
 
 ---
 
