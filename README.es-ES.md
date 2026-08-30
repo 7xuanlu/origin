@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=a7f245c59fc508721b4e1de6c76c629fdef5956542440925d317f76bc84877b3 -->
+<!-- README_SYNC: source=README.md sha256=23240a69a98330b13102549c9b2d900a3485adf87f46c70b320c06baa529bde2 -->
 
 <p align="center">
   <picture>
@@ -321,6 +321,13 @@ Documentación más detallada, conceptos y comparaciones:
 - [Primeros pasos](https://wenlan.app/docs/get-started): instala y verifica el primer bucle local.
 - [Flujo diario](https://wenlan.app/docs/daily-workflow): brief, capture, recall, handoff, distill, lint y curate.
 - [Clientes MCP](https://wenlan.app/docs/mcp-clients): conecta Claude Code, Codex, Cursor, Claude Desktop y otros clientes.
+
+### Guías de flujo de trabajo
+
+- [Crear una base de conocimiento de proyectos para consultoría](https://wenlan.app/learn/build-client-project-knowledge-base-for-consulting)
+- [Crear una base de conocimiento para investigación de inversiones](https://wenlan.app/learn/build-investment-research-knowledge-base)
+- [Crear una base de conocimiento de investigación de producto antes de redactar un PRD](https://wenlan.app/learn/build-product-research-knowledge-base-for-prd)
+- [Crear una base de conocimiento de incidentes SRE](https://wenlan.app/learn/build-sre-incident-knowledge-base)
 
 ### Conceptos
 

@@ -186,9 +186,10 @@ describe("PageDetail citations", () => {
     const quote = screen.getByText(/It stays fast under load\./);
     expect(quote.textContent).not.toMatch(/\[\d+\]/);
     expect(quote.textContent).not.toContain("#citation");
-    // Known ceiling (spec §4.3): the first-sentence citation gets no inline
-    // chip; the second citation still renders in the body.
-    expect(screen.queryByRole("button", { name: /mem-1/ })).toBeNull();
+    // The first-sentence citation renders as a chip inside the pull quote;
+    // the second citation still renders in the body.
+    const lede = document.querySelector(".page-detail-lede") as HTMLElement;
+    expect(within(lede).getByRole("button", { name: /mem-1/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /mem-2/ })).toBeInTheDocument();
   });
 
@@ -217,7 +218,89 @@ describe("PageDetail citations", () => {
     renderPage();
     expect(await screen.findByText("Cited Page")).toBeInTheDocument();
     expect(screen.getAllByText(/It stays fast under load\./)).toHaveLength(1);
-    expect(screen.queryByRole("button", { name: /mem-1/ })).toBeNull();
+    // The sentence moved up into the lede and took its chip with it.
+    const lede = document.querySelector(".page-detail-lede") as HTMLElement;
+    expect(within(lede).getByRole("button", { name: /mem-1/ })).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /mem-1/ })).toHaveLength(1);
     expect(screen.getByRole("button", { name: /mem-2/ })).toBeInTheDocument();
+  });
+
+  it("keeps the chips in the lede when the distiller put the markers before the period", async () => {
+    // The daemon's summary is the first sentence with its markers stripped;
+    // the body keeps "setup [1][2]." with a space before the markers.
+    tauriMocks.getPage.mockResolvedValue({
+      ...BASE_PAGE,
+      summary: "Tally stores all data in one SQLite file next to the app.",
+      content:
+        "# Cited Page\n\nTally stores all data in one SQLite file next to the app [1][2]. The app process is the only writer.",
+      citations: [cite(1, 1), cite(2, 2)],
+    });
+    renderPage();
+    expect(await screen.findByText("Cited Page")).toBeInTheDocument();
+    const lede = document.querySelector(".page-detail-lede") as HTMLElement;
+    expect(within(lede).getByText(/Tally stores all data in one SQLite file/)).toBeInTheDocument();
+    expect(within(lede).getByRole("button", { name: /mem-1/ })).toBeInTheDocument();
+    expect(within(lede).getByRole("button", { name: /mem-2/ })).toBeInTheDocument();
+    expect(screen.getAllByText(/Tally stores all data in one SQLite file/)).toHaveLength(1);
+    expect(screen.getByText(/The app process is the only writer\./)).toBeInTheDocument();
+    // The pull quote is italic; the popover that opens from its chip is not.
+    fireEvent.focus(within(lede).getByRole("button", { name: /mem-1/ }));
+    const popover = await screen.findByRole("tooltip");
+    expect(popover.style.fontStyle).toBe("normal");
+  });
+
+  it("keeps a long first sentence in the lede when its citation links are what pushed it past the cap", async () => {
+    const sentence =
+      "Tally stores all data in one SQLite file next to the application, with automated nightly backups to iCloud Drive and manual restoration procedures, magic link authentication for the single user, fourteen day payment terms with overdue reminders at days seven and fourteen, and no Kubernetes or Postgres anywhere in the stack because the requirements stay deliberately minimal [1][2].";
+    // The regression: the cap was measured after the markers became links, so
+    // a sentence a reader sees as 376 characters counted as 409 and lost its
+    // place in the quote.
+    expect(sentence.replace(/ ?\[\d+\]/g, "").length).toBeLessThan(400);
+    expect(sentence.replace(/\[(\d+)\]/g, "[$1](#citation:$1)").length).toBeGreaterThan(400);
+    tauriMocks.getPage.mockResolvedValue({
+      ...BASE_PAGE,
+      summary: null,
+      content: `# Cited Page\n\n${sentence} The app process is the only writer.`,
+      citations: [cite(1, 1), cite(2, 2)],
+    });
+    renderPage();
+    expect(await screen.findByText("Cited Page")).toBeInTheDocument();
+    const lede = document.querySelector(".page-detail-lede") as HTMLElement;
+    expect(within(lede).getByRole("button", { name: /mem-1/ })).toBeInTheDocument();
+    expect(within(lede).getByRole("button", { name: /mem-2/ })).toBeInTheDocument();
+    expect(screen.getAllByText(/deliberately minimal/)).toHaveLength(1);
+  });
+
+  it("drops a TLDR label the model wrote, in the quote and in the body", async () => {
+    tauriMocks.getPage.mockResolvedValue({
+      ...BASE_PAGE,
+      // What a daemon without the matching core fix stored.
+      summary: "TLDR: Tally stores all data in one SQLite file next to the app.",
+      content:
+        "# Cited Page\n\nTLDR: Tally stores all data in one SQLite file next to the app [1][2]. The app process is the only writer.",
+      citations: [cite(1, 1), cite(2, 2)],
+    });
+    renderPage();
+    expect(await screen.findByText("Cited Page")).toBeInTheDocument();
+    const lede = document.querySelector(".page-detail-lede") as HTMLElement;
+    expect(lede.textContent).not.toContain("TLDR");
+    expect(within(lede).getByRole("button", { name: /mem-1/ })).toBeInTheDocument();
+    // The sentence moved up into the quote instead of being repeated below it.
+    expect(screen.getAllByText(/Tally stores all data in one SQLite file/)).toHaveLength(1);
+  });
+
+  it("renders a hand-set summary plain and keeps the first sentence in the body", async () => {
+    tauriMocks.getPage.mockResolvedValue({
+      ...BASE_PAGE,
+      summary: "A claim an agent chose.",
+      content:
+        "# Cited Page\n\nThe daemon is local-first.[1] Second paragraph here.[2]",
+    });
+    renderPage();
+    expect(await screen.findByText("Cited Page")).toBeInTheDocument();
+    const lede = document.querySelector(".page-detail-lede") as HTMLElement;
+    expect(within(lede).getByText("A claim an agent chose.")).toBeInTheDocument();
+    expect(within(lede).queryByRole("button")).toBeNull();
+    expect(screen.getByRole("button", { name: /mem-1/ })).toBeInTheDocument();
   });
 });

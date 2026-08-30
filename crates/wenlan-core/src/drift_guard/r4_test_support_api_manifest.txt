@@ -942,6 +942,8 @@ crates/wenlan-core/src/synthesis/distill.rs|crate::synthesis::distill::tests::re
 crates/wenlan-core/src/synthesis/distill.rs|crate::synthesis::distill::tests::refresh_page_re_projects_md_when_path_passed|test_primary_session|1
 crates/wenlan-core/src/synthesis/distill.rs|crate::synthesis::distill::tests::refresh_page_rebuilds_machine_page_and_bumps_changelog|TestDbSession::execute|1
 crates/wenlan-core/src/synthesis/distill.rs|crate::synthesis::distill::tests::refresh_page_rebuilds_machine_page_and_bumps_changelog|test_primary_session|1
+crates/wenlan-core/src/synthesis/distill.rs|crate::synthesis::distill::tests::refresh_page_rebuilds_the_summary_from_the_new_body|TestDbSession::execute|1
+crates/wenlan-core/src/synthesis/distill.rs|crate::synthesis::distill::tests::refresh_page_rebuilds_the_summary_from_the_new_body|test_primary_session|1
 crates/wenlan-core/src/synthesis/distill.rs|crate::synthesis::distill::tests::resolve_distill_target_ignores_unregistered_memory_space|TestDbSession::execute|1
 crates/wenlan-core/src/synthesis/distill.rs|crate::synthesis::distill::tests::resolve_distill_target_ignores_unregistered_memory_space|test_primary_session|1
 crates/wenlan-core/src/synthesis/distill_truth_test.rs|crate::synthesis::distill::distill_truth_test::refresh_page_skips_re_distill_for_a_page_the_automatic_reader_may_not_see|TestDbSession::execute|1

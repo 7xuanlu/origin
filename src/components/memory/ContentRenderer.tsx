@@ -12,7 +12,8 @@ import { CITATION_ANCHOR_PREFIX } from "../../lib/pageCitations";
 interface ContentRendererProps {
   content: string;
   structuredFields?: string | null;
-  variant: "card" | "detail";
+  /** "lede" renders bare paragraphs so the surrounding pull-quote styles apply. */
+  variant: "card" | "detail" | "lede";
   className?: string;
   /** Render #citation:k links as inline chips (page detail). */
   renderCitation?: (occurrence: number) => React.ReactNode;
@@ -251,9 +252,16 @@ export default function ContentRenderer({
   const shape = classifyContent(normalized, structuredFields);
   const prepared = prepareForRender(normalized, shape);
 
+  const baseComponents =
+    variant === "lede"
+      ? {
+          ...markdownComponents,
+          p: ({ children }: { children?: React.ReactNode }) => <p>{children}</p>,
+        }
+      : markdownComponents;
   const components = renderCitation
     ? {
-        ...markdownComponents,
+        ...baseComponents,
         a: (props: { href?: string; children?: React.ReactNode }) => {
           const href = props.href ?? "";
           if (href.startsWith(CITATION_ANCHOR_PREFIX)) {
@@ -263,7 +271,7 @@ export default function ContentRenderer({
           return markdownComponents.a(props);
         },
       }
-    : markdownComponents;
+    : baseComponents;
 
   return (
     <div className={["content-renderer", className].filter(Boolean).join(" ")}>

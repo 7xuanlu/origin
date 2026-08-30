@@ -322,6 +322,13 @@ More detailed documentation, concepts, and comparisons:
 - [Daily workflow](https://wenlan.app/docs/daily-workflow): brief, capture, recall, handoff, distill, lint, and curate.
 - [MCP clients](https://wenlan.app/docs/mcp-clients): connect Claude Code, Codex, Cursor, Claude Desktop, and other clients.
 
+### Workflow guides
+
+- [Build a client project knowledge base for consulting](https://wenlan.app/learn/build-client-project-knowledge-base-for-consulting)
+- [Build an investment research knowledge base](https://wenlan.app/learn/build-investment-research-knowledge-base)
+- [Build a product research knowledge base before writing a PRD](https://wenlan.app/learn/build-product-research-knowledge-base-for-prd)
+- [Build an SRE incident knowledge base](https://wenlan.app/learn/build-sre-incident-knowledge-base)
+
 ### Concepts
 
 - [Why a living wiki, not just AI memory](https://wenlan.app/learn/ai-work-memory): the problem and product model in depth.

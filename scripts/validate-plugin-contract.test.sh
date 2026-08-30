@@ -177,6 +177,10 @@ assert_rejects "codex resolver parity drift" \
     perl -0pi -e 's/locked-env/codex-locked-env/' \
         "$TMPDIR_TEST/root/plugin-codex/bin/resolve-space.sh"
 
+assert_rejects "codex resolver checkout-only path regression" \
+    perl -0pi -e 's|find "\$HOME/.codex/plugins/cache"|find "\$HOME/.codex/plugins/stale"|' \
+    "$TMPDIR_TEST/root/plugin-codex/skills/recall/SKILL.md"
+
 assert_rejects "codex MCP plugin-relative cwd drift" \
     perl -0pi -e 's/"cwd": "\."/"cwd": ".."/' \
     "$TMPDIR_TEST/root/plugin-codex/.mcp.json"

@@ -460,9 +460,11 @@ fn estimate_cluster_tokens(contents: &[String]) -> usize {
 /// `DISTILL_CLUSTER_CONCURRENCY`.
 /// The summary of a distilled page: the first sentence of its first prose
 /// line, skipping headings, blank lines, and everything under an
-/// "Open Questions" heading. Citation markers like `[3]` are removed. A page
-/// with no prose outside "Open Questions" gets no summary rather than a
-/// question standing in for one.
+/// "Open Questions" heading. Citation markers like `[3]` are removed, and so
+/// is a leading "TLDR:" label when the model wrote one: the label is not part
+/// of the sentence and reads as noise in the app's pull quote. A page with no
+/// prose outside "Open Questions" gets no summary rather than a question
+/// standing in for one.
 pub(crate) fn extract_page_summary(content: &str) -> Option<String> {
     let mut in_open_questions = false;
     for raw in content.lines() {
@@ -483,6 +485,7 @@ pub(crate) fn extract_page_summary(content: &str) -> Option<String> {
             .trim_start_matches("* ")
             .trim_start_matches("> ")
             .trim();
+        let text = strip_summary_label(text);
         let sentence = match text.find(". ") {
             Some(end) => &text[..=end],
             None => text,
@@ -491,6 +494,34 @@ pub(crate) fn extract_page_summary(content: &str) -> Option<String> {
         return (!cleaned.is_empty()).then_some(cleaned);
     }
     None
+}
+
+/// Remove a leading "TLDR:" label, with any markdown emphasis around it, so a
+/// labelled opener does not put the label in the page summary. The label must
+/// be followed by a separator, so prose that merely starts with the letters
+/// ("TLDRs are no substitute for the page") is left alone.
+fn strip_summary_label(text: &str) -> &str {
+    let rest = text.trim_start().trim_start_matches(['*', '_']);
+    let lower = rest.to_ascii_lowercase();
+    let Some(label_len) = ["tl;dr", "tldr"]
+        .into_iter()
+        .find(|label| lower.starts_with(label))
+        .map(str::len)
+    else {
+        return text;
+    };
+    let after = rest[label_len..]
+        .trim_start_matches(['*', '_'])
+        .trim_start();
+    let Some(after) = after.strip_prefix([':', '-', '\u{2013}', '\u{2014}']) else {
+        return text;
+    };
+    let after = after.trim_start_matches(['*', '_']).trim_start();
+    if after.is_empty() {
+        text
+    } else {
+        after
+    }
 }
 
 /// Remove `[N]` citation markers and the space that precedes them.
@@ -1436,6 +1467,7 @@ pub(crate) async fn refresh_page_with_prompt(
     // NOT NULL`, so a concurrent agent PUT that cleared staleness wins the race
     // without TOCTOU.
     let citations_json = serde_json::to_string(&cites).unwrap_or_else(|_| "[]".to_string());
+    let summary = extract_page_summary(&content);
     let result = crate::post_write::update_page_at_source_revision(
         db,
         page_id,
@@ -1453,6 +1485,13 @@ pub(crate) async fn refresh_page_with_prompt(
         Some((citations_json, stats.summary())),
     )
     .await?;
+
+    // The one-line summary is derived from the body, so a rebuilt body gets
+    // a rebuilt summary; otherwise the pull quote outlives the prose it
+    // summarised. A gated or unchanged outcome leaves the stored page alone.
+    if result.wrote {
+        db.update_page_summary(page_id, summary.as_deref()).await?;
+    }
 
     Ok(RefreshOutcome {
         wrote: result.wrote,
@@ -1572,6 +1611,33 @@ The app process is the only writer [3].\n\n## Backup\n\nNightly copy to iCloud D
         assert_eq!(
             extract_page_summary(content).as_deref(),
             Some("Stripe over PayPal for EU clients.")
+        );
+    }
+
+    #[test]
+    fn summary_drops_a_tldr_label_the_model_wrote() {
+        let content = "TLDR: Tally stores all data in one SQLite file [2]. More prose.\n";
+        assert_eq!(
+            extract_page_summary(content).as_deref(),
+            Some("Tally stores all data in one SQLite file.")
+        );
+    }
+
+    #[test]
+    fn summary_drops_a_bold_tl_dr_label_with_a_dash() {
+        let content = "**TL;DR** \u{2014} Stripe over PayPal for EU clients. Fees are lower.\n";
+        assert_eq!(
+            extract_page_summary(content).as_deref(),
+            Some("Stripe over PayPal for EU clients.")
+        );
+    }
+
+    #[test]
+    fn summary_keeps_prose_that_merely_starts_with_those_letters() {
+        let content = "TLDRs are no substitute for the page. More prose.\n";
+        assert_eq!(
+            extract_page_summary(content).as_deref(),
+            Some("TLDRs are no substitute for the page.")
         );
     }
 
@@ -2176,6 +2242,60 @@ The app process is the only writer [3].\n\n## Backup\n\nNightly copy to iCloud D
         assert!(
             latest.get("citations_summary").is_some(),
             "citations committed atomically with the content bump"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_page_rebuilds_the_summary_from_the_new_body() {
+        let (db, _db_dir) = crate::db::tests::test_db().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let now_ts = chrono::Utc::now().timestamp();
+        {
+            let conn = db.test_primary_session().await;
+            conn.execute(
+                "INSERT INTO memories (id, source_id, title, content, chunk_index, chunk_type, memory_type, space, source_agent, created_at, last_modified, confirmed, stability, source) \
+                 VALUES (?1, ?1, ?1, 'Tokio is an async runtime for Rust programs', 0, 'text', 'fact', 'test', 'claude-code', ?2, ?2, 1, 'confirmed', 'memory')",
+                libsql::params!["mem_seed".to_string(), now_ts],
+            )
+            .await
+            .unwrap();
+        }
+        // The stored summary is the pre-#642 symptom: an open question that
+        // used to be the page's first bullet.
+        db.insert_page(
+            "page_m",
+            "Tokio",
+            Some("Does Tokio scale past one core?"),
+            "original body\n\n## Open Questions\n- Does Tokio scale past one core?",
+            None,
+            None,
+            &["mem_seed"],
+            &now,
+        )
+        .await
+        .unwrap();
+        db.set_page_stale("page_m", "source_updated").await.unwrap();
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(
+            "Tokio is an async runtime for Rust programs [1]",
+        ));
+        let outcome = refresh_page(
+            &db,
+            &llm,
+            &PromptRegistry::default(),
+            "page_m",
+            RefreshReason::SourceChanged,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.wrote);
+
+        let page = db.get_page("page_m").await.unwrap().unwrap();
+        assert_eq!(
+            page.summary.as_deref(),
+            Some("Tokio is an async runtime for Rust programs"),
+            "a rebuilt body gets a rebuilt summary"
         );
     }
 

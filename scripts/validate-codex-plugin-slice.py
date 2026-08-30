@@ -62,6 +62,11 @@ REQUIRED_SKILL_INTERFACE = {
 }
 SKILLS_WITHOUT_MCP_REFERENCE = {"handoff", "help", "pages"}
 SKILLS_USING_RESOLVER = {"brief", "capture", "distill", "handoff", "lint", "recall"}
+# Installed plugins live under ~/.codex/plugins/cache/<marketplace>/wenlan/<version>/;
+# the checkout-relative `plugin-codex/bin/...` path only resolves inside this repo.
+RESOLVER_LOCATOR = (
+    "find \"$HOME/.codex/plugins/cache\" -path '*/wenlan/*/bin/resolve-space.sh'"
+)
 REQUIRED_GUARDRAILS = {
     "forget": [
         "cannot be undone",
@@ -244,8 +249,14 @@ def validate_skills() -> None:
             fail(f"{path.relative_to(ROOT)} must be marked user-invocable for slash autocomplete")
         if skill not in SKILLS_WITHOUT_MCP_REFERENCE and "mcp__wenlan__" not in text:
             fail(f"{path.relative_to(ROOT)} must use Codex wenlan MCP tool names")
-        if skill in SKILLS_USING_RESOLVER and "plugin-codex/bin/resolve-space.sh" not in text:
-            fail(f"{path.relative_to(ROOT)} must use plugin-codex/bin/resolve-space.sh")
+        if skill in SKILLS_USING_RESOLVER:
+            if "plugin-codex/bin/resolve-space.sh" not in text:
+                fail(f"{path.relative_to(ROOT)} must use plugin-codex/bin/resolve-space.sh")
+            if RESOLVER_LOCATOR not in text:
+                fail(
+                    f"{path.relative_to(ROOT)} must locate the installed resolver with "
+                    f"{RESOLVER_LOCATOR}"
+                )
         for needle in REQUIRED_GUARDRAILS.get(skill, []):
             if " ".join(needle.split()) not in normalized_text:
                 fail(f"{path.relative_to(ROOT)} must contain guardrail {needle!r}")
