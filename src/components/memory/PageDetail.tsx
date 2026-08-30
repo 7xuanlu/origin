@@ -1296,11 +1296,16 @@ export default function PageDetail({
   const tldr = sentenceEnd > 0 && sentenceEnd < 400
     ? stripCitationLinks(bodyAfterHeadings.slice(0, sentenceEnd + 1).trim())
     : "";
-  // The lede shows the page summary when there is one; only when the first
-  // sentence itself is the lede is it cut from the body. Cutting it while the
-  // summary is shown dropped that sentence, and its citations, from the page.
+  // The lede shows the page summary when there is one; the first sentence is
+  // cut from the body only when it is what the lede shows (no summary, or a
+  // summary that repeats it). Cutting it under a different summary dropped
+  // that sentence, and its citations, from the page.
+  const normalizeSentence = (s: string) =>
+    s.replace(/\[\d+\]/g, "").replace(/\s+/g, " ").trim().replace(/\.$/, "").toLowerCase();
   const ledeText = page.summary || tldr;
-  const displayContent = tldr && !page.summary
+  const ledeIsFirstSentence =
+    !page.summary || (tldr !== "" && normalizeSentence(page.summary) === normalizeSentence(tldr));
+  const displayContent = tldr && ledeIsFirstSentence
     ? (cleanedContent.slice(0, leadingHeadings) + bodyAfterHeadings.slice(sentenceEnd + 1).trimStart()).trim()
     : cleanedContent;
 

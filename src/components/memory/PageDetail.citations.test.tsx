@@ -206,4 +206,18 @@ describe("PageDetail citations", () => {
     expect(screen.getByRole("button", { name: /mem-1/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /mem-2/ })).toBeInTheDocument();
   });
+
+  it("does not repeat the first sentence when the summary is that sentence", async () => {
+    tauriMocks.getPage.mockResolvedValue({
+      ...BASE_PAGE,
+      summary: "The daemon is local-first. It stays fast under load.",
+      content:
+        "# Cited Page\n\nThe daemon is local-first.[1] It stays fast under load. Second paragraph here.[2]",
+    });
+    renderPage();
+    expect(await screen.findByText("Cited Page")).toBeInTheDocument();
+    expect(screen.getAllByText(/It stays fast under load\./)).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: /mem-1/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /mem-2/ })).toBeInTheDocument();
+  });
 });
