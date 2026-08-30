@@ -183,7 +183,7 @@ function spaceRows(wire: any): Record<string, unknown>[] {
       ? wire.spaces
       : [];
   return rows.filter(
-    (candidate): candidate is Record<string, unknown> =>
+    (candidate: unknown): candidate is Record<string, unknown> =>
       candidate !== null && typeof candidate === "object",
   );
 }

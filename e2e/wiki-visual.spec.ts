@@ -25,7 +25,7 @@ function wikiPages() {
 async function openWiki(page: BrowserPage, locale: "en" | "zh-Hant", theme: "dark" | "light") {
   const browserErrors = collectBrowserErrors(page);
   await installTauriMock(page, {
-    fixture: { pages: wikiPages() },
+    fixture: { ...createSpacesNavigationFixture(), pages: wikiPages() },
     locale,
     localStorage: { "wenlan-theme": theme },
     rawActions: [],

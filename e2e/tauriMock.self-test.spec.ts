@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { expect, test } from "@playwright/test";
+import type { Page as KnowledgePage, Space } from "../src/lib/tauri";
 import { installTauriMock } from "./tauriMock";
 
 test("models detail reads and mutations while rejecting unknown commands", async ({ page }) => {
@@ -154,9 +155,9 @@ test("models Page draft identity, replay, Space validation, and rename versionin
       space: null,
     });
 
-    const activeBeforeRename = await invoke("get_page", { id: "page-architecture" });
+    const activeBeforeRename = await invoke("get_page", { id: "page-architecture" }) as KnowledgePage;
     await invoke("accept_refinement", { id: "refinement-page-history-cleanup" });
-    const archivedBeforeRename = await invoke("get_page", { id: "page-history" });
+    const archivedBeforeRename = await invoke("get_page", { id: "page-history" }) as KnowledgePage;
     const renameClockDraft = await invoke("create_page_draft", {
       clientDraftId: "page_66666666-6666-4666-8666-666666666666",
       title: "Rename clock",
@@ -169,14 +170,14 @@ test("models Page draft identity, replay, Space validation, and rename versionin
       title: "Rename clock",
       content: "After update",
       space: "Wenlan",
-    });
+    }) as KnowledgePage;
     const renameCollisionError = await errorMessage("update_space", {
       name: "Wenlan",
       newName: "Research",
       description: "Must not apply",
     });
     const draftAfterRenameCollision = await invoke("get_page", { id: renameClockDraft.id });
-    const spacesAfterRenameCollision = await invoke("list_spaces", {});
+    const spacesAfterRenameCollision = await invoke("list_spaces", {}) as Space[];
 
     await invoke("update_space", {
       name: "Wenlan",
@@ -184,9 +185,9 @@ test("models Page draft identity, replay, Space validation, and rename versionin
       description: "Renamed",
     });
     const moved = await invoke("get_page", { id: original.clientDraftId });
-    const updatedAfterRename = await invoke("get_page", { id: renameClockDraft.id });
-    const activeAfterRename = await invoke("get_page", { id: "page-architecture" });
-    const archivedAfterRename = await invoke("get_page", { id: "page-history" });
+    const updatedAfterRename = await invoke("get_page", { id: renameClockDraft.id }) as KnowledgePage;
+    const activeAfterRename = await invoke("get_page", { id: "page-architecture" }) as KnowledgePage;
+    const archivedAfterRename = await invoke("get_page", { id: "page-history" }) as KnowledgePage;
     const replayedAfterRename = await invoke("create_page_draft", original);
     const staleAfterRenameError = await errorMessage("update_page_draft", {
       id: original.clientDraftId,
@@ -200,7 +201,7 @@ test("models Page draft identity, replay, Space validation, and rename versionin
       newName: "Wenlan Foundation",
       description: null,
     });
-    const updatedAfterSecondRename = await invoke("get_page", { id: renameClockDraft.id });
+    const updatedAfterSecondRename = await invoke("get_page", { id: renameClockDraft.id }) as KnowledgePage;
 
     return {
       invalidIdError,
@@ -246,7 +247,7 @@ test("models Page draft identity, replay, Space validation, and rename versionin
   expect(results.renameCollisionError).toContain('Space "Research" already exists');
   expect(results.draftAfterRenameCollision).toEqual(results.updatedBeforeRename);
   expect(results.spacesAfterRenameCollision.filter(
-    (space: { name: string }) => space.name === "Research",
+    (space) => space.name === "Research",
   )).toHaveLength(1);
   for (const [before, after] of [
     [results.activeBeforeRename, results.activeAfterRename],

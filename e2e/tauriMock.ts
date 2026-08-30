@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { Page } from "@playwright/test";
-import { APP_LOCALE_STORAGE_KEY, type AppLocale } from "../src/i18n/locales";
-import type { MemoryItem } from "../src/lib/tauri";
+import { APP_LOCALE_STORAGE_KEY } from "../src/i18n/locales";
 import { createSpacesNavigationFixture } from "./fixtures/spacesNavigation";
 import { TauriMockRuntime } from "./tauriMock/runtime";
 import type {
   BrowserErrorCapture,
   InstallTauriMockOptions,
   MockCommandCall,
-  TauriMockPageScenario,
 } from "./tauriMock/types";
 
 export type { TauriMockPageScenario } from "./tauriMock/types";
@@ -110,7 +108,7 @@ declare global {
       transformCallback: (callback: (...args: unknown[]) => unknown, once?: boolean) => number;
       unregisterCallback: (id: number) => void;
     };
-    __TAURI_EVENT_PLUGIN_INTERNALS__?: {
+    __TAURI_EVENT_PLUGIN_INTERNALS__: {
       unregisterListener: (event: string, eventId: number) => void;
     };
     __wenlanTauriInvoke: (command: string, args?: unknown) => Promise<unknown>;

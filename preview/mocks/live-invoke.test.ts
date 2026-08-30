@@ -122,7 +122,7 @@ describe("liveInvoke authored Page preview", () => {
   });
 
   it("models partial draft snapshots, CAS updates, publish, discard, and title conflicts in memory", async () => {
-    const fetch = vi.fn(async (input) =>
+    const fetch = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) =>
       new Response(JSON.stringify(
         String(input).endsWith("/api/spaces")
           ? [{ name: "Wenlan" }]
