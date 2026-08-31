@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.17.6](https://github.com/7xuanlu/wenlan/compare/v0.17.5...v0.17.6) (2026-08-31)
+
+
+### Bug Fixes
+
+* **app:** fade archived cards in list view and guard computed opacity in Playwright ([#646](https://github.com/7xuanlu/wenlan/issues/646)) ([6e7de70](https://github.com/7xuanlu/wenlan/commit/6e7de707a17f336dd8e2944e9fcb2de5519b9ceb))
+* **app:** keep an Atlas region name off other nodes and off its hub's own label ([#644](https://github.com/7xuanlu/wenlan/issues/644)) ([75ac274](https://github.com/7xuanlu/wenlan/commit/75ac274a82dae6173971daf55f21e004f422cd01))
+* **app:** keep the first sentence in the page body when the summary is the lede ([#641](https://github.com/7xuanlu/wenlan/issues/641)) ([7e60a23](https://github.com/7xuanlu/wenlan/commit/7e60a23edba9d6233047ef1a6fda53be75147510))
+* **app:** open the Home review dialog on the decisions the rail counted ([#643](https://github.com/7xuanlu/wenlan/issues/643)) ([803bce5](https://github.com/7xuanlu/wenlan/commit/803bce5c8198688f29f33fbce4d6cda241a254b4))
+* **app:** the page lede keeps its citation chips when it is the first sentence ([#652](https://github.com/7xuanlu/wenlan/issues/652)) ([c669094](https://github.com/7xuanlu/wenlan/commit/c6690943dde840d16901043847f9baeb4750db47))
+* **core:** a rebuilt page gets a rebuilt summary, and old first-bullet summaries are reconciled at start ([#651](https://github.com/7xuanlu/wenlan/issues/651)) ([7787923](https://github.com/7xuanlu/wenlan/commit/7787923eb412e729e2479b18d9cadafcfc6b2654))
+* **core:** take the page summary from the first prose sentence, not the first bullet ([#642](https://github.com/7xuanlu/wenlan/issues/642)) ([e57d69c](https://github.com/7xuanlu/wenlan/commit/e57d69ce4cf24fffe278d1dbce6c654a1caed18e))
+* **mcp:** recall no longer filters results to the calling agent ([#648](https://github.com/7xuanlu/wenlan/issues/648)) ([de8b6cd](https://github.com/7xuanlu/wenlan/commit/de8b6cd5282a2efbd062a83e1df0b5e6cf5f9b86))
+* **pages:** the lede drops a "TLDR:" label and keeps its chips when it is long ([#653](https://github.com/7xuanlu/wenlan/issues/653)) ([4b93708](https://github.com/7xuanlu/wenlan/commit/4b93708791c4a8c3c850efaef5006f0b19b6202b))
+* **plugin-codex:** skills locate resolve-space.sh in the installed plugin ([#649](https://github.com/7xuanlu/wenlan/issues/649)) ([f906cc5](https://github.com/7xuanlu/wenlan/commit/f906cc57de31593a31ebe092bd8baaf27e5b8ee6))
+
 ## [0.17.5](https://github.com/7xuanlu/wenlan/compare/v0.17.4...v0.17.5) (2026-08-30)
 
 
