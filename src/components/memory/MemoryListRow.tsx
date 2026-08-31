@@ -13,6 +13,7 @@ import {
 } from "../../lib/tauri";
 import { formatTimeAgo } from "../../lib/dateFormat";
 import ContentRenderer from "./ContentRenderer";
+import { ARCHIVED_MEMORY_OPACITY } from "./archivedMemoryOpacity";
 
 interface MemoryListRowProps {
   memory: MemoryItem;
@@ -98,8 +99,8 @@ export default function MemoryListRow({
         memory.is_archived
           ? ({
               ...style,
-              opacity: 0.55,
-              "--mem-enter-opacity": 0.55,
+              opacity: ARCHIVED_MEMORY_OPACITY,
+              "--mem-enter-opacity": ARCHIVED_MEMORY_OPACITY,
             } as CSSProperties)
           : style
       }

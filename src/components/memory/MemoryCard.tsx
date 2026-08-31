@@ -5,6 +5,7 @@ import { FACET_COLORS, STABILITY_TIERS, agentDisplayName, type MemoryItem, type 
 import { formatTimeAgo } from "../../lib/dateFormat";
 import ContentRenderer from "./ContentRenderer";
 import MemoryListRow from "./MemoryListRow";
+import { ARCHIVED_MEMORY_OPACITY } from "./archivedMemoryOpacity";
 
 interface MemoryCardProps {
   memory: MemoryItem;
@@ -225,21 +226,27 @@ export default function MemoryCard({
   }
 
   // ── Standard memory card ──
+  // Resting opacity. The list view passes the `mem-fade-up` entry animation in
+  // `style`, and it runs with `both` fill on this very element: without
+  // `--mem-enter-opacity` its final keyframe would hold the card at 1 and the
+  // fade would never show (see index.css). The grid animates a wrapper instead.
+  const restingOpacity = isSuperseded || memory.is_archived
+    ? ARCHIVED_MEMORY_OPACITY
+    : stability === "confirmed" || maturity === "distilled"
+      ? 1
+      : stability === "learned"
+        ? 0.85
+        : Math.max(0.4, Math.min(0.85, 0.4 + confidence * 0.45));
   return (
     <div
       className="group relative h-full flex flex-col"
       style={{
         borderLeft: `3px solid ${borderColor}`,
-        opacity: isSuperseded || memory.is_archived
-          ? 0.55
-          : stability === "confirmed" || maturity === "distilled"
-            ? 1
-            : stability === "learned"
-              ? 0.85
-              : Math.max(0.4, Math.min(0.85, 0.4 + confidence * 0.45)),
+        opacity: restingOpacity,
+        "--mem-enter-opacity": restingOpacity,
         animation: isNew ? "mem-shimmer 8s ease-in-out infinite" : undefined,
         ...style,
-      }}
+      } as React.CSSProperties}
     >
       <div
         className="py-4 pr-4 transition-colors duration-150 flex-1"
