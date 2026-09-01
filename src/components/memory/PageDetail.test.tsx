@@ -796,6 +796,43 @@ describe("PageDetail", () => {
     expect(defaultProps.onBack).not.toHaveBeenCalled();
   });
 
+  it("surfaces the daemon's discard reason when a re-distill was blocked, not 'already up to date'", async () => {
+    const { redistillPage } = await import("../../lib/tauri");
+    (redistillPage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      status: "ok",
+      updated: false,
+      reason: "citation verification failed (8 verified, 13 unverified, 0 stripped)",
+    });
+    const { user } = renderWithQuery(<PageDetail {...defaultProps} />);
+
+    await screen.findByText("libSQL Architecture");
+    await user.click(screen.getByTitle("Re-distill page"));
+
+    expect(
+      await screen.findByText(
+        "Page not updated: citation verification failed (8 verified, 13 unverified, 0 stripped)",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("Page already up to date.")).toBeNull();
+  });
+
+  it("shows 'update blocked' instead of 'updating...' when the citation gate discarded the refresh", async () => {
+    const { getPage } = await import("../../lib/tauri");
+    const basePage = await (getPage as ReturnType<typeof vi.fn>)("concept_abc");
+    (getPage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ...basePage,
+      stale_reason: "source_updated",
+      refresh_blocked_reason:
+        "citation verification failed (8 verified, 13 unverified, 0 stripped)",
+    });
+    renderWithQuery(<PageDetail {...defaultProps} />);
+
+    expect(
+      await screen.findByText("update blocked: citations couldn't be verified"),
+    ).toBeTruthy();
+    expect(screen.queryByText("updating...")).toBeNull();
+  });
+
   it("confirms before re-distilling a user-edited page", async () => {
     const { getPage, redistillPage } = await import("../../lib/tauri");
     (getPage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({

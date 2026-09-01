@@ -1079,6 +1079,7 @@ pub async fn handle_refresh_page(
         sources_updated_count: 0,
         stale_reason: None,
         pending_rebuild: None,
+        refresh_blocked_reason: None,
         user_edited: existing.user_edited,
         relevance_score: 0.0,
         last_edited_by: None,

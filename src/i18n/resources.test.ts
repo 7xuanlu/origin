@@ -171,6 +171,7 @@ describe("translation resources", () => {
         relativeDaysAgo: "{{count}}d ago",
         needsReview: "needs review",
         updating: "updating...",
+        updateBlocked: "update blocked: citations couldn't be verified",
       },
       {
         lastDistilled: "上次精炼：{{time}}",
@@ -182,6 +183,7 @@ describe("translation resources", () => {
         relativeDaysAgo: "{{count}} 天前",
         needsReview: "需要审核",
         updating: "正在更新…",
+        updateBlocked: "更新受阻：引用未通过验证",
       },
       {
         lastDistilled: "上次精煉：{{time}}",
@@ -193,6 +195,7 @@ describe("translation resources", () => {
         relativeDaysAgo: "{{count}} 天前",
         needsReview: "需要審核",
         updating: "正在更新…",
+        updateBlocked: "更新受阻：引用未通過驗證",
       },
     ]);
   });

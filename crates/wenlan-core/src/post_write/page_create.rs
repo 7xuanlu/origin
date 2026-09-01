@@ -397,6 +397,7 @@ pub(super) async fn create_page_impl(
         sources_updated_count: 0,
         stale_reason: None,
         pending_rebuild: None,
+        refresh_blocked_reason: None,
         user_edited: false,
         relevance_score: 0.0,
         last_edited_by: None,

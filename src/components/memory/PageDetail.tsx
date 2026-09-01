@@ -619,6 +619,15 @@ export default function PageDetail({
         });
         return;
       }
+      if (!result.updated && result.reason) {
+        // The daemon ran the rebuild and discarded it (citation gate);
+        // saying "already up to date" here would hide the failure.
+        setRedistillNotice({
+          kind: "warning",
+          message: t("pageDetail.redistillBlocked", { reason: result.reason }),
+        });
+        return;
+      }
       setRedistillNotice({
         kind: "success",
         message: result.updated ? "Page re-distilled." : "Page already up to date.",
@@ -1401,14 +1410,20 @@ export default function PageDetail({
                   className="page-detail-dateline-item"
                   style={{
                     color:
-                      page.stale_reason === "source_conflict"
+                      page.stale_reason === "source_conflict" ||
+                      page.refresh_blocked_reason
                         ? "var(--mem-accent-amber)"
                         : "var(--mem-text-tertiary)",
                   }}
                 >
                   {page.stale_reason === "source_conflict"
                     ? t("pageDetail.dateline.needsReview")
-                    : t("pageDetail.dateline.updating")}
+                    : page.refresh_blocked_reason
+                      ? // The daemon discarded the automatic rebuild (citation
+                        // gate) and will not retry until sources change, so
+                        // "updating..." would be a lie that never resolves.
+                        t("pageDetail.dateline.updateBlocked")
+                      : t("pageDetail.dateline.updating")}
                 </span>
               )}
             </div>

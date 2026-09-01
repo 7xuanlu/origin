@@ -1155,7 +1155,8 @@ pub const EMBEDDING_DIM: usize = 768;
 /// `entities`-reading fence body). Migration 122 rebuilds `entity_page_map`/
 /// `observations`/`memory_entities`/`entity_minhash_bands` without their
 /// `REFERENCES entities(id)` foreign key. Migration 123 (G6 Stage 3) drops
-/// `entities` and `entity_aliases` outright.
+/// `entities` and `entity_aliases` outright. Migration 127 adds
+/// `pages.refresh_blocked_reason` (citation-gate surfacing).
 ///
 /// This constant is also the **downgrade barrier**. `run_migrations` refuses
 /// to open a database whose `user_version` exceeds it, so a build that
@@ -1163,7 +1164,7 @@ pub const EMBEDDING_DIM: usize = 768;
 /// `entities` table, skip every `version < N` branch, and quietly operate
 /// against a schema it cannot see. Refusing to open is recoverable; writing is
 /// not.
-pub const SCHEMA_VERSION: u32 = 126;
+pub const SCHEMA_VERSION: u32 = 127;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -9803,6 +9804,16 @@ impl MemoryDB {
                 self.migrate_126_rearm_empty_citations_and_drop_legacy_attempt_keys(version)
                     .await?;
             }
+
+            // Migration 127 (citation-gate surfacing): adds
+            // `pages.refresh_blocked_reason` so a re-synthesis discarded by
+            // the fail-closed citation gate can say why the page is still
+            // stale instead of showing "updating..." forever. See
+            // migrate_127_page_refresh_blocked_reason.
+            if version < 127 {
+                self.migrate_127_page_refresh_blocked_reason(version)
+                    .await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -16850,6 +16861,47 @@ impl MemoryDB {
              re-armed to NULL, {legacy_attempt_keys_dropped} legacy citation-backfill attempt \
              key(s) dropped"
         );
+        Ok(())
+    }
+
+    /// Migration 127 (citation-gate surfacing): `pages.refresh_blocked_reason`
+    /// records why the last automatic re-synthesis of a stale page was
+    /// discarded without a write (today: the fail-closed citation
+    /// verification gate). Nullable TEXT, NULL for every existing row; the
+    /// column-exists check keeps a crash-replay (ALTER applied, version bump
+    /// lost) idempotent, same pattern as migration 117.
+    async fn migrate_127_page_refresh_blocked_reason(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(127, prior_version).await?;
+        let conn = self.conn.lock().await;
+        let has_col: bool = {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM pragma_table_info('pages') \
+                     WHERE name = 'refresh_blocked_reason'",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m127 col check: {e}")))?;
+            match rows.next().await {
+                Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0) > 0,
+                _ => false,
+            }
+        };
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE pages ADD COLUMN refresh_blocked_reason TEXT",
+                (),
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m127 add refresh_blocked_reason: {e}")))?;
+        }
+        conn.execute("PRAGMA user_version = 127", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m127 bump: {e}")))?;
+        log::info!("[migration] Migration 127 applied: pages.refresh_blocked_reason column added");
         Ok(())
     }
 
@@ -30690,7 +30742,7 @@ impl MemoryDB {
             })?;
             conn.execute(
                 "UPDATE pages
-                     SET source_memory_ids = ?1, stale_reason = 'source_removed'
+                     SET source_memory_ids = ?1, stale_reason = 'source_removed', refresh_blocked_reason = NULL
                      WHERE id = ?2",
                 libsql::params![remaining_json, page_id],
             )
@@ -30966,6 +31018,7 @@ impl MemoryDB {
             conn.execute(
                 "UPDATE pages
                  SET stale_reason = 'source_updated',
+                     refresh_blocked_reason = NULL,
                      sources_updated_count = COALESCE(sources_updated_count, 0) + ?1,
                      source_revision = COALESCE(source_revision, 0) + 1,
                      citations = NULL
@@ -40990,7 +41043,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
                  FROM pages WHERE status = 'active' AND COALESCE(kind, 'concept') != 'entity' ORDER BY created_at ASC LIMIT 1",
                 (),
             )
@@ -45873,6 +45926,7 @@ impl MemoryDB {
                     conn.execute(
                         "UPDATE pages
                      SET stale_reason = 'source_updated',
+                         refresh_blocked_reason = NULL,
                          sources_updated_count = COALESCE(sources_updated_count, 0) + 1,
                          source_revision = COALESCE(source_revision, 0) + 1
                      WHERE id = ?1",
@@ -48654,7 +48708,7 @@ impl MemoryDB {
         let mut rows = conn
             .query(
                 &format!(
-                    "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                    "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
                  FROM pages WHERE id = ?1{fence_sql}"
                 ),
                 libsql::params![id],
@@ -48673,7 +48727,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
                  FROM pages WHERE entity_id = ?1 AND status = 'active' AND COALESCE(kind, 'concept') != 'entity' LIMIT 1",
                 libsql::params![entity_id],
             )
@@ -48760,7 +48814,7 @@ impl MemoryDB {
         let mut rows = conn
             .query(
                 &format!(
-                    "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                    "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
                  FROM pages WHERE status = ?1{fence_sql} ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3"
                 ),
                 libsql::params![status, limit, offset],
@@ -48790,7 +48844,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
                  FROM pages
                  WHERE status = ?1
                    AND COALESCE(kind, 'concept') != 'entity'
@@ -48821,7 +48875,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         Self::reject_page_draft_on_conn(&conn, page_id).await?;
         conn.execute(
-            "UPDATE pages SET user_edited = 0, stale_reason = 'manual_force' WHERE id = ?1",
+            "UPDATE pages SET user_edited = 0, stale_reason = 'manual_force', refresh_blocked_reason = NULL WHERE id = ?1",
             libsql::params![page_id],
         )
         .await
@@ -48840,7 +48894,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let (sql, params): (String, Vec<libsql::Value>) = match space {
             Some("uncategorized") => (
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
                  FROM pages WHERE status = ?1 AND COALESCE(kind, 'concept') != 'entity' AND space = '00000000-0000-4000-8000-000000000001' ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3".to_string(),
                 vec![
                     libsql::Value::Text(status.to_string()),
@@ -48849,7 +48903,7 @@ impl MemoryDB {
                 ],
             ),
             Some(d) => (
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
                  FROM pages WHERE status = ?1 AND COALESCE(kind, 'concept') != 'entity' AND space = ?2 ORDER BY last_modified DESC LIMIT ?3 OFFSET ?4".to_string(),
                 vec![
                     libsql::Value::Text(status.to_string()),
@@ -48859,7 +48913,7 @@ impl MemoryDB {
                 ],
             ),
             None => (
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
                  FROM pages WHERE status = ?1 AND COALESCE(kind, 'concept') != 'entity' ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3".to_string(),
                 vec![
                     libsql::Value::Text(status.to_string()),
@@ -49432,6 +49486,7 @@ impl MemoryDB {
                    changelog = ?6, \
                    citations = ?7, \
                    stale_reason = NULL, \
+                   refresh_blocked_reason = NULL, \
                    sources_updated_count = 0, \
                    source_revision = COALESCE(source_revision, 0) + 1 \
                  WHERE id = ?5 \
@@ -49449,6 +49504,7 @@ impl MemoryDB {
                    review_status = CASE WHEN ?4 IN ('manual_edit', 'fs_edit') THEN 'unconfirmed' ELSE review_status END, \
                    changelog = ?6, \
                    citations = ?7, \
+                   refresh_blocked_reason = NULL, \
                    source_revision = COALESCE(source_revision, 0) + 1 \
                  WHERE id = ?5"
             }
@@ -49556,6 +49612,7 @@ impl MemoryDB {
                    review_status = CASE WHEN ?4 IN ('manual_edit', 'fs_edit') THEN 'unconfirmed' ELSE review_status END, \
                    citations = ?6, \
                    stale_reason = NULL, \
+                   refresh_blocked_reason = NULL, \
                    sources_updated_count = 0, \
                    source_revision = COALESCE(source_revision, 0) + 1 \
                  WHERE id = ?5 \
@@ -49572,6 +49629,7 @@ impl MemoryDB {
                    user_edited = CASE WHEN ?4 IN ('manual_edit', 'fs_edit') THEN 1 ELSE user_edited END, \
                    review_status = CASE WHEN ?4 IN ('manual_edit', 'fs_edit') THEN 'unconfirmed' ELSE review_status END, \
                    citations = ?6, \
+                   refresh_blocked_reason = NULL, \
                    source_revision = COALESCE(source_revision, 0) + 1 \
                  WHERE id = ?5"
             }
@@ -50005,7 +50063,7 @@ impl MemoryDB {
             let conn = self.conn.lock().await;
             let mut rows = conn
                 .query(
-                    "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                    "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
                      FROM pages
                      WHERE entity_id = ?1 AND status = 'active'
                        AND COALESCE(review_status, 'confirmed') = 'confirmed'
@@ -52131,6 +52189,15 @@ impl MemoryDB {
             kind: row
                 .get::<String>(20)
                 .unwrap_or_else(|_| "concept".to_string()),
+            // Column 21 (migration 127). Graceful on the SELECTs that don't
+            // carry it: the search fusion queries append their own numeric
+            // score column at this index, and `String::from_sql` panics
+            // (`unreachable!`) on a non-text value — so match the raw Value
+            // instead of using the typed `get`.
+            refresh_blocked_reason: match row.get_value(21) {
+                Ok(libsql::Value::Text(reason)) => Some(reason),
+                _ => None,
+            },
             truth: None,
         })
     }
@@ -53126,7 +53193,7 @@ impl MemoryDB {
                         c.source_memory_ids, c.version, c.status, c.created_at, c.last_compiled, c.last_modified,
                         COALESCE(c.sources_updated_count, 0), c.stale_reason, COALESCE(c.user_edited, 0),
                         COALESCE(c.changelog, '[]'), COALESCE(c.creation_kind, 'distilled'), COALESCE(c.review_status, 'confirmed'),
-                        c.workspace, c.citations, COALESCE(c.kind, 'concept')
+                        c.workspace, c.citations, COALESCE(c.kind, 'concept'), c.refresh_blocked_reason
                  FROM pages c
                  INNER JOIN edges cs ON cs.src_id = c.id AND cs.edge_type = 'cites'
                         AND cs.valid_until IS NULL AND cs.dst_kind = 'memory'
@@ -53713,12 +53780,38 @@ impl MemoryDB {
         conn.execute(
             "UPDATE pages
              SET stale_reason = ?1,
+                 refresh_blocked_reason = NULL,
                  source_revision = COALESCE(source_revision, 0) + 1
              WHERE id = ?2",
             libsql::params![reason, page_id],
         )
         .await
         .map_err(|e| WenlanError::VectorDb(format!("set_page_stale: {e}")))?;
+        Ok(())
+    }
+
+    /// Record why a stale page's automatic re-synthesis was discarded without
+    /// a write (today: the fail-closed citation verification gate), so page
+    /// reads can say "update blocked: <reason>" instead of an indefinite
+    /// "updating...". Leaves `stale_reason` untouched — the page IS still
+    /// stale; only the retry loop is what the marker pauses.
+    ///
+    /// Cleared by every successful canonical page write
+    /// (`update_page_content` / the compile-acknowledge and staleness-clear
+    /// helpers) and by every mark-stale site, so it can never describe a page
+    /// that has since compiled or whose sources have since changed.
+    pub async fn set_page_refresh_blocked_reason(
+        &self,
+        page_id: &str,
+        reason: &str,
+    ) -> Result<(), WenlanError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE pages SET refresh_blocked_reason = ?1 WHERE id = ?2",
+            libsql::params![reason, page_id],
+        )
+        .await
+        .map_err(|e| WenlanError::VectorDb(format!("set_page_refresh_blocked_reason: {e}")))?;
         Ok(())
     }
 
@@ -53788,7 +53881,7 @@ impl MemoryDB {
         let affected = if let Some(revision) = expected_source_revision {
             conn.execute(
                 "UPDATE pages
-                 SET last_compiled = ?1, stale_reason = NULL, sources_updated_count = 0
+                 SET last_compiled = ?1, stale_reason = NULL, refresh_blocked_reason = NULL, sources_updated_count = 0
                  WHERE id = ?2 AND version = ?3 AND stale_reason IS NOT NULL
                    AND COALESCE(source_revision, 0) = ?4",
                 libsql::params![now, page_id, expected_version, revision],
@@ -53797,7 +53890,7 @@ impl MemoryDB {
         } else {
             conn.execute(
                 "UPDATE pages
-                 SET last_compiled = ?1, stale_reason = NULL, sources_updated_count = 0
+                 SET last_compiled = ?1, stale_reason = NULL, refresh_blocked_reason = NULL, sources_updated_count = 0
                  WHERE id = ?2 AND version = ?3 AND stale_reason IS NOT NULL",
                 libsql::params![now, page_id, expected_version],
             )
@@ -53827,7 +53920,7 @@ impl MemoryDB {
             let affected = if let Some(revision) = expected_source_revision {
                 conn.execute(
                     "UPDATE pages
-                     SET last_compiled = ?1, stale_reason = NULL, sources_updated_count = 0
+                     SET last_compiled = ?1, stale_reason = NULL, refresh_blocked_reason = NULL, sources_updated_count = 0
                      WHERE id = ?2 AND version = ?3 AND stale_reason IS NOT NULL
                        AND COALESCE(source_revision, 0) = ?4",
                     libsql::params![now, page_id, expected_version, revision],
@@ -53836,7 +53929,7 @@ impl MemoryDB {
             } else {
                 conn.execute(
                     "UPDATE pages
-                     SET last_compiled = ?1, stale_reason = NULL, sources_updated_count = 0
+                     SET last_compiled = ?1, stale_reason = NULL, refresh_blocked_reason = NULL, sources_updated_count = 0
                      WHERE id = ?2 AND version = ?3 AND stale_reason IS NOT NULL",
                     libsql::params![now, page_id, expected_version],
                 )
@@ -53895,7 +53988,7 @@ impl MemoryDB {
         let affected = if let Some(revision) = expected_source_revision {
             conn.execute(
                 "UPDATE pages
-                 SET stale_reason = NULL, sources_updated_count = 0
+                 SET stale_reason = NULL, refresh_blocked_reason = NULL, sources_updated_count = 0
                  WHERE id = ?1 AND version = ?2 AND stale_reason IS NOT NULL
                    AND COALESCE(source_revision, 0) = ?3",
                 libsql::params![page_id, expected_version, revision],
@@ -53904,7 +53997,7 @@ impl MemoryDB {
         } else {
             conn.execute(
                 "UPDATE pages
-                 SET stale_reason = NULL, sources_updated_count = 0
+                 SET stale_reason = NULL, refresh_blocked_reason = NULL, sources_updated_count = 0
                  WHERE id = ?1 AND version = ?2 AND stale_reason IS NOT NULL",
                 libsql::params![page_id, expected_version],
             )
@@ -53984,6 +54077,12 @@ impl MemoryDB {
     /// Select exactly one active stale Page after a durable composite cursor.
     /// Unlike OFFSET, the `(last_modified DESC, id ASC)` keyset does not skip a
     /// row when a successfully refreshed predecessor leaves the stale set.
+    ///
+    /// Pages whose last automatic refresh was discarded
+    /// (`refresh_blocked_reason IS NOT NULL`) are excluded: retrying with the
+    /// same sources would fail the same gate every sweep. The marker is
+    /// cleared by every mark-stale site (a real source change) and by the
+    /// explicit re-distill route, either of which re-arms the sweep.
     pub async fn get_stale_page_after(
         &self,
         reason: &str,
@@ -53991,10 +54090,11 @@ impl MemoryDB {
     ) -> Result<Option<crate::pages::Page>, WenlanError> {
         let conn = self.conn.lock().await;
         let mut sql = String::from(
-            "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+            "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
              FROM pages
              WHERE stale_reason = ? AND status = 'active'
-               AND COALESCE(kind, 'concept') != 'entity'",
+               AND COALESCE(kind, 'concept') != 'entity'
+               AND refresh_blocked_reason IS NULL",
         );
         let mut bind = vec![libsql::Value::Text(reason.to_string())];
         if let Some(cursor) = cursor {
@@ -54029,7 +54129,7 @@ impl MemoryDB {
     ) -> Result<Vec<crate::pages::Page>, WenlanError> {
         let conn = self.conn.lock().await;
         let mut sql = String::from(
-            "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept') \
+            "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason \
              FROM pages WHERE stale_reason = ?1 AND status = 'active' AND COALESCE(kind, 'concept') != 'entity'",
         );
         let mut bind: Vec<libsql::Value> = vec![libsql::Value::Text(reason.to_string())];
@@ -54065,7 +54165,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept')
+                "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
                  FROM pages
                  WHERE status = 'archived'
                    AND COALESCE(kind, 'concept') != 'entity'
@@ -54095,7 +54195,7 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         Self::reject_page_draft_on_conn(&conn, page_id).await?;
         conn.execute(
-            "UPDATE pages SET stale_reason = NULL, sources_updated_count = 0 WHERE id = ?1",
+            "UPDATE pages SET stale_reason = NULL, refresh_blocked_reason = NULL, sources_updated_count = 0 WHERE id = ?1",
             libsql::params![page_id],
         )
         .await

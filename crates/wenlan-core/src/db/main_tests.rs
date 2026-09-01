@@ -6153,6 +6153,7 @@ fn confirmed_page(id: &str, workspace: Option<&str>, sources: &[&str]) -> Page {
         sources_updated_count: 0,
         stale_reason: None,
         pending_rebuild: None,
+        refresh_blocked_reason: None,
         user_edited: false,
         relevance_score: 0.5,
         last_edited_by: None,
@@ -26626,6 +26627,95 @@ async fn test_stale_concepts_lifecycle() {
     assert_eq!(c.sources_updated_count, 0);
 }
 
+/// A stale page whose last automatic refresh was discarded
+/// (`refresh_blocked_reason` set) is skipped by the ambient sweep's
+/// `get_stale_page_after` until a mark-stale site (a real source change, or
+/// the explicit re-distill's `clear_user_edited`) re-arms it by clearing the
+/// marker.
+#[tokio::test]
+async fn refresh_blocked_reason_pauses_stale_sweep_until_rearmed() {
+    let (db, _dir) = test_db().await;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    db.insert_page(
+        "c_blocked",
+        "Blocked page",
+        None,
+        "content",
+        None,
+        None,
+        &[],
+        &now,
+    )
+    .await
+    .unwrap();
+    db.set_page_stale("c_blocked", "source_updated")
+        .await
+        .unwrap();
+
+    // Unblocked: the sweep selects it.
+    let picked = db
+        .get_stale_page_after("source_updated", None)
+        .await
+        .unwrap();
+    assert_eq!(picked.map(|p| p.id).as_deref(), Some("c_blocked"));
+
+    db.set_page_refresh_blocked_reason(
+        "c_blocked",
+        "citation verification failed (0 verified, 3 unverified, 0 stripped)",
+    )
+    .await
+    .unwrap();
+    let page = db.get_page("c_blocked").await.unwrap().unwrap();
+    assert_eq!(
+        page.refresh_blocked_reason.as_deref(),
+        Some("citation verification failed (0 verified, 3 unverified, 0 stripped)"),
+        "reason readable on the page row"
+    );
+    assert_eq!(
+        page.stale_reason.as_deref(),
+        Some("source_updated"),
+        "page stays stale while blocked"
+    );
+
+    // Blocked: the sweep skips it, but the /api/distill stale listing keeps it.
+    let picked = db
+        .get_stale_page_after("source_updated", None)
+        .await
+        .unwrap();
+    assert!(picked.is_none(), "sweep must skip a blocked page");
+    let listed = db.list_stale_pages("source_updated").await.unwrap();
+    assert_eq!(
+        listed.len(),
+        1,
+        "stale listing still shows the blocked page"
+    );
+
+    // A fresh source change re-marks the page stale AND clears the marker,
+    // re-arming the sweep for the changed evidence.
+    db.set_page_stale("c_blocked", "source_updated")
+        .await
+        .unwrap();
+    let page = db.get_page("c_blocked").await.unwrap().unwrap();
+    assert_eq!(
+        page.refresh_blocked_reason, None,
+        "mark-stale clears the marker"
+    );
+    let picked = db
+        .get_stale_page_after("source_updated", None)
+        .await
+        .unwrap();
+    assert_eq!(picked.map(|p| p.id).as_deref(), Some("c_blocked"));
+
+    // Clearing staleness (successful compile lifecycle) clears the marker too.
+    db.set_page_refresh_blocked_reason("c_blocked", "citation verification failed (again)")
+        .await
+        .unwrap();
+    db.clear_page_staleness("c_blocked").await.unwrap();
+    let page = db.get_page("c_blocked").await.unwrap().unwrap();
+    assert_eq!(page.refresh_blocked_reason, None);
+}
+
 #[tokio::test]
 async fn test_list_stale_concepts_excludes_archived() {
     let (db, _dir) = test_db().await;
@@ -37296,6 +37386,7 @@ fn from_page_tags_source_and_zeroes_score() {
         sources_updated_count: 0,
         stale_reason: None,
         pending_rebuild: None,
+        refresh_blocked_reason: None,
         user_edited: false,
         relevance_score: 0.42,
         last_edited_by: None,

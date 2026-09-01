@@ -1465,6 +1465,21 @@ pub(crate) async fn re_distill_stale_pages(
 
     let mut recompiled = 0usize;
     for page in &stale {
+        // A page whose last automatic refresh the citation gate discarded
+        // keeps `refresh_blocked_reason` until a real source change (any
+        // mark-stale site) or an explicit re-distill clears it. Identical
+        // inputs would fail the same gate, so retrying here only burns an
+        // LLM call per sweep. Same skip as `get_stale_page_after`'s SQL
+        // filter, applied in-loop because `list_stale_pages` is shared with
+        // the /api/distill stale-page payload, which must keep listing
+        // blocked pages.
+        if let Some(reason) = page.refresh_blocked_reason.as_deref() {
+            log::debug!(
+                "[re-distill-stale] '{}' refresh blocked ({reason}); skipping until sources change",
+                page.title
+            );
+            continue;
+        }
         // Synthesis, citation verification, the fail-closed guard, and the
         // atomic content+citations+changelog write all live in the ONE
         // re-distill op (`refresh_page`); this loop just owns the staleness
