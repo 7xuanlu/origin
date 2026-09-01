@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=23240a69a98330b13102549c9b2d900a3485adf87f46c70b320c06baa529bde2 -->
+<!-- README_SYNC: source=README.md sha256=60ff19e3c08b15f0a823f138a73bc8b1eb94a59c6940f3e924853ecfc8985146 -->
 
 <p align="center">
   <picture>
@@ -330,6 +330,7 @@ a1b2c3d distill: 4 pages
 - [建立有來源支撐的投資研究知識庫](https://wenlan.app/zh-TW/learn/build-investment-research-knowledge-base)
 - [在撰寫 PRD 前建立產品研究知識庫](https://wenlan.app/zh-TW/learn/build-product-research-knowledge-base-for-prd)
 - [用 runbook 與事故復盤建立 SRE 事故知識庫](https://wenlan.app/zh-TW/learn/build-sre-incident-knowledge-base)
+- [建立商業指標定義知識庫](https://wenlan.app/zh-TW/learn/build-business-metric-definition-knowledge-base)：把核准的 KPI 規格整理成有來源的資料字典，保留公式文字、粒度、排除條件、負責人、修訂與複核狀態。
 
 ### 概念
 

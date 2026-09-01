@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=23240a69a98330b13102549c9b2d900a3485adf87f46c70b320c06baa529bde2 -->
+<!-- README_SYNC: source=README.md sha256=60ff19e3c08b15f0a823f138a73bc8b1eb94a59c6940f3e924853ecfc8985146 -->
 
 <p align="center">
   <picture>
@@ -330,6 +330,7 @@ a1b2c3d distill: 4 pages
 - [建立有来源支撑的投资研究知识库](https://wenlan.app/zh-CN/learn/build-investment-research-knowledge-base)
 - [在撰写 PRD 前建立产品研究知识库](https://wenlan.app/zh-CN/learn/build-product-research-knowledge-base-for-prd)
 - [用运行手册与故障复盘建立 SRE 故障知识库](https://wenlan.app/zh-CN/learn/build-sre-incident-knowledge-base)
+- [建立业务指标定义知识库](https://wenlan.app/zh-CN/learn/build-business-metric-definition-knowledge-base)：把获准的 KPI 规范整理成有来源的数据字典，保留公式文本、粒度、排除条件、负责人、修订和审核状态。
 
 ### 概念
 
