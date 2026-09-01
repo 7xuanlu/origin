@@ -328,6 +328,7 @@ More detailed documentation, concepts, and comparisons:
 - [Build an investment research knowledge base](https://wenlan.app/learn/build-investment-research-knowledge-base)
 - [Build a product research knowledge base before writing a PRD](https://wenlan.app/learn/build-product-research-knowledge-base-for-prd)
 - [Build an SRE incident knowledge base](https://wenlan.app/learn/build-sre-incident-knowledge-base)
+- [Build a business metric definition knowledge base](https://wenlan.app/learn/build-business-metric-definition-knowledge-base): turn approved KPI specifications into a source-backed data dictionary with formula text, grain, exclusions, owners, revisions, and review state.
 
 ### Concepts
 
