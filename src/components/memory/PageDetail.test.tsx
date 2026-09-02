@@ -818,7 +818,7 @@ describe("PageDetail", () => {
 
   it("shows 'update blocked' instead of 'updating...' when the citation gate discarded the refresh", async () => {
     const { getPage } = await import("../../lib/tauri");
-    const basePage = await (getPage as ReturnType<typeof vi.fn>)("concept_abc");
+    const basePage = await getPage("concept_abc");
     (getPage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       ...basePage,
       stale_reason: "source_updated",
