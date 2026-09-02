@@ -363,6 +363,10 @@ export function dustVisibleCount(zoomIn: number): number {
  *  many. Zoom in past 4x to see them all. */
 export const HOVER_DUST_MAX = 48;
 
+/** How many neighbors a hover names outright (`forceLabel`). Beyond this the
+ *  label grid decides, so a hub with dozens of memories stays readable. */
+export const NEIGHBOR_LABEL_MAX = 12;
+
 /** Zoomed in this much past the opening view, the islands (every component
  *  but the core) are drawn solid with their names and edges; before that they
  *  sit dim at the rim so the core is the one thing the eye lands on. */
@@ -1231,7 +1235,12 @@ function dimFill(color: string, surface: string): string {
  *   unless the anchor is hovered, which shows the first HOVER_DUST_MAX. An island node (`island`) is drawn dim and nameless until
  *   `lod.islandsSolid`.
  * - HOVER, the round-2 spec: no-hover passthrough, the hovered node itself,
- *   its neighbors, everyone else muted and blanked.
+ *   its neighbors, everyone else muted and blanked. Neighbors are also named
+ *   (`forceLabel`) when there are at most NEIGHBOR_LABEL_MAX of them: the
+ *   whole point of lighting them is to show what the node connects to, and
+ *   small nodes never earn a label from sigma's size threshold on their own.
+ *   Past the cap the label grid decides, so a hub with dozens of memories
+ *   does not turn into a wall of text.
  */
 export function nodeDisplay(
   state: HoverState,
@@ -1251,7 +1260,9 @@ export function nodeDisplay(
   }
   if (state.hovered === null) return base;
   if (nodeId === state.hovered) return { ...attrs, forceLabel: true, zIndex: 2 };
-  if (state.neighbors.has(nodeId)) return { ...attrs, zIndex: 1 };
+  if (state.neighbors.has(nodeId)) {
+    return state.neighbors.size <= NEIGHBOR_LABEL_MAX ? { ...attrs, forceLabel: true, zIndex: 1 } : { ...attrs, zIndex: 1 };
+  }
   return { ...base, color: palette.edge, label: "", zIndex: 0 };
 }
 
