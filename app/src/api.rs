@@ -224,6 +224,10 @@ pub struct PageRedistillResponse {
     pub status: String,
     pub updated: bool,
     pub hint: Option<String>,
+    /// Present when `updated == false` because the daemon discarded the
+    /// rebuild (today: the citation verification gate), so the UI can say why
+    /// instead of "already up to date".
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2439,12 +2443,23 @@ mod tests {
             resp.hint.as_deref(),
             Some("page re-distill needs an LLM in the daemon")
         );
+        assert_eq!(resp.reason, None, "absent reason reads as None");
         let request = request.await.unwrap();
         assert_eq!(
             request.lines().next().unwrap_or_default(),
             "POST /api/distill/page_refresh HTTP/1.1"
         );
         assert_eq!(request_body(&request), serde_json::json!({}));
+
+        // A citation-gate discard carries `reason` alongside updated=false.
+        let blocked: PageRedistillResponse = serde_json::from_str(
+            r#"{"status":"ok","updated":false,"hint":null,"reason":"citation verification failed (8 verified, 13 unverified, 0 stripped)"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            blocked.reason.as_deref(),
+            Some("citation verification failed (8 verified, 13 unverified, 0 stripped)")
+        );
     }
 
     #[test]

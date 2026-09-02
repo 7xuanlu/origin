@@ -44,6 +44,7 @@ fn page(id: &str, workspace: Option<&str>) -> Page {
         sources_updated_count: 0,
         stale_reason: None,
         pending_rebuild: None,
+        refresh_blocked_reason: None,
         user_edited: false,
         relevance_score: 1.0,
         last_edited_by: None,

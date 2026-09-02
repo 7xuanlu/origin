@@ -212,6 +212,7 @@ fn page(id: &str) -> Page {
         sources_updated_count: 0,
         stale_reason: Some("source_updated".to_string()),
         pending_rebuild: None,
+        refresh_blocked_reason: None,
         user_edited: false,
         relevance_score: 0.0,
         last_edited_by: None,

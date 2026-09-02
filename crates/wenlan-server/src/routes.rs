@@ -623,7 +623,7 @@ pub async fn handle_distill(
                 db.clear_user_edited(page_id)
                     .await
                     .map_err(ServerError::from)?;
-                let updated = wenlan_core::refinery::deep_distill_single(
+                let outcome = wenlan_core::refinery::deep_distill_single(
                     &db,
                     prefer_llm,
                     &prompts,
@@ -631,12 +631,21 @@ pub async fn handle_distill(
                     knowledge_path.as_deref(),
                 )
                 .await?;
-                return Ok(Json(serde_json::json!({
+                let mut response = serde_json::json!({
                     "status": "ok",
                     "force": true,
                     "page_id": page_id,
-                    "updated": updated,
-                })));
+                    "updated": outcome.wrote,
+                });
+                // Say WHY nothing was written when the citation gate
+                // discarded the rebuild — otherwise `updated: false`
+                // reads as "already up to date".
+                if !outcome.wrote {
+                    if let Some(reason) = outcome.discard_reason {
+                        response["reason"] = serde_json::json!(reason);
+                    }
+                }
+                return Ok(Json(response));
             }
             _ => {
                 return Ok(Json(serde_json::json!({
@@ -911,7 +920,7 @@ pub async fn handle_redistill(
         db.clear_user_edited(&page_id)
             .await
             .map_err(ServerError::from)?;
-        let updated = wenlan_core::refinery::deep_distill_single(
+        let outcome = wenlan_core::refinery::deep_distill_single(
             &db,
             prefer_llm,
             &prompts,
@@ -919,10 +928,18 @@ pub async fn handle_redistill(
             knowledge_path.as_deref(),
         )
         .await?;
-        Ok(Json(serde_json::json!({
+        let mut response = serde_json::json!({
             "status": "ok",
-            "updated": updated,
-        })))
+            "updated": outcome.wrote,
+        });
+        // Say WHY nothing was written when the citation gate discarded the
+        // rebuild — otherwise `updated: false` reads as "already up to date".
+        if !outcome.wrote {
+            if let Some(reason) = outcome.discard_reason {
+                response["reason"] = serde_json::json!(reason);
+            }
+        }
+        Ok(Json(response))
     } else {
         Ok(Json(serde_json::json!({
             "status": "skipped",
@@ -1969,6 +1986,7 @@ mod context_page_selection_tests {
             sources_updated_count: 0,
             stale_reason: None,
             pending_rebuild: None,
+            refresh_blocked_reason: None,
             user_edited: false,
             relevance_score,
             last_edited_by: None,

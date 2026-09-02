@@ -1098,9 +1098,9 @@ pub(crate) async fn distill_pages_scoped_gated(
     run_coherence_gate: bool,
 ) -> Result<DistillResult, WenlanError> {
     if let Some(DistillTarget::Page(ref page_id)) = target {
-        let updated = deep_distill_single(db, llm, prompts, page_id, knowledge_path).await?;
+        let outcome = deep_distill_single(db, llm, prompts, page_id, knowledge_path).await?;
         return Ok(DistillResult {
-            created: if updated {
+            created: if outcome.wrote {
                 vec![page_id.clone()]
             } else {
                 vec![]
@@ -1260,6 +1260,11 @@ pub struct RefreshOutcome {
     pub acknowledged: bool,
     /// Id of the staged revision card, present iff `gated`.
     pub revision_card_id: Option<String>,
+    /// Why the synthesis was discarded without a write (today: the fail-closed
+    /// citation verification gate). Also persisted on
+    /// `pages.refresh_blocked_reason` so page reads can surface it; `None` on
+    /// every other outcome, including the other no-op early returns.
+    pub discard_reason: Option<String>,
 }
 
 pub(crate) const AUTOMATIC_PAGE_REFRESH_SOURCE_CAP: usize = 64;
@@ -1452,7 +1457,19 @@ pub(crate) async fn refresh_page_with_prompt(
             page.title,
             stats.summary()
         );
-        return Ok(RefreshOutcome::default());
+        // Surface the discard instead of leaving the page silently
+        // "updating..." forever: persist WHY on the page row so reads can
+        // show it, and hand it back on the outcome so the re-distill routes
+        // can put it in their responses. The marker is cleared by every
+        // successful canonical page write and by every mark-stale site (a
+        // real source change re-arms the automatic retry).
+        let discard_reason = format!("citation verification failed ({})", stats.summary());
+        db.set_page_refresh_blocked_reason(page_id, &discard_reason)
+            .await?;
+        return Ok(RefreshOutcome {
+            discard_reason: Some(discard_reason),
+            ..RefreshOutcome::default()
+        });
     }
 
     log::info!(
@@ -1498,21 +1515,24 @@ pub(crate) async fn refresh_page_with_prompt(
         gated: result.gated,
         acknowledged: result.acknowledged,
         revision_card_id: result.revision_card_id,
+        discard_reason: None,
     })
 }
 
 /// Re-distill a single page by reloading all source memories and recompiling
-/// with the LLM. Returns `Ok(true)` when the page content was actually
-/// rewritten, `Ok(false)` when the call was a no-op (no source memories,
-/// empty LLM output) so callers can report honest counts. Returns
-/// `Err(WenlanError::Llm)` only when the LLM call itself fails.
+/// with the LLM. Returns the full [`RefreshOutcome`] so callers can report
+/// honest counts (`wrote`) AND say why a no-op was a no-op
+/// (`discard_reason` when the citation gate discarded the synthesis; the
+/// other no-ops — no source memories, empty LLM output — stay reason-less
+/// defaults). Returns `Err(WenlanError::Llm)` only when the LLM call itself
+/// fails.
 pub async fn deep_distill_single(
     db: &MemoryDB,
     llm: Option<&Arc<dyn LlmProvider>>,
     prompts: &PromptRegistry,
     page_id: &str,
     knowledge_path: Option<&std::path::Path>,
-) -> Result<bool, WenlanError> {
+) -> Result<RefreshOutcome, WenlanError> {
     let llm = match llm {
         Some(l) if l.is_available() => l,
         Some(_) => {
@@ -1527,7 +1547,7 @@ pub async fn deep_distill_single(
         }
     };
 
-    let outcome = refresh_page(
+    refresh_page(
         db,
         llm,
         prompts,
@@ -1535,8 +1555,7 @@ pub async fn deep_distill_single(
         RefreshReason::Explicit,
         knowledge_path,
     )
-    .await?;
-    Ok(outcome.wrote)
+    .await
 }
 
 /// Apply a merge result based on the stability tier of the involved memories.
@@ -2105,10 +2124,13 @@ The app process is the only writer [3].\n\n## Backup\n\nNightly copy to iCloud D
         let llm: Arc<dyn LlmProvider> = provider.clone();
         let prompts = PromptRegistry::default();
 
-        let updated = deep_distill_single(&db, Some(&llm), &prompts, "page_target", None)
+        let outcome = deep_distill_single(&db, Some(&llm), &prompts, "page_target", None)
             .await
             .unwrap();
-        assert!(updated, "deep refresh should write the provider output");
+        assert!(
+            outcome.wrote,
+            "deep refresh should write the provider output"
+        );
 
         let seen = provider.prompts();
         let user_prompt = seen
@@ -2806,6 +2828,13 @@ The app process is the only writer [3].\n\n## Backup\n\nNightly copy to iCloud D
         .unwrap();
         assert!(!outcome.wrote, "unfaithful synthesis must be discarded");
         assert!(!outcome.gated);
+        let discard_reason = outcome
+            .discard_reason
+            .expect("gate discard must carry a reason");
+        assert!(
+            discard_reason.starts_with("citation verification failed ("),
+            "reason names the gate with its stats, got: {discard_reason}"
+        );
 
         let after = db.get_page("page_c").await.unwrap().unwrap();
         assert_eq!(
@@ -2816,6 +2845,41 @@ The app process is the only writer [3].\n\n## Backup\n\nNightly copy to iCloud D
             after.version, before.version,
             "no version bump on a discarded synthesis"
         );
+        assert_eq!(
+            after.refresh_blocked_reason.as_deref(),
+            Some(discard_reason.as_str()),
+            "discard reason persisted on the page row"
+        );
+        assert_eq!(
+            after.stale_reason.as_deref(),
+            Some("source_updated"),
+            "the page stays stale — only the retry loop pauses"
+        );
+
+        // A later successful write through the canonical update_page path
+        // clears the marker, so it can never describe a page that has since
+        // compiled.
+        let faithful: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(
+            "Tokio is an async runtime for Rust programs [1]",
+        ));
+        let outcome = refresh_page(
+            &db,
+            &faithful,
+            &prompts,
+            "page_c",
+            RefreshReason::SourceChanged,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.wrote, "faithful synthesis must land");
+        assert_eq!(outcome.discard_reason, None);
+        let recompiled = db.get_page("page_c").await.unwrap().unwrap();
+        assert_eq!(
+            recompiled.refresh_blocked_reason, None,
+            "successful write clears the blocked-reason marker"
+        );
+        assert_eq!(recompiled.stale_reason, None);
     }
 
     #[tokio::test]

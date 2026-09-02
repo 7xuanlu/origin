@@ -30,6 +30,15 @@ pub struct Page {
     /// changed but whose prose is waiting for the next compile lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_rebuild: Option<String>,
+    /// Why the last automatic re-synthesis of this stale page was discarded
+    /// without a write (today: the fail-closed citation verification gate),
+    /// e.g. "citation verification failed (8 verified, 13 unverified, 0
+    /// stripped)". `None` on every page whose last refresh landed; cleared by
+    /// every successful canonical page write and whenever a source change
+    /// re-marks the page stale, so it never describes a page that has since
+    /// compiled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_blocked_reason: Option<String>,
     /// True if a human has edited this page's content directly.
     pub user_edited: bool,
     /// Relevance score from search (0.0-1.0). Only populated by `search_pages`;
@@ -214,6 +223,34 @@ mod citation_tests {
         )
         .unwrap();
         assert_eq!(legacy.scope, "sentence");
+    }
+
+    /// `refresh_blocked_reason` is additive: absent from the serialized wire
+    /// when unset (byte-identical to the pre-column contract), tolerated as
+    /// missing on inbound JSON from older daemons, round-tripped when set.
+    #[test]
+    fn refresh_blocked_reason_absent_when_none_roundtrips_when_some() {
+        let mut page: Page = serde_json::from_str(
+            r#"{"id":"p1","title":"T","content":"body","source_memory_ids":[],
+                "version":1,"status":"active","created_at":"x","last_compiled":"x",
+                "last_modified":"x","sources_updated_count":0,"user_edited":false}"#,
+        )
+        .unwrap();
+        assert_eq!(page.refresh_blocked_reason, None);
+        let value: serde_json::Value = serde_json::to_value(&page).unwrap();
+        assert!(
+            value.get("refresh_blocked_reason").is_none(),
+            "unset refresh_blocked_reason must not appear on the wire; got {value}"
+        );
+
+        page.refresh_blocked_reason =
+            Some("citation verification failed (0 verified, 3 unverified, 0 stripped)".into());
+        let s = serde_json::to_string(&page).unwrap();
+        let back: Page = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            back.refresh_blocked_reason.as_deref(),
+            Some("citation verification failed (0 verified, 3 unverified, 0 stripped)")
+        );
     }
 
     /// Wire freeze (spec M3 D4): the `kind` discriminator must never appear in a

@@ -1063,6 +1063,13 @@ export interface Page {
   // Staleness tracking (added in migration 40)
   sources_updated_count?: number;
   stale_reason?: string | null;
+  /**
+   * Why the last automatic re-synthesis of this stale page was discarded
+   * (today: the citation verification gate). Set only while the page is
+   * blocked; the daemon clears it on every successful write and on new
+   * source changes. Missing on older daemon versions (migration 127).
+   */
+  refresh_blocked_reason?: string | null;
   user_edited?: boolean;
   citations?: PageCitation[];
   /**
@@ -1272,6 +1279,11 @@ export interface PageRedistillResponse {
   status: "ok" | "skipped" | string;
   updated: boolean;
   hint?: string | null;
+  /**
+   * Present when `updated === false` because the daemon discarded the rebuild
+   * (today: the citation verification gate) rather than finding nothing to do.
+   */
+  reason?: string | null;
 }
 
 export async function getPageSources(
