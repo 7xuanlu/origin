@@ -386,6 +386,10 @@ const en = {
     suggestedLabel: "Auto-created by an agent",
     viewAllEntities: "View all {{count}}",
   },
+  citation: {
+    openFileFailed: "Could not open this file.",
+    openLinkFailed: "Could not open this link.",
+  },
   pageDetail: {
     actions: "Page actions",
     copied: "Copied!",
@@ -1935,6 +1939,10 @@ const zhHans = {
     suggestedLabel: "由代理自动创建",
     viewAllEntities: "查看全部 {{count}} 个",
   },
+  citation: {
+    openFileFailed: "无法打开此文件。",
+    openLinkFailed: "无法打开此链接。",
+  },
   pageDetail: {
     actions: "页面操作",
     copied: "已复制！",
@@ -3453,6 +3461,10 @@ const zhHant = {
     sourceCount_other: "{{count}} 個來源",
     suggestedLabel: "由代理自動建立",
     viewAllEntities: "檢視全部 {{count}} 個",
+  },
+  citation: {
+    openFileFailed: "無法開啟此檔案。",
+    openLinkFailed: "無法開啟此連結。",
   },
   pageDetail: {
     actions: "頁面操作",

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useLayoutEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
-import type { MemoryItem, PageCitation } from "../../../lib/tauri";
+import { openFile, type MemoryItem, type PageCitation } from "../../../lib/tauri";
 import { relativeMs } from "./format";
 
 interface CitationPopoverProps {
@@ -11,6 +12,9 @@ interface CitationPopoverProps {
   sourcesLoading: boolean;
   anchorRef: React.RefObject<HTMLButtonElement | null>;
   onOpenMemory: (sourceId: string) => void;
+  /** Why the last attempt to open this citation's file or link was refused. */
+  openFailure: string | null;
+  onOpenTarget: () => void;
 }
 
 const WIDTH = 280;
@@ -21,6 +25,25 @@ const WIDTH = 280;
 export function citationFilePath(locator: string): string {
   const sep = locator.lastIndexOf("::");
   return sep === -1 ? locator : locator.slice(sep + 2);
+}
+
+// Opens the file or link a citation points at and returns the refusal text
+// instead of dropping it. Files go through the app's own `open_file` command:
+// the shell plugin's `open` only admits URL schemes (its default validator is
+// `^((mailto:\w+)|(tel:\w+)|(https?://\w+)).+`), so a bare path handed to it
+// is refused inside the plugin, and a discarded rejection is exactly how #656
+// shipped a button that did nothing.
+export async function openCitationTarget(citation: PageCitation): Promise<string | null> {
+  try {
+    if (citation.source_kind === "external_file") {
+      await openFile(citationFilePath(citation.locator));
+    } else {
+      await shellOpen(citation.locator);
+    }
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
 }
 
 // Spec: external_url shows a *domain* badge, other kinds a fixed label.
@@ -44,7 +67,10 @@ export default function CitationPopover({
   sourcesLoading,
   anchorRef,
   onOpenMemory,
+  openFailure,
+  onOpenTarget,
 }: CitationPopoverProps) {
+  const { t } = useTranslation();
   const boxRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
 
@@ -88,6 +114,16 @@ export default function CitationPopover({
     ? sourceMemory.content.replace(/\s+/g, " ").trim().slice(0, 200)
     : null;
 
+  function failureNotice(headline: "citation.openFileFailed" | "citation.openLinkFailed") {
+    if (openFailure === null) return null;
+    return (
+      <div role="alert" className="flex flex-col gap-1">
+        <p style={{ ...bodyText, color: "var(--mem-accent-amber)" }}>{t(headline)}</p>
+        <p style={{ ...mono, wordBreak: "break-word" }}>{openFailure}</p>
+      </div>
+    );
+  }
+
   function body() {
     if (citation.source_kind === "authored") {
       return (
@@ -102,9 +138,10 @@ export default function CitationPopover({
       return (
         <>
           <p style={{ ...mono, wordBreak: "break-all" }}>{filePath}</p>
-          <button style={actionStyle} onClick={() => void shellOpen(filePath)}>
+          <button style={actionStyle} onClick={onOpenTarget}>
             Open file →
           </button>
+          {failureNotice("citation.openFileFailed")}
         </>
       );
     }
@@ -112,9 +149,10 @@ export default function CitationPopover({
       return (
         <>
           <p style={{ ...mono, wordBreak: "break-all" }}>{citation.locator}</p>
-          <button style={actionStyle} onClick={() => void shellOpen(citation.locator)}>
+          <button style={actionStyle} onClick={onOpenTarget}>
             Open in browser →
           </button>
+          {failureNotice("citation.openLinkFailed")}
         </>
       );
     }

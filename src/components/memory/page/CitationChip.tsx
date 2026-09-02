@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useEffect, useId, useRef, useState } from "react";
-import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import type { MemoryItem, PageCitation } from "../../../lib/tauri";
 import { citationDisplayLabel } from "../../../lib/pageCitations";
-import CitationPopover from "./CitationPopover";
+import CitationPopover, { openCitationTarget } from "./CitationPopover";
 
 interface CitationChipProps {
   occurrence: number;
@@ -24,6 +23,7 @@ export default function CitationChip({
   onOpenMemory,
 }: CitationChipProps) {
   const [open, setOpen] = useState(false);
+  const [openFailure, setOpenFailure] = useState<string | null>(null);
   const chipRef = useRef<HTMLButtonElement>(null);
   const openTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -35,6 +35,21 @@ export default function CitationChip({
     if (closeTimer.current) clearTimeout(closeTimer.current);
   };
   useEffect(() => clearTimers, []);
+  // A refusal is about the click that caused it, not the next hover.
+  useEffect(() => {
+    if (!open) setOpenFailure(null);
+  }, [open]);
+
+  // Never resolves to a rejection: a refused open is shown in the popover,
+  // which is opened if it was not already (a chip click on a link skips it).
+  const openTarget = async () => {
+    setOpenFailure(null);
+    const failure = await openCitationTarget(citation);
+    if (failure !== null) {
+      setOpenFailure(failure);
+      setOpen(true);
+    }
+  };
 
   const activate = () => {
     // Touch has no hover: first tap opens the popover, its buttons navigate.
@@ -51,7 +66,7 @@ export default function CitationChip({
       }
       onOpenMemory(citation.locator);
     } else if (citation.source_kind === "external_url") {
-      void shellOpen(citation.locator);
+      void openTarget();
     } else {
       setOpen((v) => !v);
     }
@@ -119,6 +134,8 @@ export default function CitationChip({
           sourcesLoading={sourcesLoading}
           anchorRef={chipRef}
           onOpenMemory={onOpenMemory}
+          openFailure={openFailure}
+          onOpenTarget={() => void openTarget()}
         />
       )}
     </span>
