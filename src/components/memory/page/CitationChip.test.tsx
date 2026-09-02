@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { invoke } from "@tauri-apps/api/core";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import type { MemoryItem, PageCitation } from "../../../lib/tauri";
 import CitationChip from "./CitationChip";
@@ -49,6 +50,11 @@ function renderChip(over: Partial<React.ComponentProps<typeof CitationChip>> = {
   );
   return { onOpenMemory, ...utils };
 }
+
+beforeEach(() => {
+  vi.mocked(invoke).mockReset();
+  vi.mocked(shellOpen).mockReset();
+});
 
 afterEach(() => {
   vi.useRealTimers();
@@ -162,7 +168,54 @@ describe("CitationChip", () => {
     fireEvent.focus(screen.getByRole("button", { name: /design\.md/ }));
     expect(screen.getByText("/notes/design.md")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /Open file/ }));
-    expect(vi.mocked(shellOpen)).toHaveBeenCalledWith("/notes/design.md");
+    // A bare path must not go to the shell plugin: its `open` validator only
+    // admits URL schemes, so the app's own `open_file` command opens files.
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("open_file", { path: "/notes/design.md" });
+    expect(vi.mocked(shellOpen)).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("shows why a file could not be opened instead of failing silently", async () => {
+    const user = userEvent.setup();
+    vi.mocked(invoke).mockRejectedValueOnce(
+      'Refusing to run "/notes/run.command". Wenlan opens documents and folders, not programs.',
+    );
+    renderChip({
+      citation: cite({ source_kind: "external_file", locator: "/notes/run.command" }),
+      sourceMemory: null,
+    });
+    fireEvent.focus(screen.getByRole("button", { name: /run\.command/ }));
+    await user.click(screen.getByRole("button", { name: /Open file/ }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Could not open this file.");
+    expect(alert).toHaveTextContent(/Refusing to run/);
+  });
+
+  it("shows why a link could not be opened from the popover action", async () => {
+    const user = userEvent.setup();
+    vi.mocked(shellOpen).mockRejectedValueOnce(new Error("scope validation failed"));
+    renderChip({
+      citation: cite({ source_kind: "external_url", locator: "https://docs.rs/serde" }),
+      sourceMemory: null,
+    });
+    fireEvent.focus(screen.getByRole("button", { name: /docs\.rs/ }));
+    await user.click(screen.getByRole("button", { name: /Open in browser/ }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Could not open this link.");
+    expect(alert).toHaveTextContent("scope validation failed");
+  });
+
+  it("opens the popover with the reason when a chip click on a link is refused", async () => {
+    const user = userEvent.setup();
+    vi.mocked(shellOpen).mockRejectedValueOnce(new Error("scope validation failed"));
+    renderChip({
+      citation: cite({ source_kind: "external_url", locator: "https://docs.rs/serde" }),
+      sourceMemory: null,
+    });
+    await user.click(screen.getByRole("button", { name: /docs\.rs/ }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Could not open this link.");
+    expect(screen.getByRole("tooltip")).toContainElement(alert);
   });
 
   it("shows only the path of a document citation whose locator carries the source id", async () => {
@@ -178,7 +231,9 @@ describe("CitationChip", () => {
     expect(screen.getByText("/Users/me/Tally/notes/architecture-notes.md")).toBeInTheDocument();
     expect(screen.queryByText(/directory-notes::/)).toBeNull();
     await user.click(screen.getByRole("button", { name: /Open file/ }));
-    expect(vi.mocked(shellOpen)).toHaveBeenCalledWith("/Users/me/Tally/notes/architecture-notes.md");
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("open_file", {
+      path: "/Users/me/Tally/notes/architecture-notes.md",
+    });
   });
 
   it("explains that authored content survives re-distillation", () => {
