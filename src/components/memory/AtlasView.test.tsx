@@ -401,10 +401,15 @@ describe("AtlasView", () => {
     const { settings } = capturedSigmaInstances[0];
     expect(typeof settings.nodeReducer).toBe("function");
     expect(typeof settings.edgeReducer).toBe("function");
-    // Must stay a no-op override: sigma's built-in hover renderer hardcodes a
-    // #FFF label box that's unreadable under the dark theme's label ink.
+    // Sigma's built-in hover renderer hardcodes a #FFF label box that's
+    // unreadable under the dark theme's label ink; ours is the same painter
+    // the labels layer uses, so a lifted (highlighted) name draws on the
+    // hover layer above every other label, and a blank label paints nothing.
     expect(typeof settings.defaultDrawNodeHover).toBe("function");
-    expect(settings.defaultDrawNodeHover()).toBeUndefined();
+    expect(settings.defaultDrawNodeHover).toBe(settings.defaultDrawNodeLabel);
+    const ctx = { fillText: vi.fn(), strokeText: vi.fn(), measureText: vi.fn(() => ({ width: 0 })) };
+    settings.defaultDrawNodeHover(ctx, { key: "e1", label: "", x: 0, y: 0, size: 4 }, {});
+    expect(ctx.fillText).not.toHaveBeenCalled();
   });
 
   it("wires the radial label drawer over the live graph and lowers sigma's edge-thickness floor", async () => {

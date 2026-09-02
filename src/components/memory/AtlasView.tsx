@@ -31,8 +31,12 @@ import {
   drawRadialNodeLabel,
   lodFor,
   OPENING_LOD,
+  drawNodeLabelAt,
+  layoutFocusLabels,
+  NEIGHBOR_LABEL_MAX,
+  NODE_LABEL_FONT,
 } from "../../lib/graph/atlas";
-import type { HoverState, AtlasSimulation, LodState } from "../../lib/graph/atlas";
+import type { HoverState, AtlasSimulation, LodState, LabelPlacement } from "../../lib/graph/atlas";
 import { dustBadgeAnchors, drawDustCounts } from "../../lib/graph/dust";
 import type { CartographyScene } from "../../lib/graph/cartography";
 import {
@@ -173,6 +177,9 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
   // Reducer inputs, read from refs so hover/theme changes repaint without a
   // React re-render or a renderer rebuild (see the mount effect below).
   const hoverStateRef = useRef<HoverState>({ hovered: null, neighbors: new Set() });
+  // Names of the focused neighborhood, laid out once per (focus, camera) and
+  // reused for every label sigma paints in that frame — see layoutFocusLabels.
+  const focusLayoutRef = useRef<{ key: string; placements: Map<string, LabelPlacement> } | null>(null);
   const paletteRef = useRef<GraphPalette>(palette);
   // Zoom level of detail the reducers and the overlay read at paint time:
   // how much of each anchor's memory dust is drawn, and whether the islands
@@ -509,6 +516,52 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
     overlay.style.display = showRegionsRef.current ? "" : "none";
     overlayRef.current = overlay;
 
+    // The label painter for both the labels layer and the hover layer. With a
+    // node focused (hover or search jump) the lit neighborhood's names come
+    // from layoutFocusLabels so they never cover each other or a lit dot; a
+    // neighborhood name with no free spot is skipped rather than painted over
+    // something. Every other label keeps the radial rule. `labelSigma` is
+    // bound right after construction; sigma's constructor render runs with
+    // nothing focused, so the radial path is all it can reach.
+    let labelSigma: Sigma | null = null;
+    const focusLayout = (ctx: CanvasRenderingContext2D): Map<string, LabelPlacement> | null => {
+      const state = hoverStateRef.current;
+      const sigma = labelSigma;
+      if (state.hovered === null || sigma === null) return null;
+      const camera = sigma.getCamera().getState();
+      const { width, height } = sigma.getDimensions();
+      const key = `${state.hovered}|${camera.x}|${camera.y}|${camera.ratio}|${camera.angle}|${width}x${height}`;
+      if (focusLayoutRef.current?.key === key) return focusLayoutRef.current.placements;
+      const nodeAt = (id: string) => {
+        const display = sigma.getNodeDisplayData(id);
+        if (!display || display.hidden) return null;
+        const { x, y } = sigma.framedGraphToViewport(display);
+        return { key: id, x, y, size: display.size, label: display.label ?? "" };
+      };
+      const focus = nodeAt(state.hovered);
+      if (!focus) return null;
+      const neighbors =
+        state.neighbors.size <= NEIGHBOR_LABEL_MAX
+          ? [...state.neighbors].map(nodeAt).filter((n): n is NonNullable<typeof n> => n !== null)
+          : [];
+      ctx.font = NODE_LABEL_FONT;
+      const placements = layoutFocusLabels(focus, neighbors, (text) => ctx.measureText(text).width);
+      focusLayoutRef.current = { key, placements };
+      return placements;
+    };
+    const drawLabel = (ctx: CanvasRenderingContext2D, data: Record<string, any>, s: Record<string, any>) => {
+      const placements = focusLayout(ctx);
+      if (placements) {
+        const at = placements.get(data.key);
+        if (at) {
+          drawNodeLabelAt(ctx, data, s, at, paletteRef.current.surface);
+          return;
+        }
+        const state = hoverStateRef.current;
+        if (state.hovered === data.key || (state.neighbors.has(data.key) && state.neighbors.size <= NEIGHBOR_LABEL_MAX)) return;
+      }
+      drawRadialNodeLabel(ctx, data, s, graph, paletteRef.current.surface);
+    };
     const renderer = new Sigma(graph, container, {
       // Only nodes at least this big carry a label. With the log2 size scale
       // (atlas.ts) that is roughly degree >= 5 for an entity and >= 6 for a
@@ -539,10 +592,12 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       zIndex: true,
       // Sigma's default hover renderer (drawDiscNodeHover) paints a hardcoded
       // #FFF label box — unreadable under the dark theme's light label ink.
-      // The hovered label already renders theme-correct on the labels layer
-      // (nodeDisplay forces it; renderLabels doesn't skip the hovered node),
-      // so the box is pure loss. No-op it.
-      defaultDrawNodeHover: () => {},
+      // The focused neighborhood is `highlighted` (nodeDisplay), which sigma
+      // redraws on the hover layer above every other label: its discs via the
+      // hoverNodes program, its names through this painter, laid out by
+      // layoutFocusLabels. The labels-layer copy underneath is fully covered
+      // by this one's halo, so a lifted name never reads darker.
+      defaultDrawNodeHover: drawLabel,
       // Node/edge sizes are true CSS px at every zoom. The default divides
       // sizes by sqrt(camera ratio), which shrinks items badly once the
       // density cap below zooms the camera out ~5x from fit.
@@ -553,11 +608,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
       // 12px body-font labels placed radially around the node, facing the
       // cluster center, over a ground-coloured halo — sigma's default is
       // 14px Arial pinned to the right.
-      defaultDrawNodeLabel: (
-        ctx: CanvasRenderingContext2D,
-        data: Record<string, any>,
-        s: Record<string, any>,
-      ) => drawRadialNodeLabel(ctx, data, s, graph, paletteRef.current.surface),
+      defaultDrawNodeLabel: drawLabel,
       nodeReducer: (node, attrs) =>
         nodeDisplay(hoverStateRef.current, node, attrs, paletteRef.current, lodRef.current),
       edgeReducer: (edge, attrs) => {
@@ -574,6 +625,7 @@ export default function AtlasView({ onNodeClick, focusEntityId, onBack }: AtlasV
         );
       },
     });
+    labelSigma = renderer;
     sigmaRef.current = renderer;
     container.appendChild(overlay);
     if (import.meta.env.DEV) {

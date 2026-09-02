@@ -23,6 +23,8 @@ import {
   hoverStateFor,
   NEIGHBOR_LABEL_MAX,
   nodeDisplay,
+  labelAnchor,
+  layoutFocusLabels,
   edgeDisplay,
   drawRadialNodeLabel,
   NODE_LABEL_FONT,
@@ -475,30 +477,33 @@ describe("nodeDisplay", () => {
     expect(nodeDisplay(state, "a", attrs, PALETTE)).toEqual(attrs);
   });
 
-  it("keeps the hovered node's own color, forces its label, and puts it on top", () => {
+  it("keeps the hovered node's own color, forces its label, lifts it, and puts it on top", () => {
     const state: HoverState = { hovered: "a", neighbors: new Set(["b"]) };
     const result = nodeDisplay(state, "a", attrs, PALETTE);
     expect(result.color).toBe(attrs.color);
     expect(result.label).toBe(attrs.label);
     expect(result.forceLabel).toBe(true);
+    expect(result.highlighted).toBe(true);
     expect(result.zIndex).toBe(2);
   });
 
-  it("keeps a neighbor's own color and names it, at zIndex 1", () => {
+  it("keeps a neighbor's own color, names it, and lifts it, at zIndex 1", () => {
     const state: HoverState = { hovered: "a", neighbors: new Set(["b"]) };
     const result = nodeDisplay(state, "b", attrs, PALETTE);
     expect(result.color).toBe(attrs.color);
     expect(result.label).toBe(attrs.label);
     expect(result.forceLabel).toBe(true);
+    expect(result.highlighted).toBe(true);
     expect(result.zIndex).toBe(1);
   });
 
-  it("stops naming neighbors outright past NEIGHBOR_LABEL_MAX, leaving them lit", () => {
+  it("stops naming and lifting neighbors past NEIGHBOR_LABEL_MAX, leaving them lit", () => {
     const many = new Set(Array.from({ length: NEIGHBOR_LABEL_MAX + 1 }, (_, i) => `n${i}`));
     const result = nodeDisplay({ hovered: "a", neighbors: many }, "n0", attrs, PALETTE);
     expect(result.color).toBe(attrs.color);
     expect(result.label).toBe(attrs.label);
     expect(result.forceLabel).toBeUndefined();
+    expect(result.highlighted).toBeUndefined();
     expect(result.zIndex).toBe(1);
     const atCap = new Set(Array.from({ length: NEIGHBOR_LABEL_MAX }, (_, i) => `n${i}`));
     expect(nodeDisplay({ hovered: "a", neighbors: atCap }, "n0", attrs, PALETTE).forceLabel).toBe(true);
@@ -705,6 +710,94 @@ describe("drawRadialNodeLabel", () => {
     const ctx = mockCtx();
     drawRadialNodeLabel(ctx as any, data, settings, graphWithNodeAt(10, 0));
     expect(ctx.strokeText).not.toHaveBeenCalled();
+  });
+});
+
+describe("layoutFocusLabels", () => {
+  // 6 px per character, the way a fixed-width test face would measure.
+  const measure = (text: string) => text.length * 6;
+  const focus = { key: "tally", x: 400, y: 300, size: 4, label: "tally" };
+  const LINE = 14;
+
+  function box(at: { x: number; y: number; align: string; baseline: string }, width: number) {
+    const x = at.align === "left" ? at.x : at.align === "right" ? at.x - width : at.x - width / 2;
+    const y = at.baseline === "top" ? at.y : at.baseline === "bottom" ? at.y - LINE : at.y - LINE / 2;
+    return { x, y, w: width, h: LINE };
+  }
+  function disjoint(a: ReturnType<typeof box>, b: ReturnType<typeof box>) {
+    return a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y;
+  }
+
+  it("hangs each neighbor's name on the side facing away from the focus", () => {
+    const neighbors = [
+      { key: "east", x: 460, y: 300, size: 3, label: "east" },
+      { key: "west", x: 340, y: 300, size: 3, label: "west" },
+      { key: "north", x: 400, y: 240, size: 3, label: "north" },
+      { key: "south", x: 400, y: 360, size: 3, label: "south" },
+    ];
+    const out = layoutFocusLabels(focus, neighbors, measure);
+    expect(out.get("east")).toEqual(labelAnchor(460, 300, 3, "right"));
+    expect(out.get("west")).toEqual(labelAnchor(340, 300, 3, "left"));
+    expect(out.get("north")).toEqual(labelAnchor(400, 240, 3, "above"));
+    expect(out.get("south")).toEqual(labelAnchor(400, 360, 3, "below"));
+  });
+
+  it("faces the focus's own name away from where its neighbors sit", () => {
+    const neighbors = [
+      { key: "a", x: 460, y: 290, size: 3, label: "a" },
+      { key: "b", x: 470, y: 310, size: 3, label: "b" },
+    ];
+    expect(layoutFocusLabels(focus, neighbors, measure).get("tally")).toEqual(labelAnchor(400, 300, 4, "left"));
+    expect(layoutFocusLabels(focus, [], measure).get("tally")).toEqual(labelAnchor(400, 300, 4, "right"));
+  });
+
+  it("never lets two names overlap, nor a name cover a lit dot — the Tally cluster", () => {
+    // Positions from the launch-video take: sqlite and Backup & Review on one
+    // row left of tally, Gap-Free just right of it, two memories far below.
+    const neighbors = [
+      { key: "sqlite", x: 756, y: 254, size: 4, label: "sqlite" },
+      { key: "backup", x: 801, y: 254, size: 3, label: "Tally Backup & Review" },
+      { key: "gapfree", x: 887, y: 277, size: 3, label: "Tally's Gap-Free Invoice System" },
+      { key: "arch", x: 803, y: 678, size: 3, label: "architecture-notes" },
+      { key: "uses", x: 839, y: 742, size: 3, label: "Tally Uses SQLite Only" },
+    ];
+    const tally = { key: "tally", x: 845, y: 274, size: 5, label: "tally" };
+    const out = layoutFocusLabels(tally, neighbors, measure);
+    const boxes = [...out.entries()].map(([key, at]) => ({
+      key,
+      box: box(at, measure([tally, ...neighbors].find((n) => n.key === key)!.label)),
+    }));
+    for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        expect(disjoint(boxes[i].box, boxes[j].box), `${boxes[i].key} vs ${boxes[j].key}`).toBe(true);
+      }
+      for (const dot of [tally, ...neighbors]) {
+        const disc = { x: dot.x - dot.size, y: dot.y - dot.size, w: 2 * dot.size, h: 2 * dot.size };
+        expect(disjoint(boxes[i].box, disc), `${boxes[i].key} over ${dot.key}`).toBe(true);
+      }
+    }
+    // Everyone in this cluster has room; the focus always goes first.
+    expect(out.size).toBe(6);
+    expect([...out.keys()][0]).toBe("tally");
+  });
+
+  it("leaves a name off rather than paint it over another when nothing fits", () => {
+    // Four neighbors sitting on top of each other, all wanting the same spot,
+    // with long names that leave no free side or push.
+    const long = "a name long enough to block every side of the focus at once";
+    const neighbors = ["p", "q", "r", "s"].map((key) => ({ key, x: 406, y: 300, size: 3, label: long }));
+    const out = layoutFocusLabels({ ...focus, label: long }, neighbors, measure);
+    expect(out.size).toBeGreaterThanOrEqual(1);
+    expect(out.size).toBeLessThan(5);
+    const boxes = [...out.values()].map((at) => box(at, measure(long)));
+    for (let i = 0; i < boxes.length; i++)
+      for (let j = i + 1; j < boxes.length; j++) expect(disjoint(boxes[i], boxes[j])).toBe(true);
+  });
+
+  it("skips a blank name and keeps the rest", () => {
+    const out = layoutFocusLabels(focus, [{ key: "blank", x: 460, y: 300, size: 3, label: "" }], measure);
+    expect(out.has("blank")).toBe(false);
+    expect(out.has("tally")).toBe(true);
   });
 });
 
