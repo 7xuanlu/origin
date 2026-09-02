@@ -21,6 +21,7 @@ import {
   lodFor,
   HOVER_DUST_MAX,
   hoverStateFor,
+  NEIGHBOR_LABEL_MAX,
   nodeDisplay,
   edgeDisplay,
   drawRadialNodeLabel,
@@ -483,13 +484,24 @@ describe("nodeDisplay", () => {
     expect(result.zIndex).toBe(2);
   });
 
-  it("keeps a neighbor's own color and label, at zIndex 1", () => {
+  it("keeps a neighbor's own color and names it, at zIndex 1", () => {
     const state: HoverState = { hovered: "a", neighbors: new Set(["b"]) };
     const result = nodeDisplay(state, "b", attrs, PALETTE);
     expect(result.color).toBe(attrs.color);
     expect(result.label).toBe(attrs.label);
+    expect(result.forceLabel).toBe(true);
+    expect(result.zIndex).toBe(1);
+  });
+
+  it("stops naming neighbors outright past NEIGHBOR_LABEL_MAX, leaving them lit", () => {
+    const many = new Set(Array.from({ length: NEIGHBOR_LABEL_MAX + 1 }, (_, i) => `n${i}`));
+    const result = nodeDisplay({ hovered: "a", neighbors: many }, "n0", attrs, PALETTE);
+    expect(result.color).toBe(attrs.color);
+    expect(result.label).toBe(attrs.label);
     expect(result.forceLabel).toBeUndefined();
     expect(result.zIndex).toBe(1);
+    const atCap = new Set(Array.from({ length: NEIGHBOR_LABEL_MAX }, (_, i) => `n${i}`));
+    expect(nodeDisplay({ hovered: "a", neighbors: atCap }, "n0", attrs, PALETTE).forceLabel).toBe(true);
   });
 
   it("mutes and blanks everyone else, at zIndex 0", () => {
