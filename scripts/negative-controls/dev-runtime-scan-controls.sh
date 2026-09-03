@@ -611,9 +611,22 @@ listener_control() { # name, why, old, new, must_fail...
 # `listener-found` and `listener-free-clean-table` must both survive, because a
 # rule that answered 2 to everything would catch the diagnostic cases while
 # destroying the two answers the caller actually acts on.
+#
+# ROUND 6 re-anchored this: the anchor is the shipped grammar VERBATIM, so it
+# now carries the blank-line/`sep` bookkeeping the preamble-shape rule added,
+# and it must be updated in lockstep with the library or `count_occurrences`
+# returns 0 and the control silently tests nothing -- which is exactly how this
+# was found. The shape rule itself (banner, blank, header) is pinned by its own
+# control in scripts/negative-controls/posix-probes-negative-controls.py, over
+# fixtures this harness does not carry; here it is only along for the ride.
 listener_control nc-listener-diagnostic-is-not-a-row \
   'a merged netstat warning beside valid rows reads as "port free"' \
-  '      /^[[:space:]]*$/ { next }
+  '      # A blank line is not a preamble line, but WHERE it falls is evidence:
+      # `blank` records that one was seen since the last non-blank pre-row
+      # line, which is how the banner is told from a diagnostic sitting
+      # directly on top of the header. After the first row it is irrelevant --
+      # the real table has blank lines among its rows.
+      /^[[:space:]]*$/ { if (!rows) blank = 1; next }
       ($1 == "TCP" && NF == 5 && $5 ~ /^[0-9]+$/) ||
         ($1 == "UDP" && NF == 4 && $4 ~ /^[0-9]+$/) {
           rows = 1
@@ -626,9 +639,15 @@ listener_control nc-listener-diagnostic-is-not-a-row \
           if ($1 == "TCP" && ($3 == "0.0.0.0:0" || $3 == "[::]:0" || $3 == "*:*")) found = 1
           next
         }
-      { if (rows) after = 1; else preamble++ }
+      { if (rows) { after = 1; next }
+        preamble++
+        if (preamble == 2) sep = blank
+        blank = 0
+      }
       END {
-        if (after || preamble > 2) exit 2
+        if (after) exit 2
+        if (preamble < 1 || preamble > 2) exit 2
+        if (preamble == 2 && !sep) exit 2
         if (tcp_after_udp) exit 4
         if (!udp) exit 3
         exit(found ? 0 : 1)
@@ -647,11 +666,15 @@ listener_control nc-listener-diagnostic-is-not-a-row \
 
 # And the preamble half on its own, so the two rules are pinned separately. A
 # rule that only watched what comes AFTER the first row would pass the control
-# above and still let a warning printed BEFORE the table ride along.
+# above and still let a warning printed BEFORE the table ride along. ROUND 6
+# split `if (after || preamble > 2)` into two statements; this control keeps the
+# BUDGET half -- dropping the upper bound alone is enough to let a diagnostic
+# stand in the preamble unchallenged, and the `after` half is already pinned by
+# the whole-grammar control above.
 listener_control nc-listener-preamble-uncounted \
   'a diagnostic ahead of the first row is not counted against the preamble' \
-  '        if (after || preamble > 2) exit 2' \
-  '        if (after) exit 2' \
+  '        if (preamble < 1 || preamble > 2) exit 2' \
+  '        if (preamble < 1) exit 2' \
   listener-diagnostic-in-preamble
 
 # ROUND 5, and the case the two rules above cannot reach. They are a GRAMMAR:

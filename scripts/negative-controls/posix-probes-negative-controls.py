@@ -818,6 +818,48 @@ MUTATIONS = [
             'tests scripts/lib/host-process.sh unless a control explicitly says otherwise',
         ],
     },
+    # ROUND 7 (adversarial review), FINDING 2. The window this helper polls is
+    # a caller-settable knob, and the knob was validated with `^[0-9]+$` plus
+    # `(( _rounds > 0 ))`. The second half is SHELL ARITHMETIC, and shell
+    # arithmetic wraps: WENLAN_HOST_PROCESS_POLL_ROUNDS=18446744073709551617 is
+    # all digits, evaluates to 1 in the guard AND in the `for` loop, and the
+    # helper took ONE snapshot and returned status 1 -- "the row never appeared
+    # within the window" -- about a window that was never established. A
+    # measured negative out of a failed measurement, reachable from a caller's
+    # environment rather than from a broken tool.
+    #
+    # This mutation is the pre-fix guard verbatim, and it is the reason the
+    # case it defends uses a table that does NOT contain the row: the defect's
+    # own answer is rc=1, not rc=0, so a guard merely restored to "positive
+    # integer" is still red here. Only refusing the SPELLING passes.
+    {
+        'name': 'nc-jobpid-poll-window-wraps',
+        'why': 'a poll-rounds override that overflows 64-bit arithmetic wraps '
+               'to 1, so a one-round poll reports the terminal negative of a '
+               'ten-second window',
+        'old': '''  if ! [[ "$_rounds" =~ ^[1-9][0-9]{0,4}$ ]]; then''',
+        'new': '''  # INJECTED: the pre-fix guard -- digits, then ARITHMETIC, which wraps.
+  if ! [[ "$_rounds" =~ ^[0-9]+$ ]] || (( _rounds <= 0 )); then''',
+        'must_fail': [
+            'reports COULD NOT MEASURE for a poll window that overflows shell arithmetic',
+        ],
+        'must_survive': [
+            # The four spellings the pre-fix guard DID catch: this control must
+            # revert the overflow hole and nothing else, or it is measuring the
+            # guard's existence rather than its arithmetic.
+            'reports COULD NOT MEASURE for a poll window that is not a number',
+            'reports COULD NOT MEASURE for a poll window of zero rounds',
+            'reports COULD NOT MEASURE for a negative poll window',
+            'reports COULD NOT MEASURE for an empty poll window',
+            # And the two cases that prove a LEGITIMATE window still works, in
+            # both directions: the shortened one the suite sets, and the shipped
+            # default the source pins.
+            'reports the MEASURED NEGATIVE after a full window of readable tables',
+            'ships a hundred-round window as its default',
+            'reports the Windows pid when the row names the program that was launched',
+            'tests scripts/lib/host-process.sh unless a control explicitly says otherwise',
+        ],
+    },
     {
         'name': 'nc-image-path-swallows-ps-stderr',
         'why': 'a failing `ps` plus an EPERM `kill -0` agree on a negative neither made',
@@ -866,8 +908,8 @@ MUTATIONS = [
     {
         'name': 'nc-netstat-preamble-uncounted',
         'why': 'a diagnostic printed ahead of the banner is counted as banner',
-        'old': '        if (after || preamble > 2) exit 2',
-        'new': '        if (after) exit 2',
+        'old': '        if (preamble < 1 || preamble > 2) exit 2',
+        'new': '        if (preamble < 1) exit 2',
         'must_fail': [
             'reports COULD NOT MEASURE for a diagnostic merged into the preamble',
         ],
@@ -876,6 +918,52 @@ MUTATIONS = [
             'reports a NEGATIVE, not a failure, when nothing is listening',
             'reports COULD NOT MEASURE for a diagnostic merged after valid rows',
             'still parses the real table shape, blank lines and all',
+            'finds the listener in a table whose State column is translated',
+            # ROUND 7's fixture, and it must survive THIS control specifically:
+            # the two rules are independent. That fixture's preamble is two
+            # lines, so it never needed the count rule at all -- it is refused
+            # because those two lines are not blank-separated. A control that
+            # reddened it as well would be reverting both rules at once and
+            # measuring neither.
+            'refuses a warning that fills the preamble budget in place of the banner',
+            'still measures a preamble that is a bare header with no banner',
+            'tests scripts/lib/host-process.sh unless a control explicitly says otherwise',
+        ],
+    },
+    # ROUND 7 (adversarial review), FINDING 1. The rule above is a BUDGET, and a
+    # budget is not a shape. The banner and the header are localised, so the
+    # budget exists precisely because those two lines cannot be matched by text
+    # -- which means the budget is also satisfied by a warning sitting directly
+    # on top of the header. The reviewer supplied one, and this branch answered
+    # MEASURED CLOSED for a port that was absent from the truncated remainder;
+    # first-run/port-precheck.sh turns that into "measured free".
+    #
+    # The remedy is netstat's own SHAPE: blank, banner, blank, header, rows. The
+    # header is the last non-blank line before the first row, and the one other
+    # non-blank line allowed before it must be SEPARATED FROM IT BY A BLANK
+    # LINE. Nothing new is matched by text; a blank line is not localised.
+    #
+    # This control reverts ONLY the separation requirement, so the line budget
+    # stays intact and the case above stays green -- which is what makes this a
+    # measurement of the new rule rather than of the pair.
+    {
+        'name': 'nc-netstat-banner-shape-unchecked',
+        'why': 'a warning standing where the banner stands fits the two-line '
+               'budget, so a truncated table reads as a measured free port',
+        'old': '        if (preamble == 2 && !sep) exit 2',
+        'new': '        if (0 && preamble == 2 && !sep) exit 2',
+        'must_fail': [
+            'refuses a warning that fills the preamble budget in place of the banner',
+        ],
+        'must_survive': [
+            # The two ordinary answers, and every other preamble case: the
+            # separation rule must be the ONLY thing this changes.
+            'reports the listener pid when the port is held',
+            'reports a NEGATIVE, not a failure, when nothing is listening',
+            'reports COULD NOT MEASURE for a diagnostic merged into the preamble',
+            'reports COULD NOT MEASURE for a diagnostic merged after valid rows',
+            'still parses the real table shape, blank lines and all',
+            'still measures a preamble that is a bare header with no banner',
             'finds the listener in a table whose State column is translated',
             'tests scripts/lib/host-process.sh unless a control explicitly says otherwise',
         ],
@@ -889,8 +977,8 @@ MUTATIONS = [
         # and one "caught" -- a control that broke the file reading exactly like
         # a control that reverted a fix. The `bash -n` gate below now separates
         # those two, and this comment is why it exists.
-        'old': '      { if (rows) after = 1; else preamble++ }',
-        'new': '      { if (rows) after = 0; else preamble++ }',
+        'old': '      { if (rows) { after = 1; next }',
+        'new': '      { if (rows) { after = 0; next }',
         'must_fail': [
             'reports COULD NOT MEASURE for a diagnostic merged after valid rows',
             # Declared, not collateral: this case puts the SAME trailing
@@ -915,6 +1003,8 @@ MUTATIONS = [
             'reports a NEGATIVE, not a failure, when nothing is listening',
             'reports COULD NOT MEASURE for a diagnostic merged into the preamble',
             'still parses the real table shape, blank lines and all',
+            'refuses a warning that fills the preamble budget in place of the banner',
+            'still measures a preamble that is a bare header with no banner',
             'tests scripts/lib/host-process.sh unless a control explicitly says otherwise',
         ],
     },
