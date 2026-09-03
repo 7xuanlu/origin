@@ -5,19 +5,10 @@ use std::path::{Path, PathBuf};
 
 /// A yes/no fact about an MCP client's install, in three values.
 ///
-/// ROUND 5, DEFECT 4. Every one of these was a `bool`, and every one was
-/// produced by `std::fs::read_to_string(..).map(..).unwrap_or(false)` or by
-/// `Path::exists()` — both of which answer `false` for "measured: no" AND for
-/// "the OS would not tell me". A `~/.claude/settings.json` that a permission
-/// denies, holding an ENABLED Wenlan plugin, reported byte-for-byte identically
-/// to one with the plugin switched off. Those are different situations: the
-/// second is one the user can act on, and the first is one they have to be told
-/// about — the wizard's "not configured" row invites them to write a SECOND
-/// registration over a working one, which is the double-registration this
-/// codebase already has a warning box for.
-///
 /// Same three values and the same rule as [`CandidateProbe`]: only a measured
-/// absence is an absence.
+/// absence is an absence. A read the OS refused answers `Unreadable`, never
+/// `No` — the wizard's "not configured" row invites a SECOND registration over
+/// a working one, so the two must not be the same value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Reading {
@@ -38,13 +29,6 @@ impl Reading {
         }
     }
 
-    /// True only for a MEASURED yes. Named `is_yes` rather than exposed as a
-    /// bool field so a call site cannot treat "unreadable" as "no" by writing
-    /// the shorter thing.
-    pub fn is_yes(&self) -> bool {
-        matches!(self, Reading::Yes)
-    }
-
     /// OR over two readings of the same question, ranked so a failed read can
     /// never turn a measured yes into a no: `Yes` wins, then `Unreadable`, then
     /// `No`. A client counts as configured through EITHER a plugin or a raw
@@ -62,14 +46,10 @@ impl Reading {
     }
 }
 
-/// What reading one client config file actually answered.
-///
-/// Replaces the `Path::exists()` + `read_to_string(..).unwrap_or(false)` pair
-/// that ran everywhere below. That pair had two collapses and a third problem:
-/// `exists()` answers `false` when `metadata` fails for ANY reason, the read
-/// answered `false` for every read error, and the two together were TWO
-/// instants answering one question — the same shape as round 4's defect F.
-/// One read, three answers.
+/// What reading one client config file actually answered. One read, three
+/// answers — replacing `Path::exists()` plus a separate `read_to_string`, which
+/// were two instants answering one question and collapsed every read error into
+/// `false`.
 enum ConfigRead {
     Contents(String),
     /// Measured absent.
@@ -102,20 +82,8 @@ impl ConfigRead {
 
     /// Ask a yes/no question of the contents. An absent file is a measured
     /// `No` — it genuinely holds no entry. A file that could not be read is
-    /// neither, and NEITHER IS ONE THAT COULD NOT BE PARSED.
-    ///
-    /// ROUND 6, DEFECT D2 — where the tri-state used to die. This took an
-    /// `impl FnOnce(&str) -> bool`, and every question passed to it ended in
-    /// `serde_json::from_str(..).ok()..unwrap_or(false)` or
-    /// `parse::<DocumentMut>().ok()..unwrap_or(false)`. So a present Gemini
-    /// `settings.json` holding `not json` produced `detected = Yes`,
-    /// `has_raw_entry = No`, `has_plugin = No`, `already_configured = No`: the
-    /// file WAS read, whether it holds an entry could NOT be measured, and the
-    /// UI was told "no". The I/O layer above kept three values all the way here
-    /// and then handed them to a function that only has two.
-    ///
-    /// The question is now fallible, and a body that would not parse comes back
-    /// as `Unreadable` — a failed measurement, which is what it is.
+    /// neither, and NEITHER IS ONE THAT COULD NOT BE PARSED: the question is
+    /// fallible, and a body that would not parse comes back as `Unreadable`.
     fn asks(&self, question: impl FnOnce(&str) -> Result<bool, String>) -> Reading {
         match self {
             ConfigRead::Contents(contents) => match question(contents) {
@@ -218,18 +186,9 @@ pub(crate) fn client_config_path_for(
     home: Option<&Path>,
     config_dir: Option<&Path>,
 ) -> ClientConfigPath {
-    // ROUND 5, DEFECT 4, THE STARKEST CASE. This function used to open with
-    // `let home = dirs::home_dir()?;` — one `?` that turned EVERY client's path
-    // into `None` when that lookup failed, `claude_desktop` included, whose
-    // path does not use `home` at all. `detect_mcp_clients` then dropped all
-    // five rows through `filter_map` and returned an EMPTY VECTOR, which the
-    // Diagnostics card renders as "no MCP client detected" and the wizard as
-    // nothing to configure. A lookup that failed became a confident negative
-    // about the user's whole machine.
-    //
-    // Each arm now asks only for the directory it actually needs, and a
-    // directory that could not be determined is a VALUE — a row that says so —
-    // rather than a row that vanishes.
+    // Each arm asks only for the directory it actually needs — `claude_desktop`
+    // does not use `home` at all — and a directory that could not be determined
+    // is a VALUE, so the row still exists and says so.
     let under = |dir: Option<&Path>, what: &str, tail: &[&str]| match dir {
         Some(dir) => ClientConfigPath::Known(
             tail.iter()
@@ -320,12 +279,7 @@ fn has_both_raw_entries_toml(toml_str: &str) -> Result<bool, String> {
 /// one of the two populations.
 ///
 /// A missing `enabledPlugins` key is a measured "no plugin" — the file was
-/// understood and it enables nothing. MALFORMED JSON IS NOT. That was the
-/// shipped policy ("malformed JSON or a missing key is no plugin, never an
-/// error") and it is round 6's D2: a `~/.claude/settings.json` that a partial
-/// write or a merge conflict left unparseable answered exactly what a
-/// plugins-off one answers, and the wizard invited the user to write a SECOND
-/// registration over a plugin it had simply failed to read.
+/// understood and it enables nothing. MALFORMED JSON IS NOT.
 fn claude_code_plugin_enabled(settings_json: &str) -> Result<bool, String> {
     let value = parse_json(settings_json)?;
     Ok(value
@@ -343,8 +297,6 @@ fn claude_code_plugin_enabled(settings_json: &str) -> Result<bool, String> {
 /// directly testable function.
 fn claude_code_plugin_enabled_on_disk(home: Option<&Path>) -> Reading {
     match home {
-        // Round 5, D4: a denied `settings.json` used to answer `false` here,
-        // which is what "the plugin is off" answers. One read, three answers.
         Some(home) => read_config(&home.join(".claude").join("settings.json"))
             .asks(claude_code_plugin_enabled),
         None => Reading::Unreadable {
@@ -411,9 +363,7 @@ fn claude_desktop_plugin_enabled(manifest_json: &str) -> Result<bool, String> {
 /// THREE outcomes, not two. `Ok(None)` is "the file was understood and pins no
 /// account" — a real negative, and the reason the sessions scan is skipped.
 /// `Err` is "the file could not be parsed", which establishes nothing about
-/// whether an account is pinned. These used to be the same `None`, and the
-/// caller turned that `None` into `Reading::No` — "Claude Desktop does not have
-/// the Wenlan plugin", asserted from a file nothing could read.
+/// whether an account is pinned.
 fn claude_desktop_account_id(config_json: &str) -> Result<Option<String>, String> {
     let value = parse_json(config_json)?;
     Ok(value
@@ -424,12 +374,10 @@ fn claude_desktop_account_id(config_json: &str) -> Result<Option<String>, String
 
 /// The directory holding one subdirectory per chat-side session id for a
 /// given account: `<support_dir>/local-agent-mode-sessions/<account_id>`.
-/// Pure path construction, so a typo in either hardcoded segment fails a
-/// test that reads the returned path directly, rather than surfacing as an
-/// unexplained `false` several calls downstream. Scoping to the pinned
-/// account id also means the `skills-plugin` sentinel directory that lives
-/// alongside real account-id directories under `local-agent-mode-sessions/`
-/// is never visited — it isn't a UUID, so it can never be `account_id`.
+/// Scoping to the pinned account id means the `skills-plugin` sentinel
+/// directory that lives alongside real account-id directories under
+/// `local-agent-mode-sessions/` is never visited — it isn't a UUID, so it can
+/// never be `account_id`.
 fn claude_desktop_account_sessions_dir(support_dir: &Path, account_id: &str) -> PathBuf {
     support_dir
         .join("local-agent-mode-sessions")
@@ -454,11 +402,8 @@ fn claude_desktop_plugin_enabled_in_sessions_dir(account_sessions_dir: &Path) ->
             }
         }
     };
-    // A single matching session is enough (a user can have several open). A
-    // session whose manifest could NOT be read is neither a match nor an
-    // absence: remembered, and reported only if nothing else matched. Round 5,
-    // D4 — `entries.flatten()` plus `unwrap_or(false)` used to discard both the
-    // per-entry errors and the per-manifest ones.
+    // A session whose manifest could NOT be read is neither a match nor an
+    // absence: remembered, and reported only if nothing else matched.
     let mut unreadable: Option<String> = None;
     for entry in entries {
         let entry = match entry {
@@ -490,9 +435,7 @@ fn claude_desktop_plugin_enabled_in_sessions_dir(account_sessions_dir: &Path) ->
 /// `claude_desktop_account_id` + `claude_desktop_account_sessions_dir` +
 /// `claude_desktop_plugin_enabled_in_sessions_dir` end to end, so the full
 /// real-world path — `config.json` -> account id -> sessions dir -> manifest
-/// scan — is exercised under test with a tempdir standing in for
-/// `support_dir`. That leaves nothing for `claude_desktop_plugin_enabled_on_disk`
-/// or its `detect_mcp_clients` call site to quietly sever.
+/// scan — is exercised under test with a tempdir standing in for `support_dir`.
 fn claude_desktop_plugin_enabled_for_support_dir(support_dir: &Path) -> Reading {
     let account_id = match read_config(&support_dir.join("config.json")) {
         ConfigRead::Contents(contents) => match claude_desktop_account_id(&contents) {
@@ -500,11 +443,9 @@ fn claude_desktop_plugin_enabled_for_support_dir(support_dir: &Path) -> Reading 
             // The file was read and simply pins no account: a measured no.
             // There is no account whose sessions could hold a manifest.
             Ok(None) => return Reading::No,
-            // ROUND 6, D2. A `config.json` that would not parse used to land on
-            // the same `None` — and therefore the same `No` — as one that
-            // parsed and pinned nothing. The sessions directory is named after
-            // the account id, so an unparseable `config.json` means the scan
-            // never happened at all; that is not "the plugin is not there".
+            // The sessions directory is named after the account id, so an
+            // unparseable `config.json` means the scan never happened at all —
+            // which is not "the plugin is not there".
             Err(error) => return Reading::Unreadable { error },
         },
         ConfigRead::Absent => return Reading::No,
@@ -518,13 +459,9 @@ fn claude_desktop_plugin_enabled_for_support_dir(support_dir: &Path) -> Reading 
 
 /// Reads the real Claude Desktop support directory
 /// (`~/Library/Application Support/Claude`) and checks it via
-/// `claude_desktop_plugin_enabled_for_support_dir`. Split out so the
-/// matching/composition logic stays directly testable — mirrors
-/// `claude_code_plugin_enabled_on_disk` and `codex_cli_plugin_enabled_on_disk`.
-/// Missing home dir is "no plugin", never an error: a user who has never
-/// opened Claude Desktop must not see this break detection. READ-ONLY: never
-/// creates, writes, or modifies anything under Claude Desktop's support
-/// directory — that state belongs to another vendor's app.
+/// `claude_desktop_plugin_enabled_for_support_dir`. READ-ONLY: never creates,
+/// writes, or modifies anything under Claude Desktop's support directory —
+/// that state belongs to another vendor's app.
 fn claude_desktop_plugin_enabled_on_disk(config_dir: Option<&Path>) -> Reading {
     match config_dir {
         Some(config_dir) => {
@@ -538,11 +475,9 @@ fn claude_desktop_plugin_enabled_on_disk(config_dir: Option<&Path>) -> Reading {
 }
 
 /// The reading contributed by the home-directory lookup ITSELF, before any
-/// candidate under it is probed. A `None` home is not "this user has no home
-/// directory" — it is a lookup that failed, and every `~/...` candidate that
-/// would have been built from it went unprobed. Seeding a bundle search with
-/// this keeps a search that could only look at half its candidates from
-/// reporting the confident `No` that means "not installed".
+/// candidate under it is probed. A `None` home is a lookup that failed, so
+/// every `~/...` candidate went unprobed; seeding a bundle search with this
+/// keeps a half-completed search from reporting "not installed".
 fn home_lookup_reading(home: Option<&Path>) -> Reading {
     match home {
         Some(_) => Reading::No,
@@ -579,11 +514,8 @@ fn codex_cli_detected(
         .iter()
         .map(|p| exists(p.as_path()))
         // `Reading::or`, not `any`: a bundle path the OS refused to stat is not
-        // a bundle that is absent, and `any` over `Path::exists()` said it was.
-        //
-        // The seed is the home lookup itself: with no home, the
-        // `~/Applications` candidate was never built and never probed, so a
-        // `No` here would be a verdict from half a search.
+        // a bundle that is absent. Seeded with the home lookup itself, since
+        // with no home the `~/Applications` candidate was never built.
         .fold(config_exists.or(home_lookup_reading(home)), Reading::or)
 }
 
@@ -675,12 +607,9 @@ pub fn detect_mcp_clients() -> Vec<McpClient> {
 }
 
 /// The body, with the two directory lookups and the existence probe handed in.
-///
-/// The seam exists because the failure this function was rewritten for cannot
-/// be staged any other way: `dirs::home_dir()` on Windows resolves the known
+/// The seam exists because `dirs::home_dir()` on Windows resolves the known
 /// folder and IGNORES `$HOME`, so "the platform would not report a home
-/// directory" is unreachable through the environment on the platform this is
-/// most often run on.
+/// directory" is unreachable through the environment there.
 pub(crate) fn detect_mcp_clients_from(
     home: Option<&Path>,
     config_dir: Option<&Path>,
@@ -696,21 +625,15 @@ pub(crate) fn detect_mcp_clients_from(
 
     clients
         .iter()
-        // ROUND 5, DEFECT 4: `map`, not `filter_map`. A client whose config
-        // path could not even be built used to be DROPPED from the returned
-        // vector — and since one failed `dirs::home_dir()` broke every arm of
-        // `client_config_path`, that meant an empty vector: "no MCP client is
-        // installed", stated confidently, from a lookup that failed. A row that
-        // says "could not read" is the only honest output here, and it can only
-        // exist if the row exists.
+        // `map`, not `filter_map`: a row that says "could not read" is the only
+        // honest output for a client whose config path could not be built, and
+        // it can only exist if the row exists.
         .map(|(name, client_type)| {
             let path = client_config_path_for(client_type, home, config_dir);
             let (config_path, config) = match &path {
                 ClientConfigPath::Known(path) => {
                     // ONE read answers both "is the file there" and "what does
-                    // it say" — see `ConfigRead`. It used to be an `exists()`
-                    // call plus a separate `read_to_string`, two instants and
-                    // two collapses.
+                    // it say" — see `ConfigRead`.
                     (Some(path.to_string_lossy().to_string()), read_config(path))
                 }
                 ClientConfigPath::UnknownClient => (
@@ -742,12 +665,6 @@ pub(crate) fn detect_mcp_clients_from(
                 name: name.to_string(),
                 client_type: client_type.to_string(),
                 config_path,
-                // A raw entry OR a plugin. `Reading::or` ranks a measured yes
-                // above an unread half, so a client that is demonstrably
-                // configured through one route is not dragged to "unknown" by
-                // the other — and a client that is demonstrably configured
-                // through NEITHER, with one route unread, is unknown rather
-                // than "not configured".
                 detected,
                 already_configured: has_raw_entry.clone().or(has_plugin.clone()),
                 has_raw_entry,
@@ -783,11 +700,9 @@ fn pinned_wenlan_mcp_package(pin_file: &str) -> String {
 
 /// Give a candidate binary path the platform's executable suffix —
 /// `wenlan-mcp.exe` on Windows. Same idiom as
-/// `lifecycle::service_cli_path_for_app_exe`, and for the same reason: a
-/// suffix-less candidate never matches a real Windows install, so every
-/// Windows desktop skipped the bundled binary sitting next to the app exe and
-/// fell through to the `npx` fallback — a network dependency and a
-/// version-skew hazard on a machine that already shipped the right binary.
+/// `lifecycle::service_cli_path_for_app_exe`: a suffix-less candidate never
+/// matches a real Windows install, so the bundled binary next to the app exe is
+/// skipped and the `npx` fallback wins on a machine that already has it.
 fn with_exe_suffix(mut bin: PathBuf) -> PathBuf {
     if cfg!(target_os = "windows") {
         bin.set_extension("exe");
@@ -796,16 +711,13 @@ fn with_exe_suffix(mut bin: PathBuf) -> PathBuf {
 }
 
 /// Each `wenlan-mcp` candidate paired with where it came from, most-specific
-/// first — the single source of truth `wenlan_mcp_candidates` (the plain
-/// path list `find_wenlan_mcp_binary` resolves against) and `wire_state`'s
-/// candidate trail both derive from, so the two can never disagree about
-/// what was tried. Mirrors the plugin's own `wenlan-mcp-runner.sh`
-/// resolution order.
+/// first — the single source of truth the plain path list and `wire_state`'s
+/// candidate trail both derive from, so the two can never disagree about what
+/// was tried. Mirrors the plugin's own `wenlan-mcp-runner.sh` resolution order.
 ///
-/// Deliberately does *not* probe a cargo target dir. `~/Repos/wenlan/target/release`
-/// used to rank above the installed binary here, so the wizard baked a maintainer's
-/// build-artifact path into real users' client configs — and the entry died the next
-/// `cargo clean`. A target dir is a build output, not an install location.
+/// Deliberately does *not* probe a cargo target dir: a target dir is a build
+/// output, not an install location, and an entry pointing into one dies on the
+/// next `cargo clean`.
 pub(crate) fn wenlan_mcp_candidate_sources(
     home: Option<&Path>,
     dev_bin: Option<&str>,
@@ -843,10 +755,8 @@ fn wenlan_mcp_candidates(
 }
 
 /// Env var a test sets to point the resolver at a fixture install tree.
-/// Mirrors `lifecycle::home_dir`'s `#[cfg(test)]` HOME hook. Without it a test
-/// can only assert whatever the host it runs on happens to hold, which is how
-/// the missing `.exe` suffix above shipped behind two tests that accepted the
-/// bundled binary and the `npx` fallback interchangeably.
+/// Mirrors `lifecycle::home_dir`'s `#[cfg(test)]` HOME hook; without it a test
+/// can only assert whatever the host it runs on happens to hold.
 #[cfg(test)]
 pub(crate) const MCP_RESOLVER_HOME_ENV: &str = "WENLAN_TEST_MCP_HOME";
 
@@ -861,13 +771,10 @@ fn resolver_home_dir() -> Option<PathBuf> {
 
 /// What one candidate path is, as far as the filesystem would say.
 ///
-/// `Path::exists()` answered this in two states and got both failure modes
-/// wrong. It returns false when `metadata` fails for *any* reason, so a
-/// `wenlan-mcp.exe` the OS refused to stat — a locked file, a denied ACL, a
-/// disconnected network path — read as "not installed" and the app quietly
-/// fell through to `npx`. And it returns true for anything at the path, so a
-/// *directory* named `wenlan-mcp.exe` read as an executable and would be
-/// written into the user's client config as the command to run.
+/// `Path::exists()` gets both failure modes wrong: it is false when `metadata`
+/// fails for *any* reason (a locked file, a denied ACL, a disconnected network
+/// path all read as "not installed"), and true for anything at the path, so a
+/// *directory* named `wenlan-mcp.exe` reads as an executable.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CandidateProbe {
@@ -903,13 +810,12 @@ pub fn probe_candidate(path: &Path) -> CandidateProbe {
     }
 }
 
-/// Round 4, defect E: `metadata.is_file()` is a FILE witness, not an
-/// EXECUTABLE witness, and the resolver writes the winner into a user's client
-/// config as a command the OS then has to run.
+/// `metadata.is_file()` is a FILE witness, not an EXECUTABLE witness, and the
+/// resolver writes the winner into a user's client config as a command the OS
+/// then has to run.
 ///
-/// WHAT THIS ESTABLISHES, PER PLATFORM — stated exactly, because the honest
-/// answer differs and inventing a uniform one would be another check that
-/// cannot fail:
+/// WHAT THIS ESTABLISHES, PER PLATFORM — the honest answer differs, and
+/// inventing a uniform one would be a check that cannot fail:
 ///
 /// * Everywhere: a zero-length file is not a program. No OS on any platform
 ///   executes an empty file — there is no interpreter line, no PE header, no
@@ -925,26 +831,12 @@ pub fn probe_candidate(path: &Path) -> CandidateProbe {
 ///   probes as `File` on Windows, and that is the strongest claim available
 ///   without opening and parsing the file.
 ///
-/// THE RESIDUAL, STATED IN FULL, because a partial statement of it was itself
-/// a defect in the last round. NEITHER CHECK CERTIFIES A RUNNABLE IMAGE.
-/// `File` means "nothing here could rule it out", and the ways it can still be
-/// wrong are not confined to Windows:
-///
-/// * Windows: a non-empty but corrupt or truncated `wenlan-mcp.exe` probes as
-///   `File`. Nothing read the PE header.
-/// * UNIX, EQUALLY: the execute bit is a permission, not a format. A corrupt
-///   ELF, a shell script whose `#!` line names an interpreter that is not
-///   installed, or any non-empty file at all with mode 0755 probes as `File`
-///   and fails only when something tries to run it. The execute bit is a sound
-///   NEGATIVE (no bit means `execve` returns `EACCES`, whatever the bytes are)
-///   and a very weak positive, and only the negative is relied on here.
-///
-/// Parsing the image was considered and not done: a failed *read* of a real
-/// binary would then have to be told apart from a real bad one, which is the
-/// defect class this file exists to avoid, and the resolver's job is to pick a
-/// path rather than to certify a program. What is claimed is exactly what is
-/// checked, and the trail on the diagnostics wire shows the reading rather than
-/// a verdict.
+/// THE RESIDUAL: NEITHER CHECK CERTIFIES A RUNNABLE IMAGE, on either platform.
+/// `File` means "nothing here could rule it out". A non-empty but corrupt
+/// `.exe` probes as `File` on Windows (nothing reads the PE header), and on
+/// Unix the execute bit is a permission, not a format — a corrupt ELF or a
+/// `#!` line naming a missing interpreter probes as `File` at mode 0755. Only
+/// the execute bit's NEGATIVE is relied on here.
 fn file_probe(metadata: &std::fs::Metadata) -> CandidateProbe {
     if metadata.len() == 0 {
         return CandidateProbe::NotExecutable {
@@ -964,17 +856,10 @@ fn file_probe(metadata: &std::fs::Metadata) -> CandidateProbe {
     CandidateProbe::File
 }
 
-/// One input the candidate paths hang off, in three values.
-///
-/// ROUND 4 FOLLOW-UP, C1.4. The tri-state was fixed at the PROBE and left
-/// collapsing at candidate CONSTRUCTION, one layer upstream, where
-/// `dirs::home_dir()`, `current_exe()` and a non-Unicode `WENLAN_MCP_DEV_BIN`
-/// were all flattened into `None` by `Option` and `.ok()`. `None` then meant
-/// "that candidate is not in play", the candidate was never built, it never
-/// appeared in the trail, and a search that had failed to look at four paths
-/// could end in `NoneInstalled` -- and write `npx` over a user's working local
-/// command, with no unresolved trail to show why. A failed measurement
-/// upstream of a hardened one is still a failed measurement.
+/// One input the candidate paths hang off, in three values. A failed
+/// measurement upstream of a hardened one is still a failed measurement: an
+/// input flattened to `None` builds no candidate, so it never appears in the
+/// trail and a search that looked at nothing could end in `NoneInstalled`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RootInput<T> {
     /// Measured: here it is.
@@ -1013,12 +898,10 @@ pub struct UndeterminedInput {
 /// writing anything.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Unmeasured {
-    /// Candidate paths that produced no usable answer: one the OS would not
-    /// let this process look at, or -- round 6, additional defect 2 -- the
-    /// winner it DID look at and cannot NAME, because a path that is not valid
-    /// Unicode cannot be written into a JSON or TOML config without silently
-    /// naming a different file. Both are "there is a path here and no answer
-    /// about it that may be acted on", which is what the callers do with this.
+    /// Candidate paths that produced no usable answer: one the OS would not let
+    /// this process look at, or the winner it DID look at and cannot NAME,
+    /// because a path that is not valid Unicode cannot be written into a JSON or
+    /// TOML config without silently naming a different file.
     pub unreadable: Vec<(PathBuf, String)>,
     /// Inputs that could not be determined, so the candidates hanging off them
     /// were never built and never looked at at all.
@@ -1057,19 +940,15 @@ impl ResolverInputs {
     }
 
     /// The classification, split from the reads so a test can hand it a
-    /// failure directly. Without this seam the only way to exercise the
-    /// NotUnicode arm would be to mutate the real process environment, and the
-    /// arm that matters most -- `current_exe()` failing -- could not be
-    /// reached at all.
+    /// failure directly — `current_exe()` failing cannot be staged otherwise.
     fn from_reads(
         home: Option<PathBuf>,
         dev_bin: Result<String, std::env::VarError>,
         exe: std::io::Result<PathBuf>,
     ) -> Self {
         Self {
-            // `dirs::home_dir()` answering `None` is not "this user has no
-            // home directory" -- it is the platform declining to say. Two
-            // candidates (`installed`, `cargo`) hang off it.
+            // `dirs::home_dir()` answering `None` is the platform declining to
+            // say. Two candidates (`installed`, `cargo`) hang off it.
             home: match home {
                 Some(home) => RootInput::Known(home),
                 None => RootInput::Undetermined(
@@ -1077,8 +956,7 @@ impl ResolverInputs {
                 ),
             },
             // `env::var` returns `Err` for BOTH "unset" and "not valid
-            // Unicode". ONLY THE FIRST IS AN ABSENCE. `.ok()` erased that
-            // distinction, which is half of C1.4.
+            // Unicode". ONLY THE FIRST IS AN ABSENCE.
             dev_bin: match dev_bin {
                 Ok(value) => RootInput::Known(value),
                 Err(std::env::VarError::NotPresent) => RootInput::NotSet,
@@ -1137,22 +1015,9 @@ impl ResolverInputs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum McpBinaryResolution {
     /// A candidate measured to be a regular file, in probe order — plus any
-    /// input that could NOT be determined along the way.
-    ///
-    /// ROUND 5, DEFECT D4. `Found` used to be a bare path, and
-    /// `inputs.undetermined()` was consulted only in the empty branch below.
-    /// So `home = Known`, `dev_bin = Undetermined("not valid Unicode")`,
-    /// `exe_dir = NotSet` with a hit under `home` returned `Found` and the
-    /// undetermined input vanished from the resolution AND from the trail (an
-    /// input that could not be determined builds no candidate path, so it has
-    /// no trail entry to vanish from) — externally indistinguishable from
-    /// `dev_bin = NotSet`, a MEASURED absence. A developer whose override was
-    /// silently unreadable got the installed binary written into their config
-    /// with nothing anywhere saying the override had been skipped.
-    ///
-    /// A find does not retroactively make an unread input read. The winner is
-    /// still the first `File` in probe order — this changes nothing about the
-    /// ranking, only about what a successful search is allowed to leave out.
+    /// input that could NOT be determined along the way. A find does not
+    /// retroactively make an unread input read, and an undetermined input
+    /// builds no candidate path, so it has no trail row to be missing from.
     Found {
         path: PathBuf,
         undetermined: Vec<UndeterminedInput>,
@@ -1170,9 +1035,9 @@ pub(crate) enum McpBinaryResolution {
 
 /// One candidate as the resolver actually saw it. Carried out of the resolver
 /// so `wire_state` can put THE DECISION'S OWN probe results on the diagnostics
-/// wire instead of re-probing every path afterwards (round 4, defect F): a
-/// second probe pass is a second instant, and a permission that changed in
-/// between produced a trail that contradicted the command beside it.
+/// wire instead of re-probing afterwards: a second probe pass is a second
+/// instant, and a permission that changed in between produces a trail that
+/// contradicts the command beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProbedCandidate {
     pub path: PathBuf,
@@ -1187,50 +1052,28 @@ pub(crate) struct McpResolutionTrail {
     pub trail: Vec<ProbedCandidate>,
 }
 
-/// First candidate measured to be a usable file, in `wenlan_mcp_candidates`
-/// order, together with every reading taken to decide that. Split from
-/// [`find_wenlan_mcp_binary`] so the probe order can be exercised against an
-/// explicit tree rather than the ambient one.
+/// RANKING for the resolver below, decided and stated: a candidate that could
+/// not be looked at does NOT stop the search — a readable bundled binary
+/// outranks an unreadable dev override, because a measured file beats an
+/// unmeasured anything. It does change the *shape* of an empty result: no file
+/// plus at least one unreadable candidate is
+/// [`McpBinaryResolution::Unresolved`], never `NoneInstalled`.
 ///
-/// RANKING, decided and stated: a candidate that could not be looked at does
-/// NOT stop the search — a readable bundled binary still outranks an
-/// unreadable dev override, because a measured file beats an unmeasured
-/// anything. But it does change the *shape* of an empty result. Ending the
-/// search with no file and at least one unreadable candidate is
-/// [`McpBinaryResolution::Unresolved`], never `NoneInstalled`: the silent
-/// `npx` fall-through those cases used to take is the shipped defect, and the
-/// two are now different values that different code paths handle.
+/// Every candidate is probed exactly ONCE and probing does not stop at the
+/// winner, so there is one set of readings, the decision came from it, and the
+/// diagnostics trail IS it.
 ///
-/// Every candidate is probed exactly ONCE, and probing does not stop at the
-/// winner. That costs a few `stat` calls and buys the property defect F is
-/// about: there is one set of readings, the decision came from it, and the
-/// diagnostics trail IS it. The winner is still the first `File` in order, so
-/// the ranking above is unchanged.
 /// The key two candidate SLOTS share when they name one filesystem object.
-///
-/// ROUND 6, ADDITIONAL DEFECT 3 — a FALSE-GREEN CONTROL. The dedup below
-/// claimed "one reading per filesystem object" while keying a
-/// `HashMap<PathBuf, _>` on PATHNAME EQUALITY, and its test supplied the same
-/// spelling twice — so the test could not fail for the reason the property is
-/// about, and could not establish the claim in its own title. Two spellings of
-/// one file (`~/.wenlan/./bin/wenlan-mcp` as a dev override beside
-/// `~/.wenlan/bin/wenlan-mcp` as the installed candidate; a symlink; a
-/// differently-cased alias on Windows) were probed TWICE — two instants, which
-/// is round 4's defect F, the thing the dedup exists to prevent.
-///
 /// `canonicalize` resolves `.`/`..`, symlinks, and (on Windows) the real
-/// on-disk casing, so those three all collapse to one key. It is a look that
-/// can fail — most often because the candidate simply is not there — and a
-/// failure falls back to the literal path: two absent candidates then get two
-/// readings, which costs one `stat` and cannot produce a contradiction, since
-/// there is nothing there for either reading to disagree about.
+/// on-disk casing, so those all collapse to one key. It is a look that can fail
+/// — most often because the candidate simply is not there — and a failure falls
+/// back to the literal path: two absent candidates then get two readings, which
+/// cannot contradict each other since there is nothing there to disagree about.
 ///
-/// THE RESIDUAL, STATED: a HARDLINK is still two keys. Two directory entries
-/// for one inode are genuinely two paths, and `canonicalize` returns each
-/// unchanged; telling them apart needs a file identity `std` does not expose
-/// portably (`std::os::windows::fs::MetadataExt::file_index` is unstable, and
-/// inventing an identity would be a check that cannot fail — the thing this
-/// file exists to avoid). What is claimed is exactly what is done.
+/// THE RESIDUAL: a HARDLINK is still two keys. Two directory entries for one
+/// inode are genuinely two paths and `canonicalize` returns each unchanged;
+/// telling them apart needs a file identity `std` does not expose portably
+/// (`std::os::windows::fs::MetadataExt::file_index` is unstable).
 fn probe_key(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -1240,14 +1083,10 @@ fn resolve_wenlan_mcp_with_trail(
     probe: impl Fn(&Path) -> CandidateProbe,
 ) -> McpResolutionTrail {
     let (home, dev_bin, exe_dir) = inputs.as_paths();
-    // C1.6: one reading per FILESYSTEM OBJECT, not one per vector entry. The
-    // candidate list is four SLOTS, and two of them can name the same file --
-    // `WENLAN_MCP_DEV_BIN` pointed at the installed binary is the ordinary
-    // case for a developer. Probing that file twice is two instants, which is
-    // defect F in miniature: the same path could appear in the trail as both
-    // `file` and `unreadable`, contradicting itself and the command beside it.
-    // Every slot still appears in the trail -- the user should see that both
-    // named the same file -- but they share the one reading.
+    // One reading per FILESYSTEM OBJECT, not one per vector entry: four SLOTS,
+    // two of which can name the same file (`WENLAN_MCP_DEV_BIN` pointed at the
+    // installed binary is the ordinary developer case). Every slot still
+    // appears in the trail; they share the one reading.
     let mut seen: std::collections::HashMap<PathBuf, CandidateProbe> =
         std::collections::HashMap::new();
     let trail: Vec<ProbedCandidate> = wenlan_mcp_candidate_sources(home, dev_bin, exe_dir)
@@ -1290,11 +1129,9 @@ fn resolve_wenlan_mcp_with_trail(
         .iter()
         .find(|c| c.state == CandidateProbe::File)
         .map(|c| c.path.clone());
-    // Round 5, D4: computed BEFORE the outcome is known, and unconditionally.
-    // This used to live inside the `None` arm, which made "which inputs could
-    // not be read" a property of an empty result rather than of the search --
-    // so a hit anywhere short-circuited it out of existence, and the warnings
-    // this call logs were never emitted either.
+    // Computed unconditionally and BEFORE the outcome is known: "which inputs
+    // could not be read" is a property of the search, not of an empty result,
+    // so a hit anywhere must not short-circuit it (or its warnings) away.
     let undetermined = inputs.undetermined();
     let resolution = match found {
         Some(path) => McpBinaryResolution::Found { path, undetermined },
@@ -1358,23 +1195,18 @@ fn find_wenlan_mcp_binary_with_trail() -> McpResolutionTrail {
     resolve_wenlan_mcp_with_trail(&ResolverInputs::from_env(), probe_candidate)
 }
 
-/// What to do with a client config, given how the binary search ended.
-///
-/// The third value exists because "write nothing" is a thing this code has to
-/// be able to say, and before round 4 it could not: `Unresolved` returned the
-/// same `npx` entry as `NoneInstalled`, so a call site had no way to express
-/// "leave the user's config alone".
+/// What to do with a client config, given how the binary search ended. The
+/// third value exists so a call site can say "leave the user's config alone".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum McpEntryDecision {
     /// Write this entry — and, separately, the inputs that could not be
-    /// determined while deciding it (round 5, D4).
+    /// determined while deciding it.
     ///
-    /// `undetermined` is NOT a reason to withhold the entry: a candidate that
-    /// was measured to be a usable file is still the right command, and the
-    /// round-4 rule ("write nothing rather than a guess") applies to an EMPTY
-    /// search, not to a search that found something while one of its inputs
-    /// went unread. It is carried because the alternative is to drop it, and a
-    /// dropped failed measurement is indistinguishable from a negative one.
+    /// `undetermined` is NOT a reason to withhold the entry: a candidate
+    /// measured to be a usable file is still the right command, and "write
+    /// nothing rather than a guess" applies to an EMPTY search. It is carried
+    /// because a dropped failed measurement is indistinguishable from a
+    /// negative one.
     Write {
         entry: WenlanMcpEntry,
         undetermined: Vec<UndeterminedInput>,
@@ -1410,44 +1242,25 @@ pub(crate) fn unresolved_message(unmeasured: &Unmeasured) -> String {
 /// binary when one was measured, a version-pinned `npx` when nothing is
 /// installed, and NOTHING AT ALL when the search could not be completed.
 ///
-/// ROUND 4, DEFECT D — the collapse this removes. `Unresolved` used to yield
-/// the same `npx` entry as `NoneInstalled`, justified as "a config entry has to
-/// be something a client can run". That justification does not survive its own
-/// scenario: a real `wenlan-mcp.exe` that is momentarily unstatable — an ACL,
-/// an antivirus lock, a disconnected network path — made the app overwrite a
-/// working local command with `npx`, which on an offline machine, or one with
-/// no Node, is precisely the entry that is NOT runnable. A guess is not more
-/// runnable than the thing it replaced; it is only less measured.
-///
-/// So `Unresolved` now maps to `PreserveExisting`, and the writers make no
-/// change and report the failure. Writing nothing cannot break a working
-/// config; writing a guess can, and did.
+/// `Unresolved` maps to `PreserveExisting` rather than to `npx`: a real
+/// `wenlan-mcp.exe` that is momentarily unstatable (an ACL, an antivirus lock,
+/// a disconnected network path) would otherwise overwrite a working local
+/// command with an entry that needs Node and a network. Writing nothing cannot
+/// break a working config; writing a guess can.
 fn wenlan_mcp_entry_for(resolution: McpBinaryResolution, npm_package: &str) -> McpEntryDecision {
     match resolution {
-        // ROUND 6, ADDITIONAL DEFECT 2 — a RELEASE ARTIFACT, not a diagnostic.
-        // This was `path.to_string_lossy().to_string()`, which never fails and
-        // therefore never reports. A real, measured-usable `wenlan-mcp` under a
-        // path that is not valid Unicode resolved as `Found`, and the command
-        // written into the user's client config was the same bytes with the
-        // unrepresentable ones replaced by U+FFFD — a DIFFERENT path, naming a
-        // file that does not exist. The client then fails to launch the server
-        // with an error pointing at a filename the user cannot find on disk.
-        //
-        // `to_str()` is the fallible version, and a path that cannot be spelled
-        // is exactly the case round 4's defect D settled: no measured answer
-        // exists, so write nothing and say why. `to_string_lossy` is still used
-        // for the MESSAGE, where an approximate spelling is what a human needs
-        // and cannot be mistaken for a command.
+        // `to_str()`, not `to_string_lossy()`: a usable binary under a path that
+        // is not valid Unicode would otherwise be written into the config with
+        // the unrepresentable bytes replaced by U+FFFD — a DIFFERENT path,
+        // naming a file that does not exist. `to_string_lossy` is still used for
+        // the MESSAGE, where an approximate spelling is what a human needs.
         McpBinaryResolution::Found { path, undetermined } => match path.to_str() {
             Some(command) => McpEntryDecision::Write {
                 entry: WenlanMcpEntry {
                     command: command.to_string(),
                     args: Vec::new(),
                 },
-                // Round 5, D4: a find does not erase an input that could not be
-                // read. Carried through so the diagnostics wire can say "this
-                // command was chosen, AND these inputs were never determined"
-                // instead of showing a clean, complete search.
+                // A find does not erase an input that could not be read.
                 undetermined,
             },
             None => {
@@ -1488,9 +1301,9 @@ fn wenlan_mcp_entry_for(resolution: McpBinaryResolution, npm_package: &str) -> M
     }
 }
 
-/// [`wenlan_mcp_decision`] against an explicit candidate tree and probe, so
-/// `wire_state`'s tests can exercise the one-pass property without the ambient
-/// machine deciding the outcome.
+/// The decision against an explicit candidate tree and probe, so `wire_state`'s
+/// tests can exercise the one-pass property without the ambient machine
+/// deciding the outcome.
 #[cfg(test)]
 pub(crate) fn wenlan_mcp_decision_for(
     home: Option<&Path>,
@@ -1507,7 +1320,7 @@ pub(crate) fn wenlan_mcp_decision_for(
 }
 
 /// The same, from inputs a test built itself -- the only way to stage an
-/// UNDETERMINED input, which is C1.4's whole subject.
+/// UNDETERMINED input.
 #[cfg(test)]
 pub(crate) fn wenlan_mcp_decision_from(
     inputs: &ResolverInputs,
@@ -1529,16 +1342,8 @@ pub(crate) fn wenlan_mcp_decision() -> (McpEntryDecision, Vec<ProbedCandidate>) 
 }
 
 /// The entry that would be written, together with every input that could not
-/// be determined while deciding it.
-///
-/// ROUND 6, D3's BOUNDARY DEFECT. `McpEntryDecision::Write` carries
-/// `undetermined` correctly — and then `wenlan_mcp_entry()` matched
-/// `Write { entry, .. }` and threw it away, so the PUBLIC result of the search
-/// was `{command, args}` either way. With a non-Unicode `WENLAN_MCP_DEV_BIN`
-/// and a readable installed binary, that result was byte-for-byte what an
-/// UNSET override produces — a measured absence — and the developer whose
-/// override was silently skipped had nothing anywhere to tell them. A vector
-/// that reaches the boundary and is dropped at it never travelled.
+/// be determined while deciding it. Both halves cross the public boundary: a
+/// vector that reaches it and is dropped at it never travelled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WenlanMcpEntryReport {
     pub entry: WenlanMcpEntry,
@@ -1584,20 +1389,12 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 /// The shapes [`write_wenlan_entry_with`] is able to write into, checked
 /// BEFORE anything is backed up or written.
 ///
-/// ROUND 6, ADDITIONAL DEFECT 1 — THE CRASH, AND IT CRASHED AFTER THE BACKUP.
 /// `root["mcpServers"][MCP_SERVER_KEY] = ..` is `serde_json`'s `IndexMut`,
 /// which PANICS — not errors — when the thing being indexed is neither an
-/// object nor null. `{"mcpServers": []}` is perfectly valid JSON: it parsed,
-/// it passed the "does the key exist" check, and then the assignment panicked
-/// with `cannot access key "wenlan" in JSON array`. Any valid non-object top
-/// level (`[]`, `"x"`, `3`) panicked one line earlier, on the insert. A panic
-/// inside a Tauri command is not an error the UI can show — the user gets a
-/// dead button and, on the `mcpServers` variant, a `.json.bak` proving
-/// something started.
-///
-/// There was no schema-error path at all, so this adds one: an unexpected
-/// shape is an ordinary `Err`, raised before the backup, and the user's file
-/// is untouched.
+/// object nor null, and a panic inside a Tauri command is not an error the UI
+/// can show. `{"mcpServers": []}` and any valid non-object top level (`[]`,
+/// `"x"`, `3`) reach it. An unexpected shape is an ordinary `Err` raised
+/// before the backup, so the user's file is untouched.
 fn check_json_config_shape(
     config_path: &std::path::Path,
     root: &serde_json::Value,
@@ -1628,26 +1425,17 @@ fn check_json_config_shape(
 /// Back the config up from the bytes that were PARSED — and only while those
 /// are still the bytes on disk.
 ///
-/// ROUND 6, D1, CONDITION 1. The backup used to be `fs::copy(config_path,
-/// backup_path)`, which RE-READS the path. Read-parse-then-back-up fixed the
-/// ordering but not the object: the copy captured whatever was at that
-/// pathname at a LATER instant than the parse. Race, on both writers — the
-/// writer reads and parses valid A; another process replaces the path with
-/// malformed B; `fs::copy` puts B on top of the last good backup; the writer
-/// then overwrites B from its stale parse of A. The one recoverable copy is
-/// destroyed and B's contents are lost, silently.
+/// Written FROM `contents` rather than by `fs::copy`, which re-reads the path
+/// at a later instant and can put a concurrently-written malformed file on top
+/// of the last good backup. And the file is re-read first: if it no longer
+/// holds those bytes the update is abandoned rather than applied from a stale
+/// parse.
 ///
-/// Two changes, one per half. The backup is WRITTEN FROM `contents`, so it can
-/// only ever hold bytes this process parsed — `fs::copy` cannot be made to
-/// promise that. And the file is re-read first: if it no longer holds those
-/// bytes, the update is abandoned rather than applied from a stale parse, so a
-/// concurrent change is reported instead of overwritten.
-///
-/// THE RESIDUAL, STATED: this narrows the window, it does not close it.
-/// Between this check and the caller's `fs::write` the file can still change,
-/// and closing that properly needs a lock this codebase does not take on
-/// another vendor's config file. What it does guarantee unconditionally is the
-/// part that was destructive: the backup is never bytes nothing parsed.
+/// THE RESIDUAL: this narrows the window, it does not close it — between this
+/// check and the caller's `fs::write` the file can still change, and closing
+/// that needs a lock this codebase does not take on another vendor's config
+/// file. What is unconditional is that the backup is never bytes nothing
+/// parsed.
 fn back_up_parsed(
     config_path: &std::path::Path,
     contents: &str,
@@ -1675,14 +1463,9 @@ fn back_up_parsed(
 }
 
 /// The message for a config file that is THERE but could not be read.
-///
-/// ROUND 6, D1, CONDITION 2. Both writers opened with `if config_path.exists()`
-/// — the two-answer API this file condemns everywhere else. `exists()` is
-/// `false` for a metadata denial as well as for an absence, so a file that
-/// permits writing but not stat-ing took the NEW-FILE branch and was
-/// TRUNCATED, with no backup, from a `json!({})` skeleton. `read_config` is
-/// the three-answer replacement, and it also removes the second instant: one
-/// read answers "is it there" and "what does it say".
+/// `exists()` is `false` for a metadata denial as well as for an absence, so a
+/// file that permits writing but not stat-ing would take the NEW-FILE branch
+/// and be TRUNCATED from a `json!({})` skeleton, with no backup.
 fn unreadable_config_message(config_path: &std::path::Path, error: &str) -> AppError {
     AppError::Generic(format!(
         "Could not read {} ({error}), so Wenlan cannot tell what is in it. Nothing was written — \
@@ -1691,16 +1474,61 @@ fn unreadable_config_message(config_path: &std::path::Path, error: &str) -> AppE
     ))
 }
 
+/// The entry a decision says to write, or its `PreserveExisting` refusal as an
+/// error. Shared by both writers, which must decide BEFORE touching anything:
+/// an unresolvable binary leaves the file exactly as it was — no rewrite, and
+/// no `.bak` either, since a backup of an unchanged file suggests a change
+/// happened.
+fn entry_to_write(
+    decision: McpEntryDecision,
+) -> Result<(WenlanMcpEntry, Vec<UndeterminedInput>), AppError> {
+    match decision {
+        McpEntryDecision::Write {
+            entry,
+            undetermined,
+        } => Ok((entry, undetermined)),
+        McpEntryDecision::PreserveExisting { unmeasured } => {
+            Err(AppError::Generic(unresolved_message(&unmeasured)))
+        }
+    }
+}
+
+/// The config file's current contents, or `None` when it is measurably absent.
+/// ONE read, three answers — see `unreadable_config_message` for the branch
+/// that `exists()` plus a separate `read_to_string` truncates.
+fn existing_config(config_path: &Path) -> Result<Option<String>, AppError> {
+    match read_config(config_path) {
+        ConfigRead::Contents(contents) => Ok(Some(contents)),
+        ConfigRead::Absent => Ok(None),
+        ConfigRead::Unreadable(error) => Err(unreadable_config_message(config_path, &error)),
+    }
+}
+
+/// The same read for the removal verbs, where an absent file is an error rather
+/// than a fresh start. `exists()` reported "No config file found" for a metadata
+/// denial too, presenting a failed look as a measured absence.
+fn config_to_remove_from(config_path: &Path) -> Result<String, AppError> {
+    match read_config(config_path) {
+        ConfigRead::Contents(contents) => Ok(contents),
+        ConfigRead::Absent => Err(AppError::Generic(
+            "No config file found — nothing to remove".into(),
+        )),
+        ConfigRead::Unreadable(error) => Err(AppError::Generic(format!(
+            "Could not read {} ({error}), so Wenlan cannot tell whether there is anything to \
+             remove. Nothing was changed.",
+            config_path.display()
+        ))),
+    }
+}
+
 /// Write the Wenlan MCP server entry into a client's config file.
 /// Existing legacy `origin` entries are preserved and still detected.
 /// If `is_claude_code` is true and the file doesn't exist, returns an error
 /// (Claude Code manages its own config file).
 ///
 /// `Ok` carries the inputs that could NOT be determined while deciding what to
-/// write (round 6, D3's boundary defect). A write that succeeded while one of
-/// its inputs went unread is not the same event as one where everything was
-/// measured, and returning `()` for both made them the same event to every
-/// caller.
+/// write: a write that succeeded while one of its inputs went unread is not the
+/// same event as one where everything was measured.
 pub fn write_wenlan_entry(
     config_path: &std::path::Path,
     is_claude_code: bool,
@@ -1719,41 +1547,13 @@ pub(crate) fn write_wenlan_entry_with(
     is_claude_code: bool,
     decision: McpEntryDecision,
 ) -> Result<Vec<UndeterminedInput>, AppError> {
-    // Decide BEFORE touching anything. An unresolvable binary must leave the
-    // file exactly as it was — no rewrite, and no `.json.bak` either, since a
-    // backup of an unchanged file is just litter that suggests a change
-    // happened. (Round 4, defect D.)
-    let (entry, undetermined) = match decision {
-        McpEntryDecision::Write {
-            entry,
-            undetermined,
-        } => (entry, undetermined),
-        McpEntryDecision::PreserveExisting { unmeasured } => {
-            return Err(AppError::Generic(unresolved_message(&unmeasured)))
-        }
-    };
-    // ONE read, three answers — `read_config`, not `exists()` plus a separate
-    // `read_to_string`. See `unreadable_config_message` for the branch that
-    // used to truncate a file it could not stat.
-    let existing = match read_config(config_path) {
-        ConfigRead::Contents(contents) => Some(contents),
-        ConfigRead::Absent => None,
-        ConfigRead::Unreadable(error) => {
-            return Err(unreadable_config_message(config_path, &error))
-        }
-    };
+    let (entry, undetermined) = entry_to_write(decision)?;
+    let existing = existing_config(config_path)?;
     let mut root = match &existing {
-        // ROUND 5, DEFECT 1 — the ordering that destroyed the user's only
-        // recoverable copy. The backup used to run BEFORE this parse, so a
-        // malformed `config.json` beside a `config.json.bak` holding the last
-        // GOOD configuration overwrote the good backup with the broken file
-        // and only then returned `Invalid JSON`.
-        //
-        // So: read, parse, CHECK THE SHAPE, build the new document, and only
-        // then back up — see `back_up_parsed`, which also fixes which BYTES
-        // the backup holds. A backup is a copy of a configuration that was
-        // understood; a copy of bytes nothing could parse is not a backup, it
-        // is the loss of one.
+        // Read, parse, CHECK THE SHAPE, build the new document, and only then
+        // back up — see `back_up_parsed`. Backing up first overwrites a
+        // `config.json.bak` holding the last GOOD configuration with a
+        // malformed `config.json` on the way to reporting `Invalid JSON`.
         Some(contents) => {
             let parsed = serde_json::from_str::<serde_json::Value>(contents).map_err(|e| {
                 AppError::Generic(format!("Invalid JSON in {}: {}", config_path.display(), e))
@@ -1784,7 +1584,7 @@ pub(crate) fn write_wenlan_entry_with(
     let formatted =
         serde_json::to_string_pretty(&root).map_err(|e| AppError::Generic(e.to_string()))?;
     // Everything that could fail has failed by now, so the backup cannot be
-    // left behind by a change that never happened (round 4, defect D).
+    // left behind by a change that never happened.
     if let Some(contents) = &existing {
         back_up_parsed(config_path, contents, "json.bak")?;
     }
@@ -1813,40 +1613,20 @@ pub(crate) fn write_wenlan_entry_toml_with(
 ) -> Result<Vec<UndeterminedInput>, AppError> {
     use toml_edit::{DocumentMut, Item, Table};
 
-    // Same ordering rule as `write_wenlan_entry`: an unresolvable binary must
-    // not produce a `.toml.bak` or a rewrite. (Round 4, defect D.)
-    let (entry, undetermined) = match decision {
-        McpEntryDecision::Write {
-            entry,
-            undetermined,
-        } => (entry, undetermined),
-        McpEntryDecision::PreserveExisting { unmeasured } => {
-            return Err(AppError::Generic(unresolved_message(&unmeasured)))
-        }
-    };
-    // Same `read_config`, same reason as `write_wenlan_entry_with`: `exists()`
-    // read a metadata denial as an absence and truncated the file.
-    let existing = match read_config(config_path) {
-        ConfigRead::Contents(contents) => Some(contents),
-        ConfigRead::Absent => None,
-        ConfigRead::Unreadable(error) => {
-            return Err(unreadable_config_message(config_path, &error))
-        }
-    };
+    let (entry, undetermined) = entry_to_write(decision)?;
+    let existing = existing_config(config_path)?;
     let mut doc: DocumentMut = match &existing {
-        // Same ordering, same reason as `write_wenlan_entry_with` (round 5,
-        // defect 1): read and parse FIRST, back up only what parsed.
+        // Same ordering as `write_wenlan_entry_with`: parse FIRST, back up only
+        // what parsed.
         Some(contents) => {
             let parsed: DocumentMut = contents.parse().map_err(|e| {
                 AppError::Generic(format!("Invalid TOML in {}: {}", config_path.display(), e))
             })?;
-            // ROUND 6, ADDITIONAL DEFECT 1, THE TOML HALF. `doc["mcp_servers"][key] = ..`
-            // is `toml_edit`'s `IndexMut`, which is `index_mut(..).expect("index
-            // not found")` — a PANIC, not an error, for any `mcp_servers` that
-            // is not table-like. `mcp_servers = 5` in a user's `config.toml`
-            // parses fine, survives the presence check, and panics on the
-            // assignment. Same class as the JSON crash, same fix: a real
-            // schema-error path, raised before any backup or write.
+            // `doc["mcp_servers"][key] = ..` is `toml_edit`'s `IndexMut`, i.e.
+            // `index_mut(..).expect("index not found")` — a PANIC for any
+            // `mcp_servers` that is not table-like. `mcp_servers = 5` parses
+            // fine and survives the presence check. Same class as the JSON
+            // crash: a schema error, raised before any backup or write.
             match parsed.get("mcp_servers") {
                 None => {}
                 Some(servers) if servers.as_table_like().is_some() => {}
@@ -1892,38 +1672,17 @@ pub(crate) fn write_wenlan_entry_toml_with(
     Ok(undetermined)
 }
 
-/// Shared body of the four JSON removal verbs below: exists-check, parse,
-/// remove every key in `keys` from `mcpServers`, then — only once a removal is
-/// certain — back the file up before writing it back, so a no-op leaves no
-/// stray `.bak`. `not_found` is the caller's nothing-was-removed message,
-/// which the UI surfaces verbatim. Every sibling server and unrelated key
-/// survives.
+/// Shared body of the JSON removal verbs below: read, parse, remove every key
+/// in `keys` from `mcpServers`, then — only once a removal is certain — back
+/// the file up before writing it back, so a no-op leaves no stray `.bak`.
+/// `not_found` is the caller's nothing-was-removed message, which the UI
+/// surfaces verbatim. Every sibling server and unrelated key survives.
 fn remove_json_keys(
     config_path: &std::path::Path,
     keys: &[&str],
     not_found: &str,
 ) -> Result<(), AppError> {
-    // ROUND 6, ADDITIONAL DEFECT 4 — the same boundary collapse as the
-    // writers. `if !config_path.exists()` reported "No config file found" for a
-    // METADATA DENIAL as well as for an absence, so a config that is right
-    // there and holds the entry the user asked to remove was presented as a
-    // measured absence — and the read was never attempted. `read_config` gives
-    // the third answer.
-    let contents = match read_config(config_path) {
-        ConfigRead::Contents(contents) => contents,
-        ConfigRead::Absent => {
-            return Err(AppError::Generic(
-                "No config file found — nothing to remove".into(),
-            ))
-        }
-        ConfigRead::Unreadable(error) => {
-            return Err(AppError::Generic(format!(
-                "Could not read {} ({error}), so Wenlan cannot tell whether there is anything to \
-                 remove. Nothing was changed.",
-                config_path.display()
-            )))
-        }
-    };
+    let contents = config_to_remove_from(config_path)?;
     let mut root = serde_json::from_str::<serde_json::Value>(&contents).map_err(|e| {
         AppError::Generic(format!("Invalid JSON in {}: {}", config_path.display(), e))
     })?;
@@ -1948,8 +1707,8 @@ fn remove_json_keys(
 
     let formatted =
         serde_json::to_string_pretty(&root).map_err(|e| AppError::Generic(e.to_string()))?;
-    // Same backup rule as the writers (round 6, D1 condition 1): written from
-    // the bytes that were parsed, and only while they are still on disk.
+    // Same backup rule as the writers: written from the bytes that were parsed,
+    // and only while they are still on disk.
     back_up_parsed(config_path, &contents, "json.bak")?;
     std::fs::write(config_path, formatted)?;
     Ok(())
@@ -1965,23 +1724,7 @@ fn remove_toml_keys(
 ) -> Result<(), AppError> {
     use toml_edit::DocumentMut;
 
-    // Same three-answer read as `remove_json_keys` (round 6, additional
-    // defect 4).
-    let contents = match read_config(config_path) {
-        ConfigRead::Contents(contents) => contents,
-        ConfigRead::Absent => {
-            return Err(AppError::Generic(
-                "No config file found — nothing to remove".into(),
-            ))
-        }
-        ConfigRead::Unreadable(error) => {
-            return Err(AppError::Generic(format!(
-                "Could not read {} ({error}), so Wenlan cannot tell whether there is anything to \
-                 remove. Nothing was changed.",
-                config_path.display()
-            )))
-        }
-    };
+    let contents = config_to_remove_from(config_path)?;
     let mut doc: DocumentMut = contents.parse().map_err(|e| {
         AppError::Generic(format!("Invalid TOML in {}: {}", config_path.display(), e))
     })?;
@@ -2014,12 +1757,9 @@ fn remove_toml_keys(
 /// client config — the inverse of `write_wenlan_entry`, and the fix for the
 /// double-registration Diagnostics surfaces (a plugin *and* a raw entry for
 /// one client). Symmetric with detection: it removes exactly the keys
-/// `has_configured_entry` recognizes, so `client_config_has_raw_entry` reads
-/// `false` afterwards. Every sibling server and unrelated key survives.
-/// A missing file, or a file with neither key present, is `Err` — there is
-/// nothing to remove, and the caller surfaces that verbatim. Backs the file
-/// up first (like `write_wenlan_entry`), but only once a removal is certain,
-/// so the no-op error path leaves no stray `.bak`.
+/// `has_configured_entry` recognizes. A missing file, or a file with neither
+/// key present, is `Err`. Backs the file up, but only once a removal is
+/// certain, so the no-op error path leaves no stray `.bak`.
 pub fn remove_wenlan_entry(config_path: &std::path::Path) -> Result<(), AppError> {
     remove_json_keys(
         config_path,
@@ -2045,11 +1785,8 @@ pub fn remove_wenlan_entry_toml(config_path: &std::path::Path) -> Result<(), App
 /// duplicate a no-plugin client (Cursor, Gemini CLI) lands in after the
 /// rename. Critically different from `remove_wenlan_entry`, which drops both
 /// keys: that is correct only where a plugin still provides the server, so
-/// applying it here would delete the client's only working connection. Every
-/// other server and unrelated key survives. A missing file, or one with no
-/// `origin` entry, is `Err` (nothing to remove) — surfaced verbatim by the
-/// caller. Backs the file up first (like `remove_wenlan_entry`), but only once
-/// a removal is certain, so the no-op error path leaves no stray `.bak`.
+/// applying it here would delete the client's only working connection. A
+/// missing file, or one with no `origin` entry, is `Err`.
 pub fn remove_legacy_origin_entry(config_path: &std::path::Path) -> Result<(), AppError> {
     remove_json_keys(
         config_path,
@@ -2075,13 +1812,9 @@ mod tests {
     use crate::test_env::EnvGuard;
 
     /// A [`Reading`] as a bool, for the many tests below that are about the
-    /// FACT and not about readability.
-    ///
-    /// `Unreadable` PANICS rather than counting as `false`. That is the whole
-    /// point of the tri-state carried into the test helper: a test whose
-    /// fixture the OS refused to read must fail loudly, never quietly pass as
-    /// "measured: no" — which is the shipped defect this round is about,
-    /// re-enacted inside the suite.
+    /// FACT and not about readability. `Unreadable` PANICS rather than counting
+    /// as `false`: a test whose fixture the OS refused to read must fail
+    /// loudly, never quietly pass as "measured: no".
     #[track_caller]
     fn yes(reading: Reading) -> bool {
         match reading {
@@ -2093,15 +1826,10 @@ mod tests {
         }
     }
 
-    /// A content question's answer as a bool, for the many tests below that are
-    /// about the FACT and not about whether the fixture parses.
-    ///
-    /// A parse failure PANICS rather than counting as `false` — the same rule
-    /// as [`yes`], and round 6's D2 is the reason it is needed here too. Before
-    /// this round these predicates returned a bare `bool` and every one of them
-    /// answered `false` for a body nothing could parse, so a fixture with a
-    /// typo in it passed a "…_false_when_no_wenlan_entry" test for the wrong
-    /// reason.
+    /// A content question's answer as a bool. A parse failure PANICS rather
+    /// than counting as `false` — same rule as [`yes`], so a fixture with a
+    /// typo in it cannot pass a `…_false_when_no_wenlan_entry` test for the
+    /// wrong reason.
     #[track_caller]
     fn parsed(answer: Result<bool, String>) -> bool {
         match answer {
@@ -2134,26 +1862,28 @@ mod tests {
         }
     }
 
+    /// Every known client's config path, by the tail each one ends in.
     #[test]
-    fn test_client_config_path_claude_desktop() {
-        let path = client_config_path("claude_desktop").unwrap();
-        assert!(path.to_string_lossy().contains("Claude"));
-        assert!(path
-            .to_string_lossy()
-            .ends_with("claude_desktop_config.json"));
-    }
-
-    #[test]
-    fn test_client_config_path_cursor() {
-        let path = client_config_path("cursor").unwrap();
-        assert!(path.to_string_lossy().contains(".cursor"));
-        assert!(path.to_string_lossy().ends_with("mcp.json"));
-    }
-
-    #[test]
-    fn test_client_config_path_claude_code() {
-        let path = client_config_path("claude_code").unwrap();
-        assert!(path.to_string_lossy().ends_with(".claude.json"));
+    fn test_client_config_path_per_client() {
+        for (client_type, tail) in [
+            (
+                "claude_desktop",
+                ["Claude", "claude_desktop_config.json"].as_slice(),
+            ),
+            ("cursor", &[".cursor", "mcp.json"]),
+            ("claude_code", &[".claude.json"]),
+            ("gemini_cli", &[".gemini", "settings.json"]),
+            ("codex_cli", &[".codex", "config.toml"]),
+        ] {
+            let path = client_config_path(client_type).unwrap();
+            let expected = tail.iter().fold(PathBuf::new(), |acc, part| acc.join(part));
+            assert!(
+                path.ends_with(&expected),
+                "{client_type} resolved to {} rather than a path ending in {}",
+                path.display(),
+                expected.display()
+            );
+        }
     }
 
     #[test]
@@ -2165,41 +1895,29 @@ mod tests {
     }
 
     #[test]
-    fn test_check_already_configured_finds_legacy_origin() {
-        let json =
-            r#"{"mcpServers": {"origin": {"command": "npx", "args": ["-y", "origin-mcp"]}}}"#;
-        assert!(parsed(has_configured_entry(json)));
+    fn test_check_already_configured() {
+        for (json, expected) in [
+            (
+                r#"{"mcpServers": {"origin": {"command": "npx", "args": ["-y", "origin-mcp"]}}}"#,
+                true,
+            ),
+            (
+                r#"{"mcpServers": {"wenlan": {"command": "npx", "args": ["-y", "wenlan-mcp"]}}}"#,
+                true,
+            ),
+            (r#"{"mcpServers": {"other-server": {}}}"#, false),
+            (r#"{"theme": "dark"}"#, false),
+        ] {
+            assert_eq!(parsed(has_configured_entry(json)), expected, "{json}");
+        }
     }
 
-    #[test]
-    fn test_check_already_configured_finds_wenlan() {
-        let json =
-            r#"{"mcpServers": {"wenlan": {"command": "npx", "args": ["-y", "wenlan-mcp"]}}}"#;
-        assert!(parsed(has_configured_entry(json)));
-    }
-
-    #[test]
-    fn test_check_already_configured_not_found() {
-        let json = r#"{"mcpServers": {"other-server": {}}}"#;
-        assert!(!parsed(has_configured_entry(json)));
-    }
-
-    #[test]
-    fn test_check_already_configured_no_mcp_servers_key() {
-        let json = r#"{"theme": "dark"}"#;
-        assert!(!parsed(has_configured_entry(json)));
-    }
-
-    /// CHANGED IN ROUND 6 WITH THE CODE IT PINNED. This test used to be
-    /// `assert!(!has_configured_entry("not json"))` — it REQUIRED a body that
-    /// could not be parsed to answer exactly what a parsed body with no entry
-    /// answers, which is D2 stated as a requirement. Its three siblings
-    /// (`*_false_on_malformed_json`, `*_false_on_malformed_toml`) required the
-    /// same thing and changed the same way.
-    ///
-    /// The property worth keeping from it is the one it was really guarding:
-    /// garbage in a config file must not panic or hang the detector. That is
-    /// still checked — the call returns — and the answer is now the honest one.
+    /// A body that could not be parsed must not answer what a parsed body with
+    /// no entry answers. The property the old `assert!(!…("not json"))` was
+    /// really guarding — garbage must not panic or hang the detector — still
+    /// holds: the call returns, and the answer is now the honest one. The
+    /// `unparseable(..)` assertions in the sibling predicates' tests below pin
+    /// the same rule for each of them.
     #[test]
     fn an_unparseable_config_is_unmeasurable_not_a_measured_absence() {
         let error = unparseable(has_configured_entry("not json"));
@@ -2217,85 +1935,59 @@ mod tests {
         );
     }
 
+    /// Matching is by the `wenlan@` prefix, never a literal marketplace name:
+    /// a fresh install writes the short form and a machine that added the old
+    /// self-hosted marketplace (deleted upstream in 048d77a8) writes the long
+    /// one, and both populations have to match.
     #[test]
-    fn test_claude_code_plugin_enabled_matches_fresh_install_prefix() {
-        // Fresh install: marketplace name is the short form.
-        let json = r#"{"enabledPlugins": {"wenlan@7xuanlu": true}}"#;
-        assert!(parsed(claude_code_plugin_enabled(json)));
+    fn test_claude_code_plugin_enabled() {
+        for (json, expected) in [
+            (r#"{"enabledPlugins": {"wenlan@7xuanlu": true}}"#, true),
+            (
+                r#"{"enabledPlugins": {"wenlan@7xuanlu-wenlan": true}}"#,
+                true,
+            ),
+            (r#"{"enabledPlugins": {"wenlan@7xuanlu": false}}"#, false),
+            (
+                r#"{"enabledPlugins": {"other-plugin@somewhere": true}}"#,
+                false,
+            ),
+            (r#"{"theme": "dark"}"#, false),
+        ] {
+            assert_eq!(parsed(claude_code_plugin_enabled(json)), expected, "{json}");
+        }
     }
 
-    #[test]
-    fn test_claude_code_plugin_enabled_matches_legacy_marketplace_name() {
-        // A machine that added the old self-hosted marketplace before it was
-        // deleted upstream (048d77a8) — must still match, since matching is
-        // by the `wenlan@` prefix, not a literal marketplace name.
-        let json = r#"{"enabledPlugins": {"wenlan@7xuanlu-wenlan": true}}"#;
-        assert!(parsed(claude_code_plugin_enabled(json)));
-    }
-
-    #[test]
-    fn test_claude_code_plugin_enabled_false_when_disabled() {
-        let json = r#"{"enabledPlugins": {"wenlan@7xuanlu": false}}"#;
-        assert!(!parsed(claude_code_plugin_enabled(json)));
-    }
-
-    #[test]
-    fn test_claude_code_plugin_enabled_false_when_no_wenlan_entry() {
-        let json = r#"{"enabledPlugins": {"other-plugin@somewhere": true}}"#;
-        assert!(!parsed(claude_code_plugin_enabled(json)));
-    }
-
-    #[test]
-    fn test_claude_code_plugin_enabled_false_when_no_enabled_plugins_key() {
-        let json = r#"{"theme": "dark"}"#;
-        assert!(!parsed(claude_code_plugin_enabled(json)));
-    }
-
-    /// CHANGED IN ROUND 6 WITH THE CODE — see
-    /// `an_unparseable_config_is_unmeasurable_not_a_measured_absence`. This one
-    /// is the case Codex's D6a is built on: a `~/.claude/settings.json` that
-    /// would not parse used to be indistinguishable from one with the plugin
-    /// switched off, and "switched off" is what licenses writing a raw entry.
+    /// A `~/.claude/settings.json` that would not parse must not be
+    /// indistinguishable from one with the plugin switched off — "switched off"
+    /// is what licenses writing a raw entry.
     #[test]
     fn an_unparseable_claude_code_settings_file_is_unmeasurable() {
         let error = unparseable(claude_code_plugin_enabled("not json"));
         assert!(error.contains("not valid JSON"), "{error}");
     }
 
+    /// Prefix matching again: `wenlan-local` is the pre-7xuanlu/wenlan#348
+    /// marketplace name and `7xuanlu-wenlan` the post-rename one.
     #[test]
-    fn test_codex_cli_plugin_enabled_matches_pre_rename_marketplace() {
-        let toml = "[plugins.\"wenlan@wenlan-local\"]\nenabled = true\n";
-        assert!(parsed(codex_cli_plugin_enabled(toml)));
+    fn test_codex_cli_plugin_enabled() {
+        for (toml, expected) in [
+            ("[plugins.\"wenlan@wenlan-local\"]\nenabled = true\n", true),
+            (
+                "[plugins.\"wenlan@7xuanlu-wenlan\"]\nenabled = true\n",
+                true,
+            ),
+            (
+                "[plugins.\"wenlan@wenlan-local\"]\nenabled = false\n",
+                false,
+            ),
+            ("[plugins.\"other@somewhere\"]\nenabled = true\n", false),
+            ("model = \"gpt-5.5\"\n", false),
+        ] {
+            assert_eq!(parsed(codex_cli_plugin_enabled(toml)), expected, "{toml}");
+        }
     }
 
-    #[test]
-    fn test_codex_cli_plugin_enabled_matches_post_rename_marketplace() {
-        // 7xuanlu/wenlan#348 renames the marketplace to match Claude's — must
-        // still match, since matching is by the `wenlan@` prefix, not a
-        // literal marketplace name.
-        let toml = "[plugins.\"wenlan@7xuanlu-wenlan\"]\nenabled = true\n";
-        assert!(parsed(codex_cli_plugin_enabled(toml)));
-    }
-
-    #[test]
-    fn test_codex_cli_plugin_enabled_false_when_disabled() {
-        let toml = "[plugins.\"wenlan@wenlan-local\"]\nenabled = false\n";
-        assert!(!parsed(codex_cli_plugin_enabled(toml)));
-    }
-
-    #[test]
-    fn test_codex_cli_plugin_enabled_false_when_no_wenlan_entry() {
-        let toml = "[plugins.\"other@somewhere\"]\nenabled = true\n";
-        assert!(!parsed(codex_cli_plugin_enabled(toml)));
-    }
-
-    #[test]
-    fn test_codex_cli_plugin_enabled_false_when_no_plugins_key() {
-        let toml = "model = \"gpt-5.5\"\n";
-        assert!(!parsed(codex_cli_plugin_enabled(toml)));
-    }
-
-    /// CHANGED IN ROUND 6 WITH THE CODE, same reason as the JSON siblings.
     #[test]
     fn an_unparseable_codex_config_is_unmeasurable() {
         let error = unparseable(codex_cli_plugin_enabled("not toml ["));
@@ -2313,45 +2005,33 @@ mod tests {
         ]}"#
     }
 
+    /// The match is on `name`, exactly. `wenlan-old` rules out a
+    /// `starts_with`/`contains` match, `Wenlan` a case-insensitive one, and the
+    /// `other-plugin`/`marketplaceName: wenlan` row rules out matching the
+    /// wrong field.
     #[test]
-    fn test_claude_desktop_plugin_enabled_true_for_exact_name() {
-        assert!(parsed(
-            claude_desktop_plugin_enabled(manifest_with_wenlan())
-        ));
+    fn test_claude_desktop_plugin_enabled() {
+        for (json, expected) in [
+            (manifest_with_wenlan(), true),
+            (
+                r#"{"plugins": [{"id": "p1", "name": "wenlan-old", "marketplaceName": "wenlan"}]}"#,
+                false,
+            ),
+            (
+                r#"{"plugins": [{"id": "p1", "name": "other-plugin", "marketplaceName": "wenlan"}]}"#,
+                false,
+            ),
+            (r#"{"plugins": [{"id": "p1", "name": "Wenlan"}]}"#, false),
+            (r#"{"lastUpdated": 1}"#, false),
+        ] {
+            assert_eq!(
+                parsed(claude_desktop_plugin_enabled(json)),
+                expected,
+                "{json}"
+            );
+        }
     }
 
-    #[test]
-    fn test_claude_desktop_plugin_enabled_false_for_similar_name() {
-        // Guards against a `starts_with`/`contains` match instead of exact
-        // equality: "wenlan-old" must not count as "wenlan".
-        let json =
-            r#"{"plugins": [{"id": "p1", "name": "wenlan-old", "marketplaceName": "wenlan"}]}"#;
-        assert!(!parsed(claude_desktop_plugin_enabled(json)));
-    }
-
-    #[test]
-    fn test_claude_desktop_plugin_enabled_false_when_only_marketplace_name_matches() {
-        // The entry's `name` is "other-plugin"; only `marketplaceName` says
-        // "wenlan". Matching the wrong field would false-positive here.
-        let json =
-            r#"{"plugins": [{"id": "p1", "name": "other-plugin", "marketplaceName": "wenlan"}]}"#;
-        assert!(!parsed(claude_desktop_plugin_enabled(json)));
-    }
-
-    #[test]
-    fn test_claude_desktop_plugin_enabled_false_case_mismatch() {
-        let json = r#"{"plugins": [{"id": "p1", "name": "Wenlan"}]}"#;
-        assert!(!parsed(claude_desktop_plugin_enabled(json)));
-    }
-
-    #[test]
-    fn test_claude_desktop_plugin_enabled_false_when_no_plugins_key() {
-        assert!(!parsed(claude_desktop_plugin_enabled(
-            r#"{"lastUpdated": 1}"#
-        )));
-    }
-
-    /// CHANGED IN ROUND 6 WITH THE CODE, same reason as the siblings.
     #[test]
     fn an_unparseable_desktop_manifest_is_unmeasurable() {
         let error = unparseable(claude_desktop_plugin_enabled("not json"));
@@ -2375,12 +2055,9 @@ mod tests {
         );
     }
 
-    /// CHANGED IN ROUND 6 WITH THE CODE. This required a malformed
-    /// `config.json` to answer `None` — the same value a file that parsed and
-    /// pinned no account answers — and the caller turned that `None` into
-    /// `Reading::No`, i.e. "Claude Desktop does not have the Wenlan plugin".
     /// The account id names the sessions directory, so an unparseable
-    /// `config.json` means the manifest scan never happened at all.
+    /// `config.json` means the manifest scan never happened at all — which must
+    /// not answer the `None` that a file pinning no account answers.
     #[test]
     fn an_unparseable_desktop_config_cannot_answer_which_account_is_pinned() {
         let error = claude_desktop_account_id("not json")
@@ -2550,16 +2227,11 @@ mod tests {
     }
 
     /// Live-machine sanity check, not part of the default gating suite (this
-    /// machine's Claude Desktop state is not portable to CI or other dev
-    /// machines) — run explicitly with `cargo test --lib -- --ignored
-    /// claude_desktop_detected_via_real_plugin_manifest`. This machine's
-    /// `rpm/manifest.json`, under the account pinned by
-    /// `~/Library/Application Support/Claude/config.json`, lists a plugin
-    /// named "wenlan" (verified by hand before writing this test). If
-    /// `detect_mcp_clients`'s `claude_desktop` branch is ever severed from
-    /// `claude_desktop_plugin_enabled_on_disk`, this is the one test in this
-    /// file that will catch it — everything else here exercises the logic
-    /// against a fake `support_dir`, never the real one.
+    /// machine's Claude Desktop state is not portable to CI) — run explicitly
+    /// with `cargo test --lib -- --ignored`. It is the one test here that runs
+    /// against the REAL support dir, so it is the only one that catches
+    /// `detect_mcp_clients`'s `claude_desktop` branch being severed from
+    /// `claude_desktop_plugin_enabled_on_disk`.
     #[test]
     #[ignore]
     fn claude_desktop_detected_via_real_plugin_manifest() {
@@ -2583,17 +2255,10 @@ mod tests {
     }
 
     /// Write a fixture that is plausibly a program: non-empty, and on Unix
-    /// carrying the execute bit.
-    ///
-    /// ROUND 4, DEFECT E, THE TEST HALF. These fixtures used to be
-    /// `std::fs::write(path, b"")` — ZERO BYTES — and the assertions below
-    /// certified them as the resolved `wenlan-mcp` binary. The test encoded the
-    /// defect as the expected behaviour: a probe that answers `File` for an
-    /// empty file is a probe that will write an unrunnable command into a real
-    /// user's client config, and every test agreed that was correct.
-    ///
-    /// `MZ` is the DOS/PE signature; nothing here parses it, it is simply
-    /// honest fixture content rather than nothing at all.
+    /// carrying the execute bit. A zero-byte fixture would be certified as the
+    /// resolved binary by a probe that only checks `is_file()`, so the fixture
+    /// has to be able to tell the two apart. `MZ` is the DOS/PE signature;
+    /// nothing here parses it.
     fn write_binary_fixture(path: &Path) {
         std::fs::write(path, b"MZ\x90\x00 wenlan-mcp test fixture\n").unwrap();
         #[cfg(unix)]
@@ -2626,10 +2291,9 @@ mod tests {
     }
 
     /// The entry the app writes into client configs must be the installed
-    /// binary whenever one exists. `npx` here is a failure, not an
-    /// alternative: it is a network dependency and a version-skew hazard, and
-    /// it is exactly what a Windows install got while the candidate paths
-    /// carried no `.exe` suffix. This test used to accept either answer.
+    /// binary whenever one exists. `npx` here is a failure, not an alternative:
+    /// it is a network dependency and a version-skew hazard, and it is what a
+    /// Windows install gets when the candidate paths carry no `.exe` suffix.
     #[test]
     #[serial_test::serial]
     fn wenlan_mcp_entry_takes_the_installed_binary_over_npx() {
@@ -2640,10 +2304,8 @@ mod tests {
         std::env::set_var(MCP_RESOLVER_HOME_ENV, tmp.path());
 
         let report = wenlan_mcp_entry().expect("a readable installed binary resolves");
-        // Round 6, D3's boundary defect: an empty `undetermined` is itself a
-        // measurement — every resolver input was read. This fixture determines
-        // all three, so the report has to SAY that rather than have nowhere to
-        // say it.
+        // An empty `undetermined` is itself a measurement: every resolver input
+        // was read. This fixture determines all three.
         assert!(
             report.undetermined.is_empty(),
             "nothing was undetermined in this fixture: {:?}",
@@ -2820,18 +2482,11 @@ mod tests {
         );
     }
 
-    /// C1.4, AND IT IS THE SHIPPED-USER ONE. Round 4 hardened the tri-state at
-    /// the PROBE and left it collapsing one layer upstream, at candidate
-    /// CONSTRUCTION: `dirs::home_dir()` answering `None`, `current_exe()`
-    /// failing, and a non-Unicode `WENLAN_MCP_DEV_BIN` were all flattened into
-    /// `None` by `Option`/`.ok()`. The candidates that hang off those inputs
-    /// were then never built, never probed, and never appeared in the trail --
-    /// and a search that had looked at NOTHING could end in `NoneInstalled`
-    /// and write `npx` over a user's working local command.
-    ///
-    /// The probe here panics if it is ever called, which states the fixture
-    /// exactly: no candidate path exists to probe, because none could be
-    /// constructed. The answer must still not be "nothing is installed".
+    /// An input that could not be determined builds no candidate, so a search
+    /// that looked at NOTHING must still not end in `NoneInstalled` and write
+    /// `npx` over a user's working local command. The probe here panics if it
+    /// is ever called, which states the fixture exactly: there is no candidate
+    /// path to probe.
     #[test]
     fn an_input_that_could_not_be_determined_is_never_none_installed() {
         let never_probed = |path: &Path| -> CandidateProbe {
@@ -2904,20 +2559,12 @@ mod tests {
         );
     }
 
-    /// ROUND 5, DEFECT D4 — a `Found` short-circuited the undetermined inputs
-    /// out of existence.
-    ///
-    /// `inputs.undetermined()` was consulted only in the resolver's EMPTY
-    /// branch, so the moment any candidate probed as a file the failed input
-    /// stopped being reported. It could not even be inferred from the trail:
-    /// an input that could not be determined builds no candidate path, so it
-    /// has no trail row to be missing from — a three-row trail beside a chosen
-    /// command looks exactly like a complete search.
-    ///
-    /// This is Codex's stated input verbatim: `home` determined, `dev_bin`
-    /// undetermined ("not valid Unicode"), `exe_dir` not set, and a real file
-    /// under `home`. The developer's override was silently skipped; the only
-    /// question is whether anything says so.
+    /// A `Found` must not short-circuit the undetermined inputs out of
+    /// existence. It cannot be inferred from the trail either: an undetermined
+    /// input builds no candidate path, so a three-row trail beside a chosen
+    /// command looks exactly like a complete search. Fixture: `home`
+    /// determined, `dev_bin` undetermined, `exe_dir` not set, real file under
+    /// `home`.
     #[test]
     fn a_found_binary_still_reports_an_input_that_could_not_be_read() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2934,10 +2581,8 @@ mod tests {
             McpBinaryResolution::Found { path, undetermined } => {
                 // Compared as filesystem objects, not as strings: the resolver
                 // spells this `<home>\.wenlan/bin/wenlan-mcp.exe` (a literal
-                // `/`-joined tail) while the fixture spells it with separators
-                // — the same file, two spellings. That difference is Codex's
-                // third residual (per-spelling, not per-object, deduplication)
-                // and is out of scope here; the test must not depend on it.
+                // `/`-joined tail) while the fixture uses platform separators —
+                // the same file, two spellings.
                 assert_eq!(
                     std::fs::canonicalize(path).unwrap(),
                     std::fs::canonicalize(&installed).unwrap()
@@ -2997,10 +2642,9 @@ mod tests {
         }
     }
 
-    /// The other half of C1.4: the classification itself. `.ok()` on
-    /// `env::var` and on `current_exe()` is what erased the difference between
-    /// "not set" and "could not be read", so the arms are pinned here directly
-    /// rather than through whatever the host process happens to have.
+    /// The classification itself: `.ok()` on `env::var` and `current_exe()`
+    /// erases the difference between "not set" and "could not be read", so the
+    /// arms are pinned directly rather than through the host process.
     #[test]
     fn a_read_that_failed_is_not_an_input_that_is_absent() {
         let determined = ResolverInputs::from_reads(
@@ -3037,33 +2681,24 @@ mod tests {
         );
     }
 
-    /// C1.6. The candidate list is four SLOTS and two of them can name the same
-    /// FILE -- `WENLAN_MCP_DEV_BIN` pointed at the installed binary is the
-    /// ordinary developer setup. Probing that file twice is two instants, so
-    /// the trail could carry the same path as both `file` and `unreadable`,
-    /// contradicting itself and the command printed beside it. One reading per
-    /// filesystem object; both slots still shown, sharing it.
+    /// The candidate list is four SLOTS and two of them can name the same FILE
+    /// -- `WENLAN_MCP_DEV_BIN` pointed at the installed binary is the ordinary
+    /// developer setup. Probing that file twice is two instants, so the trail
+    /// could carry the same path as both `file` and `unreadable`, contradicting
+    /// itself and the command printed beside it. One reading per filesystem
+    /// object; both slots still shown, sharing it.
     #[test]
     fn the_same_file_named_by_two_slots_is_probed_once() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         let installed = install_wenlan_mcp_into(home);
-        // ROUND 6, ADDITIONAL DEFECT 3 — THE FALSE-GREEN CONTROL. This fixture
-        // used to pass `installed.to_str()` as the dev override: the SAME
-        // SPELLING, twice. `HashMap<PathBuf, _>` keys on pathname equality, so
-        // the test passed by construction and could not fail for the reason
-        // its own name states — it measured "one reading per vector entry
-        // spelled identically", not "one reading per FILESYSTEM OBJECT".
-        //
-        // Two spellings, one file: the ordinary developer case of an override
-        // built by walking a directory back (`$bin/../bin/wenlan-mcp`).
-        //
-        // It has to be `..` rather than `.`: `Path`'s `Eq` and `Hash` both run
-        // over `components()`, which DROPS a `CurDir` component, so `a/./b`
-        // already hashes equal to `a/b` and would have passed against the old
-        // pathname-keyed map. `ParentDir` components are kept, so these two are
-        // genuinely different keys — asserted below, so the fixture cannot
-        // silently decay back into the one that could not fail.
+        // Two SPELLINGS, one file: the ordinary developer case of an override
+        // built by walking a directory back (`$bin/../bin/wenlan-mcp`). It has
+        // to be `..` rather than `.`: `Path`'s `Eq` and `Hash` run over
+        // `components()`, which DROPS a `CurDir` component, so `a/./b` already
+        // hashes equal to `a/b` and would pass against a pathname-keyed map.
+        // `ParentDir` components are kept — asserted below, so the fixture
+        // cannot decay back into one that could not fail.
         let walked = home
             .join(".wenlan")
             .join("bin")
@@ -3125,16 +2760,11 @@ mod tests {
         assert_eq!(written_entry(decision).command, walked.to_str().unwrap());
     }
 
-    /// DEFECT E. `metadata.is_file()` is a FILE witness, not an EXECUTABLE
-    /// witness, and the resolver hands its winner to a client as a command to
-    /// run. A zero-byte file is not a program on any operating system, and this
-    /// is the check that says so — the same check whose absence let the FIXTURES
-    /// in this file certify `b""` as the installed binary.
-    ///
-    /// It must reach the resolver, not just the probe: a `NotExecutable`
-    /// candidate is measured-unusable, so the search moves on and — with no
-    /// unreadable candidate anywhere — ends in the MEASURED `NoneInstalled`,
-    /// never `Unresolved`. Nothing failed; the answer is just no.
+    /// A zero-byte file is not a program on any operating system. The rule must
+    /// reach the resolver, not just the probe: a `NotExecutable` candidate is
+    /// measured-unusable, so the search moves on and — with no unreadable
+    /// candidate anywhere — ends in the MEASURED `NoneInstalled`, never
+    /// `Unresolved`. Nothing failed; the answer is just no.
     #[test]
     fn an_empty_file_is_never_resolved_as_the_binary() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3332,12 +2962,8 @@ mod tests {
         assert!(entry.args.is_empty());
     }
 
-    /// DEFECT D, at the decision. `Unresolved` used to produce the SAME `npx`
-    /// entry as `NoneInstalled` — a measured absence manufactured out of a
-    /// failed look. The third value existed and was discarded one function
-    /// later, which is the exact shape Codex's round-3 review named.
-    ///
-    /// It must now be "write nothing". `npx` is not a safe default: it needs
+    /// At the decision: `Unresolved` must be "write nothing", not the `npx`
+    /// entry `NoneInstalled` produces. `npx` is not a safe default — it needs
     /// Node and a network, and the user whose local binary was momentarily
     /// unstatable has neither guaranteed.
     #[test]
@@ -3369,14 +2995,10 @@ mod tests {
         }
     }
 
-    /// DEFECT D, at the mutation. The scenario Codex described end to end: a
-    /// user HAS a local `wenlan-mcp` in a client config, and the candidate is
-    /// momentarily unstatable (ACL, antivirus, disconnected network path).
-    /// Rewriting that config to `npx` breaks an offline machine, or one with no
-    /// Node, that was working a second earlier.
-    ///
-    /// The file must come back BYTE-IDENTICAL, and no `.bak` may be left
-    /// either: a backup implies a change happened.
+    /// At the mutation: a user HAS a local `wenlan-mcp` in a client config and
+    /// the candidate is momentarily unstatable (ACL, antivirus, disconnected
+    /// network path). The file must come back BYTE-IDENTICAL, and no `.bak` may
+    /// be left either — a backup implies a change happened.
     #[test]
     fn an_unreadable_candidate_leaves_an_existing_config_untouched() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3445,20 +3067,12 @@ mod tests {
         }
     }
 
-    /// ROUND 5, DEFECT 1 — the writers destroyed the user's only recoverable
-    /// copy on the way to reporting the problem.
-    ///
-    /// The scenario is the ordinary one: `config.json` got corrupted (a crash
-    /// mid-write, a bad hand-edit) and `config.json.bak` still holds the last
-    /// GOOD configuration — which is exactly what a `.bak` is for. The writer
-    /// copied the current file over the backup FIRST and only then read and
-    /// parsed it, so the malformed bytes landed on top of the good ones and
-    /// the call returned `Invalid JSON`. The recovery copy was gone at the one
-    /// moment it mattered.
-    ///
-    /// The old tests could not see this: they asserted `is_err()`, and the
-    /// destructive path returns exactly the same `Err`. The assertion that
-    /// separates the two is on the BACKUP's bytes, not on the return value.
+    /// `config.json` is corrupted (a crash mid-write, a bad hand-edit) and
+    /// `config.json.bak` still holds the last GOOD configuration. Backing up
+    /// before parsing lands the malformed bytes on top of the good ones and
+    /// then returns `Invalid JSON`, destroying the recovery copy at the one
+    /// moment it mattered. The assertion that catches that is on the BACKUP's
+    /// bytes; `is_err()` is the same either way.
     #[test]
     fn a_malformed_config_does_not_overwrite_the_last_good_backup() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3488,8 +3102,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), malformed);
     }
 
-    /// Same defect, same fix, in the Codex TOML writer — Codex's review named
-    /// both, and a fix to one of two identical orderings is half a fix.
+    /// The same rule in the Codex TOML writer — a fix to one of two identical
+    /// orderings is half a fix.
     #[test]
     fn a_malformed_toml_config_does_not_overwrite_the_last_good_backup() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3549,10 +3163,8 @@ mod tests {
     fn test_write_wenlan_entry_creates_new_file() {
         let _env = EnvGuard::capture(&[MCP_RESOLVER_HOME_ENV, "WENLAN_MCP_DEV_BIN"]);
         let tmp = tempfile::tempdir().unwrap();
-        // Stand up the install the resolver is supposed to find, so the
-        // written command is decided by the fixture and not by whatever this
-        // host happens to have. The old "npx or a path" assertion passed on
-        // both answers, which is why it never saw the missing `.exe` suffix.
+        // Stand up the install the resolver is supposed to find, so the written
+        // command is decided by the fixture rather than by this host.
         let installed = install_wenlan_mcp_into(tmp.path());
         std::env::remove_var("WENLAN_MCP_DEV_BIN");
         std::env::set_var(MCP_RESOLVER_HOME_ENV, tmp.path());
@@ -3561,10 +3173,9 @@ mod tests {
         write_wenlan_entry(&config_path, false).unwrap();
         let contents = std::fs::read_to_string(&config_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
-        // `.entry`, not the whole report: the report's `undetermined` half is
-        // for the caller, and must never be written into the user's config
-        // file (round 6, D3 — the report type exists precisely so the entry
-        // shape written to disk stays exactly `{command, args}`).
+        // `.entry`, not the whole report: `undetermined` is for the caller and
+        // must never reach the user's config file, whose entry shape stays
+        // exactly `{command, args}`.
         assert_eq!(
             parsed["mcpServers"]["wenlan"],
             serde_json::to_value(wenlan_mcp_entry().unwrap().entry).unwrap()
@@ -3579,46 +3190,36 @@ mod tests {
         assert!(parsed["mcpServers"]["origin"].is_null());
     }
 
+    /// The entry is added and nothing else in the file moves: a sibling server,
+    /// a legacy `origin` entry (preserved, not replaced), and an unrelated
+    /// top-level key. `mcpServers` is created when it is not there.
     #[test]
-    fn test_write_wenlan_entry_preserves_existing_servers() {
+    fn test_write_wenlan_entry_preserves_everything_else() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.json");
-        let existing = r#"{"mcpServers": {"other": {"command": "other-cmd"}}}"#;
-        std::fs::write(&config_path, existing).unwrap();
-        write_wenlan_entry(&config_path, false).unwrap();
-        let contents = std::fs::read_to_string(&config_path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
-        assert!(parsed["mcpServers"]["other"].is_object());
-        assert!(parsed["mcpServers"]["wenlan"].is_object());
-    }
-
-    #[test]
-    fn test_write_wenlan_entry_preserves_legacy_origin_entry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.json");
-        let existing =
-            r#"{"mcpServers": {"origin": {"command": "npx", "args": ["-y", "origin-mcp"]}}}"#;
-        std::fs::write(&config_path, existing).unwrap();
-        write_wenlan_entry(&config_path, false).unwrap();
-        let contents = std::fs::read_to_string(&config_path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
-        assert_eq!(
-            parsed["mcpServers"]["origin"]["args"],
-            serde_json::json!(["-y", "origin-mcp"])
-        );
-        assert!(parsed["mcpServers"]["wenlan"].is_object());
-    }
-
-    #[test]
-    fn test_write_wenlan_entry_creates_mcp_servers_key() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.json");
-        std::fs::write(&config_path, r#"{"theme": "dark"}"#).unwrap();
-        write_wenlan_entry(&config_path, false).unwrap();
-        let contents = std::fs::read_to_string(&config_path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
-        assert_eq!(parsed["theme"], "dark");
-        assert!(parsed["mcpServers"]["wenlan"].is_object());
+        for (i, (existing, pointer, preserved)) in [
+            (
+                r#"{"mcpServers": {"other": {"command": "other-cmd"}}}"#,
+                "/mcpServers/other/command",
+                serde_json::json!("other-cmd"),
+            ),
+            (
+                r#"{"mcpServers": {"origin": {"command": "npx", "args": ["-y", "origin-mcp"]}}}"#,
+                "/mcpServers/origin/args",
+                serde_json::json!(["-y", "origin-mcp"]),
+            ),
+            (r#"{"theme": "dark"}"#, "/theme", serde_json::json!("dark")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let config_path = tmp.path().join(format!("config{i}.json"));
+            std::fs::write(&config_path, existing).unwrap();
+            write_wenlan_entry(&config_path, false).unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+            assert_eq!(parsed.pointer(pointer), Some(&preserved), "{existing}");
+            assert!(parsed["mcpServers"]["wenlan"].is_object(), "{existing}");
+        }
     }
 
     #[test]
@@ -3631,15 +3232,26 @@ mod tests {
         assert!(backup.exists());
         let backup_contents = std::fs::read_to_string(&backup).unwrap();
         assert!(backup_contents.contains("original"));
+
+        // The Codex TOML writer takes the same backup.
+        let toml_path = tmp.path().join("config.toml");
+        std::fs::write(&toml_path, "model = \"gpt-5.5\"\n").unwrap();
+        write_wenlan_entry_toml(&toml_path).unwrap();
+        assert!(std::fs::read_to_string(tmp.path().join("config.toml.bak"))
+            .unwrap()
+            .contains("gpt-5.5"));
     }
 
     #[test]
-    fn test_write_wenlan_entry_errors_on_invalid_json() {
+    fn test_write_wenlan_entry_errors_on_an_unparseable_config() {
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("config.json");
         std::fs::write(&config_path, "not valid json").unwrap();
-        let result = write_wenlan_entry(&config_path, false);
-        assert!(result.is_err());
+        assert!(write_wenlan_entry(&config_path, false).is_err());
+
+        let toml_path = tmp.path().join("config.toml");
+        std::fs::write(&toml_path, "not toml [").unwrap();
+        assert!(write_wenlan_entry_toml(&toml_path).is_err());
     }
 
     #[test]
@@ -3651,42 +3263,26 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_client_config_path_gemini_cli() {
-        let path = client_config_path("gemini_cli").unwrap();
-        assert!(path.ends_with(Path::new(".gemini").join("settings.json")));
-    }
-
-    #[test]
-    fn test_client_config_path_codex_cli() {
-        let path = client_config_path("codex_cli").unwrap();
-        assert!(path.ends_with(Path::new(".codex").join("config.toml")));
-    }
-
     /// `exists` that answers true for exactly one path — so a test failure
     /// means the probed path is wrong, not merely that some boolean was false.
     fn only(hit: &str) -> impl Fn(&Path) -> Reading + '_ {
         move |p: &Path| Reading::of(p == Path::new(hit))
     }
 
+    /// Both ChatGPT desktop bundle locations count. A typo in either candidate
+    /// path fails here rather than surfacing as a missing `codex_cli` row.
     #[test]
-    fn codex_cli_detected_finds_chatgpt_in_applications() {
+    fn codex_cli_detected_finds_chatgpt_in_either_applications_dir() {
         let home = PathBuf::from("/Users/someone");
-        assert!(yes(codex_cli_detected(
-            Reading::No,
-            Some(&home),
-            only("/Applications/ChatGPT.app")
-        )));
-    }
-
-    #[test]
-    fn codex_cli_detected_finds_chatgpt_in_user_applications() {
-        let home = PathBuf::from("/Users/someone");
-        assert!(yes(codex_cli_detected(
-            Reading::No,
-            Some(&home),
-            only("/Users/someone/Applications/ChatGPT.app")
-        )));
+        for bundle in [
+            "/Applications/ChatGPT.app",
+            "/Users/someone/Applications/ChatGPT.app",
+        ] {
+            assert!(
+                yes(codex_cli_detected(Reading::No, Some(&home), only(bundle))),
+                "{bundle} was not probed"
+            );
+        }
     }
 
     #[test]
@@ -3735,16 +3331,12 @@ mod tests {
         );
     }
 
-    // ── Round 5, defect 4: tri-state client detection ────────────────────
+    // ── Tri-state client detection ───────────────────────────────────────
 
-    /// A path that could not be built is not a client that is absent.
-    ///
-    /// `client_config_path` opened with `let home = dirs::home_dir()?;` — ONE
-    /// `?` that turned every client's path into `None` when that lookup failed,
-    /// `claude_desktop` included, whose path is built from the CONFIG dir and
-    /// never touches `home`. Both halves are pinned here: the home-based
-    /// clients report the failure, and the one that does not need home is
-    /// unaffected by it.
+    /// A path that could not be built is not a client that is absent. Both
+    /// halves are pinned: the home-based clients report the failure, and
+    /// `claude_desktop` — whose path is built from the CONFIG dir and never
+    /// touches `home` — is unaffected by it.
     #[test]
     fn a_home_that_could_not_be_determined_is_not_a_missing_client() {
         let config_dir = PathBuf::from("/tmp/fixture-config");
@@ -3765,11 +3357,9 @@ mod tests {
         );
     }
 
-    /// THE STARKEST CASE. With no home and no config dir, every client's path
-    /// was `None`, `filter_map` dropped every row, and `detect_mcp_clients`
-    /// returned an EMPTY VECTOR — which the Diagnostics card renders as "no MCP
-    /// client detected" and the wizard as nothing to set up. A lookup that
-    /// failed became a confident statement about the user's whole machine.
+    /// With no home and no config dir, an EMPTY VECTOR renders as "no MCP
+    /// client detected" in the Diagnostics card and as nothing to set up in the
+    /// wizard — a lookup that failed, stated as a fact about the machine.
     #[test]
     fn a_search_that_could_not_look_is_never_an_empty_client_list() {
         let clients = detect_mcp_clients_from(None, None, |_| Reading::No);
@@ -3797,18 +3387,14 @@ mod tests {
         }
     }
 
-    /// Codex's own scenario: a `~/.claude/settings.json` the OS will not hand
-    /// over. It used to answer `false` through
-    /// `read_to_string(..).map(..).unwrap_or(false)` — byte-identical to a
-    /// settings file that is perfectly readable and has the plugin switched
-    /// OFF. The user is then invited to configure a client that may already be
-    /// configured, which is the double registration this app has a warning box
-    /// for.
+    /// A `~/.claude/settings.json` the OS will not hand over must not read as a
+    /// readable settings file with the plugin switched OFF, or the user is
+    /// invited into the double registration this app has a warning box for.
     ///
-    /// The unreadable file is staged as a DIRECTORY at the settings path: it is
-    /// the one read failure that reproduces on every platform (Windows answers
-    /// `Access is denied`, Unix `EISDIR`), and a chmod-based fixture would be
-    /// a no-op on Windows, which is where this app most needs the distinction.
+    /// Staged as a DIRECTORY at the settings path: the one read failure that
+    /// reproduces on every platform (Windows `Access is denied`, Unix
+    /// `EISDIR`). A chmod-based fixture is a no-op on Windows, which is where
+    /// this app most needs the distinction.
     #[test]
     fn a_settings_file_that_could_not_be_read_is_not_a_plugin_that_is_off() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3831,7 +3417,7 @@ mod tests {
         }
 
         // And a home that could not be determined is not a plugin that is off
-        // either — the `dirs::home_dir()` guard used to `return false`.
+        // either: the `dirs::home_dir()` guard must not `return false`.
         match claude_code_plugin_enabled_on_disk(None) {
             Reading::Unreadable { error } => assert!(error.contains("home directory")),
             other => panic!("an undetermined home reported {other:?}"),
@@ -3840,7 +3426,7 @@ mod tests {
 
     /// The same collapse on the client's own config file, end to end through
     /// `detect_mcp_clients_from`: a `~/.gemini/settings.json` that cannot be
-    /// read used to report exactly like one with no Wenlan entry.
+    /// read must not report exactly like one with no Wenlan entry.
     #[test]
     fn a_config_that_could_not_be_read_is_not_a_config_without_an_entry() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3954,11 +3540,6 @@ mod tests {
             "[mcp_servers.other]\ncommand = \"x\"\n"
         )));
         assert!(!parsed(has_configured_entry_toml("model = \"gpt-5.5\"\n")));
-        // CHANGED IN ROUND 6 WITH THE CODE: this line was
-        // `assert!(!has_configured_entry_toml("not toml ["))`, which required
-        // an unparseable `config.toml` to answer what a parsed one with no
-        // entry answers. Codex CLI's row is the one that then reads
-        // `already_configured = No`.
         assert!(unparseable(has_configured_entry_toml("not toml [")).contains("not valid TOML"));
     }
 
@@ -4023,27 +3604,6 @@ args = ["--flag"]
         assert_eq!(first, second);
     }
 
-    #[test]
-    fn test_write_wenlan_entry_toml_creates_backup() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.toml");
-        std::fs::write(&config_path, "model = \"gpt-5.5\"\n").unwrap();
-        write_wenlan_entry_toml(&config_path).unwrap();
-        let backup = tmp.path().join("config.toml.bak");
-        assert!(backup.exists());
-        assert!(std::fs::read_to_string(&backup)
-            .unwrap()
-            .contains("gpt-5.5"));
-    }
-
-    #[test]
-    fn test_write_wenlan_entry_toml_errors_on_invalid_toml() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.toml");
-        std::fs::write(&config_path, "not toml [").unwrap();
-        assert!(write_wenlan_entry_toml(&config_path).is_err());
-    }
-
     // ── remove_wenlan_entry (JSON) ──────────────────────────────────────
 
     #[test]
@@ -4063,67 +3623,90 @@ args = ["--flag"]
         assert_eq!(parsed["mcpServers"]["other"]["command"], "other-cmd");
     }
 
+    /// Both keys the verb recognizes come out, and everything else — an
+    /// unrelated top-level key included — stays.
     #[test]
-    fn test_remove_wenlan_entry_preserves_unrelated_structure() {
+    fn test_remove_wenlan_entry_removes_both_keys_and_keeps_the_rest() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.json");
-        let existing = r#"{"theme": "dark", "mcpServers": {"wenlan": {"command": "npx"}}}"#;
-        std::fs::write(&config_path, existing).unwrap();
-
-        remove_wenlan_entry(&config_path).unwrap();
-
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(parsed["theme"], "dark");
-        assert!(parsed["mcpServers"]["wenlan"].is_null());
+        for (i, (existing, gone)) in [
+            (
+                r#"{"theme": "dark", "mcpServers": {"wenlan": {"command": "npx"}}}"#,
+                "wenlan",
+            ),
+            (
+                r#"{"theme": "dark", "mcpServers": {"origin": {"command": "npx", "args": ["-y", "origin-mcp"]}}}"#,
+                "origin",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let config_path = tmp.path().join(format!("config{i}.json"));
+            std::fs::write(&config_path, existing).unwrap();
+            remove_wenlan_entry(&config_path).unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+            assert!(parsed["mcpServers"][gone].is_null(), "{existing}");
+            assert_eq!(parsed["theme"], "dark", "{existing}");
+        }
     }
 
+    /// Nothing to remove is an `Err`, for both formats and for both shapes of
+    /// nothing — and the no-op error path leaves no stray `.bak` behind.
     #[test]
-    fn test_remove_wenlan_entry_removes_legacy_origin() {
+    fn test_remove_wenlan_entry_errs_when_there_is_nothing_to_remove() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.json");
-        let existing =
-            r#"{"mcpServers": {"origin": {"command": "npx", "args": ["-y", "origin-mcp"]}}}"#;
-        std::fs::write(&config_path, existing).unwrap();
+        type Remove = fn(&std::path::Path) -> Result<(), AppError>;
+        for (remove, name, no_entry, bak) in [
+            (
+                remove_wenlan_entry as Remove,
+                "config.json",
+                r#"{"mcpServers": {"other": {}}}"#,
+                "json.bak",
+            ),
+            (
+                remove_wenlan_entry_toml as Remove,
+                "config.toml",
+                "model = \"gpt-5.5\"\n",
+                "toml.bak",
+            ),
+        ] {
+            let config_path = tmp.path().join(name);
+            std::fs::write(&config_path, no_entry).unwrap();
+            assert!(remove(&config_path).is_err(), "{name}");
+            assert!(!config_path.with_extension(bak).exists(), "{name}");
 
-        remove_wenlan_entry(&config_path).unwrap();
-
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert!(parsed["mcpServers"]["origin"].is_null());
+            let missing = tmp.path().join(format!("does-not-exist-{name}"));
+            assert!(remove(&missing).is_err(), "{name}");
+        }
     }
 
-    #[test]
-    fn test_remove_wenlan_entry_errs_when_no_entry_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.json");
-        std::fs::write(&config_path, r#"{"mcpServers": {"other": {}}}"#).unwrap();
-        assert!(remove_wenlan_entry(&config_path).is_err());
-        // No-op error path leaves no stray backup behind.
-        assert!(!config_path.with_extension("json.bak").exists());
-    }
-
-    #[test]
-    fn test_remove_wenlan_entry_errs_when_file_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("does-not-exist.json");
-        assert!(remove_wenlan_entry(&config_path).is_err());
-    }
-
+    /// Removal is symmetric with detection: the written file still parses and
+    /// `client_config_has_raw_entry` no longer sees an entry.
     #[test]
     fn test_remove_wenlan_entry_leaves_client_config_has_raw_entry_false() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.json");
-        let existing =
-            r#"{"mcpServers": {"wenlan": {"command": "npx"}, "other": {"command": "x"}}}"#;
-        std::fs::write(&config_path, existing).unwrap();
-        // Precondition: detection sees the raw entry before removal.
-        assert!(yes(client_config_has_raw_entry("cursor", &config_path)));
-
-        remove_wenlan_entry(&config_path).unwrap();
-
-        // The written file still parses and detection no longer sees an entry.
-        assert!(!yes(client_config_has_raw_entry("cursor", &config_path)));
+        type Remove = fn(&std::path::Path) -> Result<(), AppError>;
+        for (remove, client, name, existing) in [
+            (
+                remove_wenlan_entry as Remove,
+                "cursor",
+                "config.json",
+                r#"{"mcpServers": {"wenlan": {"command": "npx"}, "other": {"command": "x"}}}"#,
+            ),
+            (
+                remove_wenlan_entry_toml as Remove,
+                "codex_cli",
+                "config.toml",
+                "[mcp_servers.wenlan]\ncommand = \"npx\"\nargs = [\"-y\", \"wenlan-mcp\"]\n",
+            ),
+        ] {
+            let config_path = tmp.path().join(name);
+            std::fs::write(&config_path, existing).unwrap();
+            assert!(yes(client_config_has_raw_entry(client, &config_path)));
+            remove(&config_path).unwrap();
+            assert!(!yes(client_config_has_raw_entry(client, &config_path)));
+        }
     }
 
     // ── remove_wenlan_entry_toml (Codex CLI) ────────────────────────────
@@ -4158,69 +3741,27 @@ args = ["-y", "wenlan-mcp"]
         assert!(parsed["mcp_servers"].get("wenlan").is_none());
     }
 
-    #[test]
-    fn test_remove_wenlan_entry_toml_errs_when_no_entry_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.toml");
-        std::fs::write(&config_path, "model = \"gpt-5.5\"\n").unwrap();
-        assert!(remove_wenlan_entry_toml(&config_path).is_err());
-        assert!(!config_path.with_extension("toml.bak").exists());
-    }
-
-    #[test]
-    fn test_remove_wenlan_entry_toml_errs_when_file_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("does-not-exist.toml");
-        assert!(remove_wenlan_entry_toml(&config_path).is_err());
-    }
-
-    #[test]
-    fn test_remove_wenlan_entry_toml_leaves_client_config_has_raw_entry_false() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            "[mcp_servers.wenlan]\ncommand = \"npx\"\nargs = [\"-y\", \"wenlan-mcp\"]\n",
-        )
-        .unwrap();
-        assert!(yes(client_config_has_raw_entry("codex_cli", &config_path)));
-
-        remove_wenlan_entry_toml(&config_path).unwrap();
-
-        assert!(!yes(client_config_has_raw_entry("codex_cli", &config_path)));
-    }
-
     // ── has_both_raw_entries (raw+raw duplicate detection) ──────────────
 
     #[test]
-    fn test_has_both_raw_entries_true_when_wenlan_and_origin_present() {
-        // The real ~/.cursor/mcp.json shape on this machine.
-        let json = r#"{"mcpServers": {
+    fn test_has_both_raw_entries() {
+        // The first fixture is the real ~/.cursor/mcp.json duplicate shape.
+        assert!(parsed(has_both_raw_entries(
+            r#"{"mcpServers": {
             "origin": {"command": "npx", "args": ["-y", "origin-mcp"]},
             "wenlan": {"command": "npx", "args": ["-y", "wenlan-mcp"]}
-        }}"#;
-        assert!(parsed(has_both_raw_entries(json)));
-    }
-
-    #[test]
-    fn test_has_both_raw_entries_false_when_only_wenlan() {
-        let json = r#"{"mcpServers": {"wenlan": {"command": "npx"}}}"#;
-        assert!(!parsed(has_both_raw_entries(json)));
-    }
-
-    #[test]
-    fn test_has_both_raw_entries_false_when_only_origin() {
-        let json = r#"{"mcpServers": {"origin": {"command": "npx"}}}"#;
-        assert!(!parsed(has_both_raw_entries(json)));
-    }
-
-    #[test]
-    fn test_has_both_raw_entries_false_when_neither() {
+        }}"#
+        )));
+        assert!(!parsed(has_both_raw_entries(
+            r#"{"mcpServers": {"wenlan": {"command": "npx"}}}"#
+        )));
+        assert!(!parsed(has_both_raw_entries(
+            r#"{"mcpServers": {"origin": {"command": "npx"}}}"#
+        )));
         assert!(!parsed(has_both_raw_entries(
             r#"{"mcpServers": {"other": {}}}"#
         )));
         assert!(!parsed(has_both_raw_entries(r#"{"theme": "dark"}"#)));
-        // CHANGED IN ROUND 6 WITH THE CODE, same reason as the TOML sibling.
         assert!(unparseable(has_both_raw_entries("not json")).contains("not valid JSON"));
     }
 
@@ -4236,7 +3777,6 @@ args = ["-y", "wenlan-mcp"]
             "[mcp_servers.origin]\ncommand = \"npx\"\n"
         )));
         assert!(!parsed(has_both_raw_entries_toml("model = \"gpt-5.5\"\n")));
-        // CHANGED IN ROUND 6 WITH THE CODE, same reason as the sibling above.
         assert!(unparseable(has_both_raw_entries_toml("not toml [")).contains("not valid TOML"));
     }
 
@@ -4338,41 +3878,49 @@ args = ["-y", "wenlan-mcp"]
         assert!(yes(client_config_has_raw_entry("cursor", &config_path)));
     }
 
+    /// The `.bak` is taken (both formats), and only when something is actually
+    /// removed: an already-clean file and a missing one are both `Err` and
+    /// leave no stray backup.
     #[test]
-    fn test_remove_legacy_origin_entry_creates_backup() {
+    fn test_remove_legacy_origin_entry_backs_up_only_a_real_removal() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.json");
-        std::fs::write(
-            &config_path,
-            r#"{"mcpServers": {"origin": {"command": "npx"}, "wenlan": {"command": "npx"}}}"#,
-        )
-        .unwrap();
+        type Remove = fn(&std::path::Path) -> Result<(), AppError>;
+        for (remove, name, bak, duplicate, only_wenlan) in [
+            (
+                remove_legacy_origin_entry as Remove,
+                "config.json",
+                "json.bak",
+                r#"{"mcpServers": {"origin": {"command": "npx"}, "wenlan": {"command": "npx"}}}"#,
+                r#"{"mcpServers": {"wenlan": {"command": "npx"}}}"#,
+            ),
+            (
+                remove_legacy_origin_entry_toml as Remove,
+                "config.toml",
+                "toml.bak",
+                "[mcp_servers.origin]\ncommand = \"npx\"\n[mcp_servers.wenlan]\ncommand = \"npx\"\n",
+                "[mcp_servers.wenlan]\ncommand = \"npx\"\n",
+            ),
+        ] {
+            let config_path = tmp.path().join(name);
+            std::fs::write(&config_path, duplicate).unwrap();
+            remove(&config_path).unwrap();
+            let backup = config_path.with_extension(bak);
+            assert!(backup.exists(), "{name}");
+            assert!(
+                std::fs::read_to_string(&backup).unwrap().contains("origin"),
+                "{name}"
+            );
 
-        remove_legacy_origin_entry(&config_path).unwrap();
+            let clean = tmp.path().join(format!("clean-{name}"));
+            std::fs::write(&clean, only_wenlan).unwrap();
+            assert!(remove(&clean).is_err(), "{name}");
+            assert!(!clean.with_extension(bak).exists(), "{name}");
 
-        let backup = tmp.path().join("config.json.bak");
-        assert!(backup.exists());
-        assert!(std::fs::read_to_string(&backup).unwrap().contains("origin"));
-    }
-
-    #[test]
-    fn test_remove_legacy_origin_entry_errs_when_only_wenlan_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.json");
-        std::fs::write(
-            &config_path,
-            r#"{"mcpServers": {"wenlan": {"command": "npx"}}}"#,
-        )
-        .unwrap();
-        assert!(remove_legacy_origin_entry(&config_path).is_err());
-        // No-op error path leaves no stray backup behind.
-        assert!(!config_path.with_extension("json.bak").exists());
-    }
-
-    #[test]
-    fn test_remove_legacy_origin_entry_errs_when_file_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(remove_legacy_origin_entry(&tmp.path().join("nope.json")).is_err());
+            assert!(
+                remove(&tmp.path().join(format!("nope-{name}"))).is_err(),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -4429,36 +3977,6 @@ args = ["-y", "wenlan-mcp"]
         )));
     }
 
-    #[test]
-    fn test_remove_legacy_origin_entry_toml_creates_backup() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            "[mcp_servers.origin]\ncommand = \"npx\"\n[mcp_servers.wenlan]\ncommand = \"npx\"\n",
-        )
-        .unwrap();
-        remove_legacy_origin_entry_toml(&config_path).unwrap();
-        assert!(config_path.with_extension("toml.bak").exists());
-    }
-
-    #[test]
-    fn test_remove_legacy_origin_entry_toml_errs_when_only_wenlan_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.toml");
-        std::fs::write(&config_path, "[mcp_servers.wenlan]\ncommand = \"npx\"\n").unwrap();
-        assert!(remove_legacy_origin_entry_toml(&config_path).is_err());
-        assert!(!config_path.with_extension("toml.bak").exists());
-    }
-
-    #[test]
-    fn test_remove_legacy_origin_entry_toml_errs_when_file_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(remove_legacy_origin_entry_toml(&tmp.path().join("nope.toml")).is_err());
-    }
-
-    // ── Round 6 ─────────────────────────────────────────────────────────
-
     /// A decision that names a real binary, for the write tests below — so
     /// they exercise this file's branches rather than whatever the host has
     /// installed.
@@ -4472,20 +3990,12 @@ args = ["-y", "wenlan-mcp"]
         }
     }
 
-    /// ADDITIONAL DEFECT 1 — THE CRASH, and it crashed AFTER the backup.
-    ///
     /// `{"mcpServers": []}` is valid JSON a user can genuinely have (an editor
-    /// that serialises an empty map as `[]`, a hand-edit). It parsed, it passed
-    /// the presence check, and then `root["mcpServers"]["wenlan"] = ..` — which
-    /// is `serde_json`'s `IndexMut`, and PANICS rather than erroring when it is
-    /// handed an array. By then `fs::copy` had already taken the backup, so the
-    /// user was left with a `.json.bak`, an unchanged config, a dead button and
-    /// no message: a panic inside a Tauri command has no error the UI can show.
-    ///
-    /// Three things are asserted, and the third is the one that makes this a
-    /// regression test rather than a smoke test: the call RETURNS (a panic
-    /// fails the test), the message names the shape, and NO BACKUP EXISTS —
-    /// nothing started.
+    /// that serialises an empty map as `[]`, a hand-edit), and
+    /// `root["mcpServers"]["wenlan"] = ..` is `serde_json`'s `IndexMut`, which
+    /// PANICS rather than erroring on an array. Three assertions, and the third
+    /// is what makes this a regression test: the call RETURNS, the message
+    /// names the shape, and NO BACKUP EXISTS — nothing started.
     #[test]
     fn an_mcp_servers_array_is_a_schema_error_not_a_panic() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4532,9 +4042,7 @@ args = ["-y", "wenlan-mcp"]
     }
 
     /// A present-but-null `mcpServers` is NOT a schema error: it is a place an
-    /// entry can go. (`serde_json`'s `IndexMut` turns a null into an object, so
-    /// this one never crashed — it is here so the schema check cannot be
-    /// tightened into refusing a file it used to handle.)
+    /// entry can go, and the schema check must not tighten into refusing it.
     #[test]
     fn a_null_mcp_servers_key_is_still_writable() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4552,9 +4060,9 @@ args = ["-y", "wenlan-mcp"]
         assert_eq!(written["theme"], "dark", "unrelated keys must survive");
     }
 
-    /// ADDITIONAL DEFECT 1, THE TOML HALF. `doc[\"mcp_servers\"][key] = ..` is
-    /// `toml_edit`'s `IndexMut`, i.e. `.expect(\"index not found\")` — a panic
-    /// for any `mcp_servers` that is not table-like.
+    /// The TOML half: `doc["mcp_servers"][key] = ..` is `toml_edit`'s
+    /// `IndexMut`, i.e. `.expect("index not found")` — a panic for any
+    /// `mcp_servers` that is not table-like.
     #[test]
     fn a_scalar_mcp_servers_key_is_a_schema_error_not_a_panic_in_toml() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4573,15 +4081,11 @@ args = ["-y", "wenlan-mcp"]
         assert!(!config_path.with_extension("toml.bak").exists());
     }
 
-    /// D1, CONDITION 1 — the backup is written from the bytes that were
-    /// PARSED, and only while those are still the bytes on disk.
-    ///
-    /// `back_up_parsed` is exercised directly because the race it closes cannot
-    /// be staged through the writers without a hook into the middle of them:
-    /// the interleaving is read+parse A, another process writes B, backup. This
-    /// asserts the guard itself — handed contents that no longer match the
-    /// file, it refuses and leaves NO backup, instead of copying B over the
-    /// user's last good one.
+    /// The backup is written from the bytes that were PARSED, and only while
+    /// those are still on disk. `back_up_parsed` is exercised directly because
+    /// the race it closes (read+parse A, another process writes B, backup)
+    /// cannot be staged through the writers without a hook into the middle of
+    /// them.
     #[test]
     fn a_config_that_changed_under_the_writer_is_not_backed_up_from_the_new_bytes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4618,15 +4122,11 @@ args = ["-y", "wenlan-mcp"]
         );
     }
 
-    /// D1, CONDITION 2 / ADDITIONAL DEFECT 4 — `exists()` was a two-answer API
-    /// standing in for a three-answer question, on all four verbs.
-    ///
-    /// The OS refusal the defect is really about (a file that permits writing
-    /// but not `metadata`) cannot be staged portably. A DIRECTORY at the config
-    /// path reaches the SAME branch: `read_config` answers `Unreadable`, not
-    /// `Absent`, so the writer must refuse and say so rather than take the
-    /// new-file branch — which is what truncated an unstattable file, from a
-    /// `json!({})` skeleton, with no backup.
+    /// The OS refusal this is really about (a file that permits writing but not
+    /// `metadata`) cannot be staged portably. A DIRECTORY at the config path
+    /// reaches the SAME branch: `read_config` answers `Unreadable`, not
+    /// `Absent`, so the writer must refuse rather than take the new-file branch
+    /// and truncate from a `json!({})` skeleton with no backup.
     #[test]
     fn a_config_path_that_cannot_be_read_is_never_treated_as_a_new_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4674,11 +4174,10 @@ args = ["-y", "wenlan-mcp"]
             .contains("No config file found"));
     }
 
-    /// ADDITIONAL DEFECT 2 — a RELEASE ARTIFACT. `to_string_lossy` turned a
-    /// path that cannot be spelled in UTF-8 into one that CAN, made of U+FFFD,
-    /// and wrote it into the user's client config as the command to run. That
-    /// names a different, nonexistent file, and the failure surfaces later as
-    /// the client failing to launch a filename the user cannot find.
+    /// `to_string_lossy` turns a path that cannot be spelled in UTF-8 into one
+    /// that CAN, made of U+FFFD. Writing that into a client config names a
+    /// different, nonexistent file, and the failure surfaces later as the
+    /// client failing to launch a filename the user cannot find.
     #[test]
     fn a_binary_under_a_non_unicode_path_is_never_written_as_a_lossy_command() {
         #[cfg(windows)]
@@ -4729,13 +4228,11 @@ args = ["-y", "wenlan-mcp"]
         }
     }
 
-    /// D2, END TO END — the shape the UI actually receives.
-    ///
-    /// A present Gemini `settings.json` holding `not json`. The file WAS read,
-    /// so `detected` is a measured yes; whether it holds a Wenlan entry could
-    /// NOT be measured, so `has_raw_entry` and `already_configured` must not be
-    /// `no`. Before this round every one of them was `no`, and "no" is what
-    /// puts an unqualified "Set up" button in front of the user.
+    /// End to end, in the shape the UI receives: a present Gemini
+    /// `settings.json` holding `not json`. The file WAS read, so `detected` is
+    /// a measured yes; whether it holds a Wenlan entry could NOT be measured,
+    /// so `has_raw_entry` and `already_configured` must not be `no` — "no" is
+    /// what puts an unqualified "Set up" button in front of the user.
     #[test]
     fn a_present_but_unparseable_client_config_is_detected_and_unmeasurable() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4772,9 +4269,9 @@ args = ["-y", "wenlan-mcp"]
         );
     }
 
-    /// The D6b half: a malformed `~/.claude/settings.json` used to reach
-    /// `has_plugin = No` through the same collapse, and a MEASURED `no` for the
-    /// plugin is the gate on Diagnostics' destructive raw-duplicate fix.
+    /// A MEASURED `no` for the plugin is the gate on Diagnostics' destructive
+    /// raw-duplicate fix, so a malformed `~/.claude/settings.json` must not
+    /// reach it.
     #[test]
     fn an_unparseable_claude_settings_file_leaves_the_plugin_state_unmeasured() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4814,9 +4311,9 @@ args = ["-y", "wenlan-mcp"]
         }
     }
 
-    /// D3's BOUNDARY DEFECT, at the writers. A write that succeeded while one
-    /// of the resolver's inputs went unread is not the same event as one where
-    /// everything was measured; both used to return `()`.
+    /// At the writers: a write that succeeded while one of the resolver's
+    /// inputs went unread is not the same event as one where everything was
+    /// measured, so it cannot report the same thing.
     #[test]
     fn a_write_reports_the_inputs_that_could_not_be_determined() {
         let tmp = tempfile::tempdir().unwrap();

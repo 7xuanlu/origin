@@ -71,15 +71,12 @@ pub struct BinaryWire {
     /// they are carried separately rather than left to be inferred from a short
     /// trail.
     ///
-    /// ROUND 5, D4: this used to live inside `unresolved`, i.e. only ever
-    /// alongside `command: null`. That made it structurally impossible to
-    /// report an undetermined input on a search that FOUND something -- and a
-    /// find is precisely when the omission is invisible, because the command
-    /// beside it looks like a complete answer. It sits here, beside `command`
-    /// rather than under a failure, because it is a property of the SEARCH:
-    /// non-empty with a command means "this command was chosen, and these
-    /// inputs were never read"; empty with a command means the search really
-    /// did cover everything it names.
+    /// It sits here, beside `command` rather than under a failure, because it
+    /// is a property of the SEARCH: non-empty with a command means "this
+    /// command was chosen, and these inputs were never read"; empty with a
+    /// command means the search really did cover everything it names. Under
+    /// `unresolved` it could only ever be reported alongside `command: null`,
+    /// and a find is precisely when the omission is invisible.
     pub undetermined: Vec<mcp_config::UndeterminedInput>,
     pub candidates: Vec<BinaryCandidate>,
 }
@@ -91,9 +88,6 @@ pub struct UnresolvedBinary {
     pub message: String,
     /// Candidate PATHS that could not be looked at.
     pub unreadable: Vec<UnreadableCandidate>,
-    // `undetermined` used to live here. It now lives on `BinaryWire` itself --
-    // see the field comment there for why a failure that only exists on the
-    // no-command path is a failure a successful search can hide.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -108,12 +102,10 @@ pub struct BinaryCandidate {
     /// The measurement: `file`, `not_a_file`, `not_executable` with the reason,
     /// `absent`, or `unreadable` with the OS error.
     ///
-    /// Round 4, defect F: an `exists: bool` used to sit beside this, and it was
-    /// the old boolean collapse still on the wire — `false` for "absent", for
-    /// "a directory is squatting on the name", and for "the OS refused to look".
-    /// Any reader that took the easy field got the conflation back for free, and
-    /// the Diagnostics panel did exactly that (it labelled an unreadable
-    /// candidate "Missing"). Removed; readers match on `state`.
+    /// There is deliberately no `exists: bool` beside it: `false` would cover
+    /// "absent", "a directory is squatting on the name", and "the OS refused to
+    /// look" alike, and any reader taking the easy field gets that conflation
+    /// back for free. Readers match on `state`.
     pub state: mcp_config::CandidateProbe,
     pub source: String,
 }
@@ -122,13 +114,12 @@ pub struct BinaryCandidate {
 pub struct ClientWire {
     pub client_type: String,
     pub name: String,
-    /// ROUND 5, DEFECT 4: these four were `bool`, and every one of them was a
-    /// `Path::exists()` or a `read_to_string(..).unwrap_or(false)` — `false`
-    /// for "measured: no" AND for "the OS would not tell me". Readers match on
-    /// [`mcp_config::Reading`], exactly as they already do on `CandidateProbe`
-    /// for the binary trail, and for the same reason (round 4, defect F): a
-    /// boolean beside a tri-state hands the conflation back to any reader that
-    /// takes the shorter field, so there is no boolean.
+    /// Tri-state, not `bool`: a `Path::exists()` or a
+    /// `read_to_string(..).unwrap_or(false)` is `false` for "measured: no" AND
+    /// for "the OS would not tell me". Readers match on
+    /// [`mcp_config::Reading`], as they do on `CandidateProbe` for the binary
+    /// trail; a boolean beside a tri-state would hand the conflation back to
+    /// any reader that takes the shorter field.
     pub detected: mcp_config::Reading,
     /// `None` when the directory the path hangs off could not be determined.
     /// The row still exists — that is the point — but there is no path to show.
@@ -158,14 +149,13 @@ pub struct ClientWire {
 /// `"config"`. Routing it to `"config"` is exactly the double-registration that
 /// broke a real machine (see commit 5d7a364); `claude_code` / `codex_cli` reach
 /// the same conclusion via their own `"plugin"` arm.
-/// ROUND 5, DEFECT 4, AT THE ROUTE. A route is an INSTRUCTION, so computing one
-/// from an unread input is worse than reporting nothing: `!detected` used to
-/// yield `"skip"` for a client whose config the OS refused to stat ("this isn't
-/// here, do nothing" — about a client that may well be there), and an unread
-/// `has_plugin` yielded `"config"` for a Claude Desktop that already has the
-/// chat-side plugin, which is precisely the double registration that broke a
-/// real machine. `"unknown"` is the fourth value: no instruction, because none
-/// was established.
+///
+/// A route is an INSTRUCTION, so computing one from an unread input is worse
+/// than reporting nothing: a `!detected` collapse says "this isn't here, do
+/// nothing" about a client whose config the OS merely refused to stat, and an
+/// unread `has_plugin` routes a plugin-equipped Claude Desktop to `"config"`.
+/// `"unknown"` is the fourth value: no instruction, because none was
+/// established.
 fn route_for(
     client_type: &str,
     detected: &mcp_config::Reading,
@@ -222,19 +212,9 @@ fn daemon_wire_for(
 /// Builds the mcp-binary wire state from ONE resolution: the decision setup
 /// would act on, and the probe readings that decision was made from.
 ///
-/// ROUND 4, DEFECT F. The comment that used to sit here claimed the command and
-/// the trail "can never disagree" because both came from the same *candidate
-/// list*. That was false, and the falseness was the bug: the entry was resolved
-/// by one probe pass inside `mcp_config::wenlan_mcp_entry()`, and then this
-/// function ran a SECOND, independent probe pass over the same paths. Two
-/// passes are two instants. A permission that flipped in between produced
-/// `command: npx` printed beside `state: file`, or a local command beside
-/// `state: unreadable` — a diagnostics trail contradicting the decision it was
-/// supposed to explain, which is worse than no trail.
-///
-/// Now the caller does one pass and hands both halves here, so the trail
-/// describes the decision that was actually made — by construction, not by
-/// assertion.
+/// ONE probe pass, done by the caller, feeding both halves. Two passes are two
+/// instants: a permission that flips in between prints `command: npx` beside
+/// `state: file`, a trail contradicting the decision it is supposed to explain.
 fn mcp_binary_wire(
     decision: mcp_config::McpEntryDecision,
     trail: Vec<mcp_config::ProbedCandidate>,
@@ -247,9 +227,9 @@ fn mcp_binary_wire(
             source: c.source.to_string(),
         })
         .collect();
-    // Round 5, D4: `undetermined` comes out of BOTH arms. A chosen command and
-    // an input that could not be read are independent facts, and pairing them
-    // only with the failure arm is what let a `Found` swallow the second one.
+    // `undetermined` comes out of BOTH arms: a chosen command and an input
+    // that could not be read are independent facts, so pairing them only with
+    // the failure arm lets a `Found` swallow the second one.
     let (command, args, unresolved, undetermined) = match decision {
         mcp_config::McpEntryDecision::Write {
             entry,
@@ -289,13 +269,10 @@ fn mcp_binary_wire(
 
 /// Reshapes one `mcp_config::detect_mcp_clients()` row for the wire.
 ///
-/// PURE — it reads nothing. It used to call `client_plugin_enabled`,
-/// `client_config_has_raw_entry` and `client_config_has_both_raw_entries` here,
-/// re-reading the very files `detect_mcp_clients` had just read, so `detected`
-/// and `has_raw_entry` on one row could come from different instants and
-/// contradict each other. That is round 4's defect F in the client half, and it
-/// is fixed the same way it was for the binary trail: one pass reads, and
-/// everything downstream reshapes what that pass returned.
+/// PURE — it reads nothing. Re-reading the files `detect_mcp_clients` has just
+/// read would let `detected` and `has_raw_entry` on one row come from different
+/// instants and contradict each other: one pass reads, and everything
+/// downstream reshapes what that pass returned.
 fn client_wire(client: &mcp_config::McpClient) -> ClientWire {
     ClientWire {
         route: route_for(&client.client_type, &client.detected, &client.has_plugin).to_string(),
@@ -312,7 +289,7 @@ fn client_wire(client: &mcp_config::McpClient) -> ClientWire {
 /// Assembles the full `WireState` for the real machine. The mcp-binary half is
 /// ONE call to `mcp_config::wenlan_mcp_decision()`, which returns the decision
 /// and the probe readings behind it together — see `mcp_binary_wire` for why
-/// two separate probe passes were a defect and not an optimisation. Never
+/// two separate probe passes cannot be trusted. Never
 /// errors — a down daemon shows up as `daemon.reachable: false`, and an
 /// unresolvable binary as `mcp_binary.command: null`, not a failed command.
 pub async fn compute(client: &WenlanClient) -> WireState {
@@ -495,12 +472,10 @@ mod tests {
         assert!(wire.unresolved.is_none());
     }
 
-    /// DEFECT F. `compute` used to resolve the entry with one probe pass and
-    /// then RE-PROBE every candidate to build the trail. Two passes are two
-    /// instants: a permission that flipped in between produced `command: npx`
-    /// printed beside `state: file`, or a local command beside `state:
-    /// unreadable` — a trail contradicting the decision it exists to explain.
-    /// The comment above the function claimed the two "can never disagree".
+    /// Resolving the entry with one probe pass and then RE-PROBING every
+    /// candidate to build the trail is two instants: a permission that flips in
+    /// between prints `command: npx` beside `state: file`, a trail
+    /// contradicting the decision it exists to explain.
     ///
     /// The fixture flips exactly that way: the first look at the installed
     /// candidate says `File`, every later look says `Unreadable`. The probe
@@ -562,7 +537,7 @@ mod tests {
         );
     }
 
-    /// DEFECT D on the wire. An unresolvable search writes nothing, so there is
+    /// An unresolvable search writes nothing, so there is
     /// no command to show. `command: null` is the honest rendering; a
     /// placeholder string would put a command on screen that setup would never
     /// write.
@@ -678,9 +653,8 @@ mod tests {
         );
     }
 
-    /// A3's record. A stop that could not establish the daemon ended is the
-    /// state `docs/cross-platform.md` used to claim was impossible; it reaches
-    /// the wire with its reason, and it is not the same JSON as `ended`.
+    /// A stop that could not establish the daemon ended reaches the wire with
+    /// its reason, and is not the same JSON as `ended`.
     #[test]
     fn daemon_wire_carries_the_last_sidecar_stop_outcome_with_its_reason() {
         let unmeasured = crate::daemon_start::SidecarStopOutcome::CouldNotMeasure {
@@ -722,11 +696,9 @@ mod tests {
         );
     }
 
-    /// A4's trail half. `exists: false` conflated "not there" with "could not
-    /// look" and with "a directory is sitting at that path"; the trail is a
-    /// diagnostic surface, so every state has to reach it — and, round 4, the
-    /// `exists` bool that re-created the conflation for any reader who took it
-    /// is gone from the wire entirely.
+    /// `exists: false` conflates "not there" with "could not look" and with "a
+    /// directory is sitting at that path". The trail is a diagnostic surface,
+    /// so every state has to reach it separately.
     #[test]
     fn candidate_trail_separates_absence_from_a_failed_look_and_a_directory() {
         let home = PathBuf::from("/Users/someone");
@@ -828,9 +800,7 @@ mod tests {
     /// A no-plugin client whose config carries both `wenlan` and `origin`
     /// surfaces the raw+raw duplicate — the case plugin+raw detection can never
     /// reach for cursor/gemini_cli. Staged on the `McpClient` rather than on
-    /// disk, because `client_wire` no longer reads anything: it used to re-read
-    /// the same files `detect_mcp_clients` had just read, which is round 4's
-    /// defect F in the client half (two instants, one row).
+    /// disk, because `client_wire` reads nothing.
     #[test]
     fn client_wire_carries_a_raw_duplicate_through() {
         let mut client = cursor_client(Reading::Yes, Reading::Yes);
@@ -841,12 +811,11 @@ mod tests {
         assert_eq!(wire.has_plugin, Reading::No);
     }
 
-    /// ROUND 5, DEFECT 4, AT THE ROUTE. A route is an instruction. Computing
-    /// one from a reading that failed hands the user an action derived from
-    /// nothing — `"skip"` ("this client isn't here") for a config the OS
-    /// refused to stat, and `"config"` ("write a raw entry") for a Claude
-    /// Desktop whose chat-side plugin could not be read, which is exactly the
-    /// double registration that broke a real machine.
+    /// A route is an instruction. Computing one from a reading that failed
+    /// hands the user an action derived from nothing — `"skip"` for a config
+    /// the OS refused to stat, and `"config"` for a Claude Desktop whose
+    /// chat-side plugin could not be read, which is the double registration
+    /// that broke a real machine.
     #[test]
     fn a_reading_that_failed_produces_no_instruction() {
         let unreadable = Reading::Unreadable {
