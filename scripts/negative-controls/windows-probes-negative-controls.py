@@ -345,6 +345,25 @@ function Get-CimInstance {
     @(@(0..288 | ForEach-Object { [pscustomobject]@{ ProcessId = $_; Name = "p$_.exe"; ExecutablePath = "C:\Windows\System32\p$_.exe" } }) +
       @($script:SrvCimPids | ForEach-Object { [pscustomobject]@{ ProcessId = $_; Name = "wenlan-server.exe"; ExecutablePath = "C:\x\wenlan-server.exe" } }))
 }
+# The user's files under $DataDir, as the row's TWO reads see them: once before
+# the uninstaller runs and once after. The pair is the point -- a fixture that
+# answered the same thing every time could not express a file going missing,
+# which is the only thing this row exists to notice. The default is a clean
+# uninstall: the same three files, same digests, both times.
+$script:TreeSnapshots = @(
+    @{ State = "taken"; Files = @{ "memorydb.sqlite" = "AAA"; "config.json" = "BBB"; "logs\wenlan.log" = "CCC" } },
+    @{ State = "taken"; Files = @{ "memorydb.sqlite" = "AAA"; "config.json" = "BBB"; "logs\wenlan.log" = "CCC" } }
+)
+$script:TreeReads = 0
+function Get-TreeFileDigests {
+    param([string]$Root)
+    $i = $script:TreeReads
+    if ($i -ge $script:TreeSnapshots.Count) { $i = $script:TreeSnapshots.Count - 1 }
+    $script:TreeReads++
+    $s = $script:TreeSnapshots[$i]
+    [pscustomobject]@{ State = $s.State; Files = $s.Files
+        Detail = "driver fixture read $($i + 1) of ${Root}: $($s.State), $($s.Files.Count) files" }
+}
 function netstat.exe {
     param([Parameter(ValueFromRemainingArguments = $true)]$Rest)
     # The shape `netstat -ano` really prints, including the header line (which
@@ -630,6 +649,7 @@ $AppExe = "C:\Users\ci\AppData\Local\Programs\Wenlan\wenlan-app.exe"
 # directly, and the cases that are ABOUT them drive Get-TaskPresence through a
 # setup line instead.
 $TaskName = "WenlanServer"
+$DataDir = "C:\Users\ci\AppData\Local\wenlan"
 $OwnedServerImage = "C:\Users\ci\AppData\Local\Programs\wenlan\wenlan-server.exe"
 $PreexistingServerPids = @()
 $TaskOwned = $true
@@ -817,6 +837,10 @@ function netstat.exe {
     # Well-formed rows, none of them LISTENING. The netstat equivalent of the
     # empty listener table: a host with no listening socket at all is not a
     # measurement of an idle machine.
+    #
+    # It carries a UDP row so that this fixture isolates the LISTENING floor:
+    # without one the end witness below refuses it first, and a control that
+    # deleted the floor would still see a red case for the wrong reason.
     "netstat-no-listeners": r"""
 function netstat.exe {
     param([Parameter(ValueFromRemainingArguments = $true)]$Rest)
@@ -825,8 +849,107 @@ function netstat.exe {
     "",
     "  Proto  Local Address          Foreign Address        State           PID",
     "  TCP    127.0.0.1:49670        127.0.0.1:49671        ESTABLISHED     8888",
-    "  TCP    127.0.0.1:49671        127.0.0.1:49670        ESTABLISHED     8889"
+    "  TCP    127.0.0.1:49671        127.0.0.1:49670        ESTABLISHED     8889",
+    "  UDP    0.0.0.0:5353           *:*                                    2340"
 }
+""",
+    # ROUND 4 of the parse, ported from scripts/lib/host-process.sh. A status-0
+    # diagnostic merged BESIDE real rows. Its first token is neither TCP nor
+    # UDP, so a parse that skipped every line not already claiming to be a
+    # protocol row never looked at it: the rows that survived validated, none of
+    # them was 7878, and an incomplete read became a measured negative.
+    "netstat-warning-beside-rows": r"""
+function netstat.exe {
+    param([Parameter(ValueFromRemainingArguments = $true)]$Rest)
+    "",
+    "Active Connections",
+    "",
+    "  Proto  Local Address          Foreign Address        State           PID",
+    "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1576",
+    "WARNING: provider returned partial results",
+    "  UDP    0.0.0.0:5353           *:*                                    2340"
+}
+""",
+    # The SAME table with the warning line removed, and nothing else changed.
+    # It is what makes the case above a measurement of the warning rather than
+    # of the fixture: this one still reads as a measured negative.
+    "netstat-warning-free": r"""
+function netstat.exe {
+    param([Parameter(ValueFromRemainingArguments = $true)]$Rest)
+    "",
+    "Active Connections",
+    "",
+    "  Proto  Local Address          Foreign Address        State           PID",
+    "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1576",
+    "  UDP    0.0.0.0:5353           *:*                                    2340"
+}
+""",
+    # ROUND 5. A believable PREFIX: every line is a well-formed row and the
+    # preamble is intact, so the grammar has nothing to object to. Only the
+    # missing UDP section says the stream stopped before the TCP table ended.
+    "netstat-truncated-before-udp": r"""
+function netstat.exe {
+    param([Parameter(ValueFromRemainingArguments = $true)]$Rest)
+    "",
+    "Active Connections",
+    "",
+    "  Proto  Local Address          Foreign Address        State           PID",
+    "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1576",
+    "  TCP    0.0.0.0:445            0.0.0.0:0              LISTENING       4"
+}
+""",
+    # ROUND 6. A UDP row is present, so the end witness is satisfied -- but a
+    # TCP row follows it, so this stream is not "all of TCP, then all of UDP"
+    # and the witness licenses nothing about the TCP section.
+    "netstat-tcp-after-udp": r"""
+function netstat.exe {
+    param([Parameter(ValueFromRemainingArguments = $true)]$Rest)
+    "",
+    "Active Connections",
+    "",
+    "  Proto  Local Address          Foreign Address        State           PID",
+    "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1576",
+    "  UDP    0.0.0.0:5353           *:*                                    2340",
+    "  TCP    0.0.0.0:445            0.0.0.0:0              LISTENING       4"
+}
+""",
+
+    # --- the user's data across the uninstall ------------------------------
+    # THE FIXTURE THE ROW WAS BLIND TO: the data ROOT is still there -- this run
+    # holds a DeleteOnClose handle inside it, so it cannot not be -- and one of
+    # the user's files under it is gone.
+    "user-data-file-erased": r"""
+$script:TreeSnapshots = @(
+    @{ State = "taken"; Files = @{ "memorydb.sqlite" = "AAA"; "config.json" = "BBB"; "logs\wenlan.log" = "CCC" } },
+    @{ State = "taken"; Files = @{ "config.json" = "BBB"; "logs\wenlan.log" = "CCC" } }
+)
+""",
+    # Present, same path, different bytes.
+    "user-data-file-rewritten": r"""
+$script:TreeSnapshots = @(
+    @{ State = "taken"; Files = @{ "memorydb.sqlite" = "AAA"; "config.json" = "BBB" } },
+    @{ State = "taken"; Files = @{ "memorydb.sqlite" = "ZZZ"; "config.json" = "BBB" } }
+)
+""",
+    "user-data-post-read-failed": r"""
+$script:TreeSnapshots = @(
+    @{ State = "taken"; Files = @{ "memorydb.sqlite" = "AAA"; "config.json" = "BBB" } },
+    @{ State = "unmeasurable"; Files = @{} }
+)
+""",
+    "user-data-pre-read-failed": r"""
+$script:TreeSnapshots = @(
+    @{ State = "unmeasurable"; Files = @{} },
+    @{ State = "taken"; Files = @{ "memorydb.sqlite" = "AAA" } }
+)
+""",
+    # Both reads succeeded and there was nothing to lose. Not a clean uninstall
+    # -- an observation with nothing in it.
+    "user-data-empty-before": r"""
+$script:TreeSnapshots = @(
+    @{ State = "taken"; Files = @{} },
+    @{ State = "taken"; Files = @{} }
+)
 """,
 
     # --- Invoke-WebRequest ------------------------------------------------
@@ -1399,6 +1522,16 @@ SETUP_CLOSE = r"""} catch {
 # The pre-check refuses to run if a block closes over a variable no driver
 # defines -- silence there would be $null.State, which reads as "could not
 # measure" and would make an unmeasurable case pass for the wrong reason.
+def _setup_vars(declared):
+    """A setup entry's declared variable(s), always as a tuple.
+
+    A setup may define more than one -- the two data-dir snapshots are two
+    shipped statements and the row branches on both -- and a name left out here
+    is a name the free-variable check would not know a driver defines.
+    """
+    return (declared,) if isinstance(declared, str) else tuple(declared)
+
+
 def _grab(src, needle):
     """The one source line starting with `needle`, verbatim, left-stripped.
 
@@ -1463,6 +1596,14 @@ SETUP = {
     # kept running its own copy.
     ("nsis", "sidecar-sweep-measured"):
         ("ownedLeft", lambda src: _grab(src, "$ownedLeft = ") + "\n"),
+    # BOTH snapshots, taken from the shipped statements rather than copied: the
+    # pre one runs where the shipped script runs it (before the uninstaller),
+    # the post one where it runs it (after). A copy here would keep the row
+    # green under a control that deleted one of them from the source.
+    ("nsis", "user-data-survives-uninstall"):
+        (("preDataSnapshot", "postDataSnapshot"),
+         lambda src: _grab(src, "$preDataSnapshot = Get-TreeFileDigests") + "\n"
+                     + _grab(src, "$postDataSnapshot = ") + "\n"),
 }
 
 # ROUND 6 (Codex Sol), B1 + RANKED #2. THE `SETUP-THREW` MARKER WAS CREDITED
@@ -1511,9 +1652,9 @@ SETUP_THROW_WITNESS = {
 }
 
 # Variables the PREAMBLE defines for the extracted blocks.
-PREAMBLE_VARS = {"Health", "App", "AppExe", "TaskName", "OwnedServerImage",
-                 "PreexistingServerPids", "preTask", "postTask",
-                 "MayDriveTask", "TaskDeleteResult", "CleanupDirs"}
+PREAMBLE_VARS = {"Health", "App", "AppExe", "TaskName", "DataDir",
+                 "OwnedServerImage", "PreexistingServerPids", "preTask",
+                 "postTask", "MayDriveTask", "TaskDeleteResult", "CleanupDirs"}
 
 # Environment a case runs with. GAUNTLET_HEALTH_TIMEOUT_SEC is removed for every
 # other case, so a value in the developer's shell cannot change what a case
@@ -1552,6 +1693,16 @@ ZIP_FUNCS = ["Invoke-Native", "Get-HealthTimeoutSec", "Get-HealthReachability",
 NSIS_FUNCS = ["Get-CimProcessWitness", "Get-CimProcessSet",
               "Get-ProcessTableWitness", "Get-ProcessLiveness",
               "Get-OwnedProcessesByImage", "Get-DirPresence"]
+# lib.ps1 is a THIRD subject, and it has to be: `Get-HealthReachability` no
+# longer classifies the exception itself, it asks these three. Extracted and
+# driven exactly like the channel functions -- unstubbed, they would trip the
+# stub-escape guard, and unmutatable, the reset/refusal discrimination would
+# have no control defending it anywhere.
+LIB_FUNCS = ["Get-WebExceptionShape", "Test-ConnectionRefused",
+             "Test-HttpErrorResponse"]
+# A control whose SUBJECT is lib.ps1 still reddens cases of a channel, because
+# lib.ps1 has no rows of its own.
+CONTROL_CASE_CHANNEL = {"lib": "zip"}
 
 CASES = [
     # --- finding 1: the port probe -------------------------------------
@@ -1580,6 +1731,22 @@ CASES = [
      "port-7878-closed", "FAIL", "not rows this parse understands"),
     ("port-witness-no-listeners", "zip", ("tcp-table-without-7878", "netstat-no-listeners"),
      "port-7878-closed", "FAIL", "no listening TCP row at all"),
+    # The three rounds scripts/lib/host-process.sh had already taken and this
+    # parse had not. Each pairs the primary table with a netstat that is
+    # incomplete in a different way, and each must be UNMEASURABLE.
+    ("port-witness-warning-beside-rows", "zip",
+     ("tcp-table-without-7878", "netstat-warning-beside-rows"),
+     "port-7878-closed", "FAIL", "not rows this parse understands"),
+    # ...and the same table without the warning, which must still measure.
+    ("port-witness-warning-free-still-measures", "zip",
+     ("tcp-table-without-7878", "netstat-warning-free"),
+     "port-7878-closed", "PASS", "measured closed"),
+    ("port-witness-truncated-before-udp", "zip",
+     ("tcp-table-without-7878", "netstat-truncated-before-udp"),
+     "port-7878-closed", "FAIL", "no UDP row"),
+    ("port-witness-tcp-after-udp", "zip",
+     ("tcp-table-without-7878", "netstat-tcp-after-udp"),
+     "port-7878-closed", "FAIL", "the sections are interleaved"),
 
     # --- finding 2: the health probe -----------------------------------
     ("health-off-refused", "zip", ("http-refused",),
@@ -1811,6 +1978,23 @@ CASES = [
     ("nsis-sweep-ownership-unmeasured", "nsis", ("srv-ownership-unmeasured",),
      "sidecar-sweep-measured", "FAIL", "were never measured"),
 
+    # --- the user's data across the uninstall, in the nsis channel ---------
+    # The claim is about the FILES. The data root's survival is guaranteed by
+    # this run's own open handle, so every one of these fixtures has the root
+    # standing and differs only underneath it.
+    ("nsis-user-data-intact", "nsis", (),
+     "user-data-survives-uninstall", "PASS", "byte-for-byte what they were"),
+    ("nsis-user-data-file-erased", "nsis", ("user-data-file-erased",),
+     "user-data-survives-uninstall", "FAIL", "took 1 and rewrote 0"),
+    ("nsis-user-data-file-rewritten", "nsis", ("user-data-file-rewritten",),
+     "user-data-survives-uninstall", "FAIL", "took 0 and rewrote 1"),
+    ("nsis-user-data-post-read-failed", "nsis", ("user-data-post-read-failed",),
+     "user-data-survives-uninstall", "FAIL", "could not measure"),
+    ("nsis-user-data-pre-read-failed", "nsis", ("user-data-pre-read-failed",),
+     "user-data-survives-uninstall", "FAIL", "could not measure"),
+    ("nsis-user-data-empty-before", "nsis", ("user-data-empty-before",),
+     "user-data-survives-uninstall", "FAIL", "there were no files under"),
+
     # --- ROUND 5, C4: the row that grades the teardown, in BOTH channels ---
     # The nsis row read only $DataDir. Its false green: the uninstaller removes
     # the install dir so `uninstall-removes-dir` passes, another installer
@@ -1923,15 +2107,49 @@ CONTROLS = [
      """    return [pscustomobject]@{ State = "none"; OwningProcess = $null
         Detail = "INJECTED: measured closed on the whole-table read alone: $($table.Count) rows, none on $Port" }""",
      ["port-table-hides-7878-netstat-finds-it", "port-witness-cannot-run",
-      "port-witness-table-garbled", "port-witness-no-listeners"]),
+      "port-witness-table-garbled", "port-witness-no-listeners",
+      "port-witness-warning-beside-rows", "port-witness-truncated-before-udp",
+      "port-witness-tcp-after-udp"]),
 
     ("nc-port-witness-row-shape-not-checked",
      "C4's parse: every line claiming to be a protocol row no longer has to BE "
      "one, so a torn or localised table matches nothing and reads as free",
      "zip",
-     """    if ($notARow -ne 0) {""",
-     """    if ($false) {""",
+     """        $wellFormed = (($f[0] -eq "TCP" -and $f.Count -eq 5 -and $f[4] -match '^\\d+$') -or
+                       ($f[0] -eq "UDP" -and $f.Count -eq 4 -and $f[3] -match '^\\d+$'))""",
+     """        $wellFormed = ($f[0] -eq "TCP" -or $f[0] -eq "UDP")""",
      ["port-witness-table-garbled"]),
+
+    # ROUND 4 of scripts/lib/host-process.sh's parse, which this copy was three
+    # rounds behind. The mutation is verbatim the shape it shipped with.
+    ("nc-port-witness-skips-non-protocol-lines",
+     "round 4: a line whose first token is neither TCP nor UDP is skipped "
+     "instead of counted, so a status-0 warning merged beside the rows leaves "
+     "an incomplete table reading as a measured negative",
+     "zip",
+     """        if (-not $wellFormed) {
+            if ($rows -ne 0) { $notARow++ } else { $preamble++ }
+            continue
+        }""",
+     """        if ($f[0] -ne "TCP" -and $f[0] -ne "UDP") { continue }
+        if (-not $wellFormed) { $notARow++; continue }""",
+     ["port-witness-warning-beside-rows"]),
+
+    ("nc-port-witness-end-witness-dropped",
+     "round 5: nothing requires the UDP section, so a table truncated after a "
+     "well-formed prefix -- every remaining row valid -- reads as a closed port",
+     "zip",
+     """    if ($udp -lt 1) {""",
+     """    if ($false) {""",
+     ["port-witness-truncated-before-udp"]),
+
+    ("nc-port-witness-section-order-assumed",
+     "round 6: the TCP-before-UDP ordering the end witness rests on is assumed "
+     "rather than checked, so an interleaved stream ratifies its own TCP half",
+     "zip",
+     """    if ($tcpAfterUdp -ne 0) {""",
+     """    if ($false) {""",
+     ["port-witness-tcp-after-udp"]),
 
     ("nc-port-witness-empty-is-free",
      "C4's other parse guard: a netstat with no listening row at all is read as "
@@ -1946,7 +2164,7 @@ CONTROLS = [
      "is recorded as a stopped daemon",
      "zip",
      """        return [pscustomobject]@{ State = "unmeasurable"
-            Detail = "the health probe failed without reaching a verdict (status $($we.Status)$(if ($sockErr) { ", socket $sockErr" }): $($we.Message))" }""",
+            Detail = "the health probe failed without reaching a verdict ($($shape.Type)$(if ($shape.Status) { ", status $($shape.Status)" })$(if ($shape.SocketError) { ", socket $($shape.SocketError) at depth $($shape.SocketDepth)" }): $($ex.Message))" }""",
      """        return [pscustomobject]@{ State = "down"
             Detail = "INJECTED: any web failure read as a stopped daemon" }""",
      ["health-off-timeout", "health-off-dns", "health-recovery-timeout",
@@ -1955,41 +2173,44 @@ CONTROLS = [
     ("nc-health-non-web-error-is-down",
      "finding 2's other half: a probe that never reached the network is recorded as a stopped daemon",
      "zip",
-     """        if (-not $we) {
-            # Not even a web exception: a bad URI, a missing assembly, a
-            # scriptblock error. Nothing was asked of the network.
-            return [pscustomobject]@{ State = "unmeasurable"
-                Detail = "the health probe did not reach the network ($($ex.GetType().FullName): $($ex.Message))" }
-        }""",
-     """        if (-not $we) {
-            return [pscustomobject]@{ State = "down"
-                Detail = "INJECTED: a probe that never ran read as a stopped daemon" }
-        }""",
+     """            return [pscustomobject]@{ State = "unmeasurable"
+                Detail = "the health probe did not reach the network ($($shape.Type): $($ex.Message))" }""",
+     """            return [pscustomobject]@{ State = "down"
+                Detail = "INJECTED: a probe that never ran read as a stopped daemon" }""",
      ["health-off-bad-uri"]),
 
     ("nc-health-reset-is-down",
      "B1: a connect that failed with a RESET is put back in the negative, so a "
      "live peer slamming the door certifies a stopped daemon",
      "zip",
-     """        if ($we.Status -eq [System.Net.WebExceptionStatus]::ConnectFailure -and
-            $sockErr -eq "ConnectionRefused") {""",
-     """        if ($we.Status -eq [System.Net.WebExceptionStatus]::ConnectFailure -and
-            ($sockErr -eq "ConnectionRefused" -or $sockErr -eq "ConnectionReset")) {""",
+     """        if (Test-ConnectionRefused $shape) {""",
+     """        if ((Test-ConnectionRefused $shape) -or
+            ($shape.Status -eq "ConnectFailure" -and $shape.SocketError -eq "ConnectionReset")) {""",
      ["health-off-connectfailure-reset"]),
 
+    # The classifier moved into lib.ps1, so the control that defends it follows
+    # it: without the walk the SocketException an IOException hides is never
+    # reached, and the reset a live listener produces cannot be named at all.
     ("nc-health-inner-chain-not-walked",
-     "B1's evidence: only $we.InnerException is read, so the reset a live "
-     "listener produces cannot even be named in the row",
-     "zip",
-     """        $sockErr = ""
-        $inner = $we.InnerException
-        while ($inner -and -not $sockErr) {
-            $s = $inner -as [System.Net.Sockets.SocketException]
-            if ($s) { $sockErr = $s.SocketErrorCode.ToString() }
-            $inner = $inner.InnerException
-        }""",
-     """        $s = $we.InnerException -as [System.Net.Sockets.SocketException]
-        $sockErr = if ($s) { $s.SocketErrorCode.ToString() } else { "" }""",
+     "B1's evidence: only the direct InnerException is read, so the reset a "
+     "live listener produces cannot even be named in the row",
+     "lib",
+     """    $depth = 0
+    $cur = $Exception.InnerException
+    while ($cur) {
+        $depth++
+        if ($cur.GetType().FullName -eq "System.Net.Sockets.SocketException") {
+            $shape.SocketError = "" + $cur.SocketErrorCode
+            $shape.SocketDepth = $depth
+            break
+        }
+        $cur = $cur.InnerException
+    }""",
+     """    $cur = $Exception.InnerException
+    if ($cur -and $cur.GetType().FullName -eq "System.Net.Sockets.SocketException") {
+        $shape.SocketError = "" + $cur.SocketErrorCode
+        $shape.SocketDepth = 1
+    }""",
      ["health-off-reset-by-live-listener"]),
 
     ("nc-health-timeout-below-the-refusal",
@@ -2584,6 +2805,45 @@ CONTROLS = [
      """            if ($false) { $unproven += "INJECTED: a refused licence no longer makes this row unproven" }""",
      ["nsis-dirs-install-licence-refused", "nsis-dirs-data-licence-refused"]),
 
+    # The defect this row replaced: the observation read the data ROOT, which
+    # this run keeps undeletable with its own DeleteOnClose handle, so it was
+    # true whatever the uninstaller did to the files under it.
+    ("nc-nsis-user-data-files-not-compared",
+     "the row stops comparing the files and rests on the data root, which this "
+     "run's own open handle guarantees -- so an uninstaller that erased every "
+     "user file still passes",
+     "nsis",
+     """        foreach ($rel in $preDataSnapshot.Files.Keys) {""",
+     """        foreach ($rel in @()) {""",
+     ["nsis-user-data-file-erased", "nsis-user-data-file-rewritten"]),
+
+    ("nc-nsis-user-data-post-read-failure-is-survival",
+     "a post-uninstall snapshot that could not be taken stops making the row "
+     "unproven, so a failed read becomes a measured loss or a measured survival "
+     "depending only on what the pre-read happened to hold",
+     "nsis",
+     """        if ($postDataSnapshot.State -ne "taken") {
+            throw "could not measure whether the user's data survived: $($postDataSnapshot.Detail); recorded as unproven, not as survived"
+        }""",
+     """        if ($false) { throw "INJECTED: the post-uninstall snapshot no longer has to have been taken" }""",
+     ["nsis-user-data-post-read-failed"]),
+
+    ("nc-nsis-user-data-pre-read-failure-is-survival",
+     "the pre-uninstall snapshot stops having to have been taken, so the row "
+     "compares against nothing",
+     "nsis",
+     """        if ($null -eq $preDataSnapshot -or $preDataSnapshot.State -ne "taken") {""",
+     """        if ($false) {""",
+     ["nsis-user-data-pre-read-failed"]),
+
+    ("nc-nsis-user-data-nothing-to-lose-is-survival",
+     "an empty pre-uninstall snapshot stops making the row unproven, so a run "
+     "that had no user data certifies that the uninstaller left it alone",
+     "nsis",
+     """        if ($preDataSnapshot.Files.Count -lt 1) {""",
+     """        if ($false) {""",
+     ["nsis-user-data-empty-before"]),
+
     ("nc-zip-leftover-dirs-install-tree-not-examined",
      "ROUND 5, C4 in the other channel: the row reads only the data dir",
      "zip",
@@ -2624,7 +2884,8 @@ CONTROLS = [
 MUST_BE_STUBBED = ["Get-NetTCPConnection", "Get-Process", "Invoke-WebRequest",
                    "Get-CimInstance", "Stop-Process", "schtasks.exe",
                    "netstat.exe", "Stop-OwnedServerProcess", "Stop-ProcessByImage",
-                   "Start-Sleep", "Get-ScheduledTask", "wenlan.exe", "Get-Item"]
+                   "Start-Sleep", "Get-ScheduledTask", "wenlan.exe", "Get-Item",
+                   "Get-TreeFileDigests"]
 
 # Cmdlets that must never appear in EXTRACTED text. The channel scripts delete
 # %LOCALAPPDATA%\wenlan, run installers, unpack archives and KILL PROCESSES;
@@ -2784,8 +3045,8 @@ STATIC_MEMBER_ALLOWED = {
 # `.Kill()` and `.Delete()` are absent, which is the whole point -- they are
 # refused by not being here rather than by being named somewhere.
 INSTANCE_METHOD_ALLOWED = {
-    "add", "contains", "gettype", "indexof", "startswith", "substring",
-    "toarray", "tostring", "trim",
+    "add", "contains", "containskey", "gettype", "indexof", "startswith",
+    "substring", "toarray", "tostring", "trim",
 }
 
 # `&` followed by what it invokes. The alternation order matters: the pinned
@@ -3885,12 +4146,14 @@ def self_check(zip_src, lib_src):
     return bad
 
 
-def build_driver(subject_text, subject, stub_keys, row):
-    funcs = ZIP_FUNCS if subject == "zip" else NSIS_FUNCS
+def build_driver(texts, subject, stub_keys, row):
+    subject_text = texts[subject]
+    funcs = [(subject_text, f) for f in (ZIP_FUNCS if subject == "zip" else NSIS_FUNCS)]
+    funcs += [(texts["lib"], f) for f in LIB_FUNCS]
     stub_text = "".join(STUBS[k] for k in stub_keys)
     parts = [PREAMBLE, stub_text]
-    for fn in funcs:
-        body = extract_function(subject_text, fn)
+    for src, fn in funcs:
+        body = extract_function(src, fn)
         assert_extract_is_inert(body, "function %s" % fn)
         parts.append(body)
         parts.append("\n")
@@ -4078,7 +4341,7 @@ def classify_driver_output(row, out, returncode, want_status, want_detail,
     return ("pass", "")
 
 
-def run_case(work, subject_text, case, label=None):
+def run_case(work, texts, case, label=None):
     """Run one case. Returns ("pass" | "fail" | "unmeasured", why).
 
     ROUND 5 (Codex Sol), FINDING 1. The verdict used to be a BOOLEAN with the
@@ -4095,7 +4358,7 @@ def run_case(work, subject_text, case, label=None):
     log_base = case_log_name(name, label)
     try:
         out, rc = run_driver(work, ("%s--%s" % (label, name)) if label else name,
-                             build_driver(subject_text, subject, stub_keys, row), env)
+                             build_driver(texts, subject, stub_keys, row), env)
     except (subprocess.TimeoutExpired, OSError) as exc:
         # The driver never returned, and there is no transcript to point at.
         return ("unmeasured", "the driver did not return: %r" % (exc,))
@@ -4130,7 +4393,7 @@ def run_all(work, texts, subject_filter=None, label=None):
     """
     todo = [c for c in CASES if not subject_filter or c[1] == subject_filter]
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        results = list(pool.map(lambda c: run_case(work, texts[c[1]], c, label), todo))
+        results = list(pool.map(lambda c: run_case(work, texts, c, label), todo))
     buckets = {"pass": [], "fail": [], "unmeasured": []}
     for case, (verdict, why) in zip(todo, results):
         buckets[verdict].append(case[0])
@@ -4290,18 +4553,16 @@ def main():
     nsis_bytes_before = NSIS.read_bytes()
     zip_before = ZIP.read_text(encoding="utf-8")
     nsis_before = NSIS.read_text(encoding="utf-8")
-    # READ ONCE, never mutated, and deliberately NOT part of the
-    # "did the source change during the run" snapshot below: lib.ps1 belongs to
-    # another lane, no control touches it, and nothing extracted from it is
-    # executed. It is here only so `Check`'s shipped contract can be compared
-    # against the replica in PREAMBLE.
+    # lib.ps1 is a driven subject: `Check`'s shipped contract is compared
+    # against the replica in PREAMBLE, AND the three web-exception classifiers
+    # the channels delegate to are extracted from it and mutated by controls.
     try:
         lib_before = LIB.read_text(encoding="utf-8")
     except OSError as e:
         print("  STALE  %s could not be read (%s); the replica's Check could not "
               "be compared against the contract it models" % (LIB, e))
         lib_before = ""
-    texts = {"zip": zip_before, "nsis": nsis_before}
+    texts = {"zip": zip_before, "nsis": nsis_before, "lib": lib_before}
 
     print("windows-probes-negative-controls")
 
@@ -4328,7 +4589,8 @@ def main():
                       % (label, pattern, ", ".join("%s:%d" % (label, n) for n in ns), why))
                 hard += 1
         reach_chunks = []
-        for fn_list, key in ((ZIP_FUNCS, "zip"), (NSIS_FUNCS, "nsis")):
+        for fn_list, key in ((ZIP_FUNCS, "zip"), (NSIS_FUNCS, "nsis"),
+                             (LIB_FUNCS, "lib")):
             for fn in fn_list:
                 try:
                     body = extract_function(texts[key], fn)
@@ -4370,7 +4632,8 @@ def main():
                 if k not in STUBS:
                     print("  STALE  case %s names unknown stub %r" % (case[0], k))
                     hard += 1
-        known_vars = set(PREAMBLE_VARS) | {v for v, _s in SETUP.values()}
+        known_vars = set(PREAMBLE_VARS) | {v for d, _s in SETUP.values()
+                                           for v in _setup_vars(d)}
         for subject, row in sorted(subject_rows):
             label = "%s row %s" % (subject, row)
             try:
@@ -4396,9 +4659,12 @@ def main():
                       "wrong reason)" % (label, ", ".join("$" + v for v in loose)))
                 hard += 1
                 continue
-            if (subject, row) in SETUP and SETUP[(subject, row)][0] not in free_variables(body):
-                print("  STALE  Check %s no longer uses $%s, so its setup line "
-                      "drives nothing" % (label, SETUP[(subject, row)][0]))
+            unused = [v for v in _setup_vars(SETUP.get((subject, row), ("",))[0])
+                      if v and v not in free_variables(body)]
+            if unused:
+                print("  STALE  Check %s no longer uses %s, so its setup line "
+                      "drives nothing"
+                      % (label, ", ".join("$" + v for v in unused)))
                 hard += 1
                 continue
             reach_chunks.append(("Check %s" % label, body))
@@ -4407,7 +4673,8 @@ def main():
         try:
             assert_every_reachable_command_is_accounted_for(
                 reach_chunks,
-                set(MUST_BE_STUBBED) | set(ZIP_FUNCS) | set(NSIS_FUNCS))
+                set(MUST_BE_STUBBED) | set(ZIP_FUNCS) | set(NSIS_FUNCS)
+                | set(LIB_FUNCS))
             print("  ok     every command reachable from extracted text is "
                   "stubbed, driver-defined or inert")
         except ValueError as e:
@@ -4507,7 +4774,9 @@ def main():
             mtexts = dict(texts)
             mtexts[subject] = mutated
             mpassed, mfailed, munmeasured = run_all(
-                work, mtexts, subject_filter=subject, label=name)
+                work, mtexts,
+                subject_filter=CONTROL_CASE_CHANNEL.get(subject, subject),
+                label=name)
             (LOGS / ("%s.log" % name)).write_text(
                 "passed: %s\nfailed: %s\nunmeasured: %s\n"
                 % (mpassed, mfailed, munmeasured), encoding="utf-8")
