@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=abd449a0aa5ce5325c272e35ef486a6a8b7295bd5009c620aaf50f317f805fe9 -->
+<!-- README_SYNC: source=README.md sha256=a0461fc92a4c4fb5027d1f063f425f25438c5181ff3cb478c2705385e779b4ab -->
 
 <p align="center">
   <picture>
@@ -125,9 +125,7 @@ Wenlan 把文档、笔记和过去的 AI 对话整理成会随工作持续更新
 
 **Wenlan 最独特的做法：** 来源与原子记忆会分别支撑持续维护的页面。记忆历史保留知识如何改变；页面历史说明当前结论由哪些依据支撑。机器维护的页面可以依当前依据重建；对人工文字的改动则成为可审核的修订，不会直接覆盖。
 
-<p align="center">
-  <img src="./docs/assets/feature-reel.gif" alt="Wenlan feature reel，展示有来源支撑的页面、来源检查、graph context、agent capture 与 curation。" width="100%">
-</p>
+https://github.com/user-attachments/assets/f206fd82-bb25-4bf3-8d6e-82242c12bd8a
 
 <a id="knowledge-graph"></a>
 

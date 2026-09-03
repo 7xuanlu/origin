@@ -125,9 +125,7 @@ For the complete workflow, see the [LLM-wiki implementation guide](https://wenla
 
 **Wenlan's distinctive move:** Sources and atomic Memories independently support maintained Pages. Memory history preserves how knowledge changed; Page history shows which current evidence supports the synthesis. Machine-maintained Pages can rebuild from current support, while changes to human writing wait as reviewable revisions.
 
-<p align="center">
-  <img src="./docs/assets/feature-reel.gif" alt="Wenlan feature reel showing source-backed pages, source inspection, graph context, agent capture, and curation." width="100%">
-</p>
+https://github.com/user-attachments/assets/ee4c3a7f-3609-46e5-8538-be26c4963caa
 
 <a id="knowledge-graph"></a>
 
