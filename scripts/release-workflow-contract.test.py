@@ -1986,8 +1986,8 @@ SIGNPATH_GUARD_TRUTH_TABLE: tuple[
     #
     # Rows 1 and 2 above already cover REQUIRED=false: unset behaves as false,
     # and the guard cannot tell an unset variable from an explicit one. These
-    # four make each combination explicit, because the matrix is the finding and
-    # a matrix that is only implied is a matrix nobody checked.
+    # four make each combination explicit, because a matrix that is only implied
+    # is a matrix nobody checked.
     (
         "not required, not configured: today's upstream state and every fork's",
         {"SIGNPATH_CONFIGURED": "false", "SIGNPATH_REQUIRED": "false"},
@@ -2234,8 +2234,8 @@ def _filtering_server_but(project_reply: str) -> tuple[tuple[str, str], ...]:
 #: Columns: description, env, stub replies, expected exit, text the output
 #: MUST contain, text it must NOT contain.
 #:
-#: The exit column carries three states, not two, and that is the finding this
-#: table exists to hold on to:
+#: The exit column carries three states, not two, and that is what this table
+#: exists to hold on to:
 #:
 #:   0  everything this run looked at answered affirmatively
 #:   1  something answered NEGATIVELY
@@ -2592,7 +2592,7 @@ def _stub_curl(directory: str, replies: tuple[tuple[str, str], ...]) -> None:
     shape a TRANSFER THAT FAILED has: curl prints the status line it had already
     received through `-w` and then exits non-zero (28 timeout, 18 short body, 56
     reset). Without it this stub could only ever produce completed requests, and
-    the round-5 finding is precisely about the ones that do not complete.
+    the rows that matter here are the ones that do not complete.
     """
     lines = [
         "#!/usr/bin/env bash",
@@ -3772,26 +3772,24 @@ def authenticode_behaviour_violations(
 ) -> AuthenticodeRun:
     """Run the shipped Authenticode step against real signed and broken files.
 
-    Nothing here is stubbed: Windows itself answers, over files whose signature
-    state was produced rather than asserted. One qualification, because round
-    13d was right that "nothing is mocked" overstated it -- the `accepted` row
-    substitutes the expected publisher, since no host running this has a
-    SignPath-signed file. It measures that a valid signature from the expected
-    publisher reaches PASS; the literal `SignPath Foundation` is pinned by a
-    separate static contract, and the publisher mutation below is what shows the
-    comparison is load-bearing. The static contract on this step is all
-    substring markers, so
-    an `exit 0` inserted at the top of the body satisfies every one of them and
-    ships an unsigned installer -- the exact defect class this workstream exists
-    to catch, in the gate that is supposed to catch it.
+    Windows itself answers, over files whose signature state was produced rather
+    than asserted. One qualification: the `accepted` row substitutes the expected
+    publisher, since no host running this has a SignPath-signed file. It measures
+    that a valid signature from the expected publisher reaches PASS; the literal
+    `SignPath Foundation` is pinned by a separate static contract, and the
+    publisher mutation below is what shows the comparison is load-bearing. That
+    static contract is all substring markers, so an `exit 0` inserted at the top
+    of the body satisfies every one of them and ships an unsigned installer --
+    the exact defect class this workstream exists to catch, in the gate that is
+    supposed to catch it.
 
-    Coverage degrades by ROW, not all-or-nothing. The
-    `missing` row needs no Authenticode at all -- the step throws on Test-Path
-    before it reaches the cmdlet -- so it runs anywhere pwsh exists, including
-    the Ubuntu lane that actually runs this suite in CI, and it is the row that
-    catches an early `exit 0`. The four signature-state rows need Windows. The
-    caller is told which kinds ran so it can require exactly the mutations those
-    rows can catch, and name the rest UNCHECKED rather than passing over them.
+    Coverage degrades by ROW, not all-or-nothing. The `missing` row needs no
+    Authenticode at all -- the step throws on Test-Path before it reaches the
+    cmdlet -- so it runs anywhere pwsh exists, including the Ubuntu lane that
+    actually runs this suite in CI, and it is the row that catches an early
+    `exit 0`. The four signature-state rows need Windows. The caller is told
+    which kinds ran so it can require exactly the mutations those rows can catch,
+    and name the rest UNCHECKED rather than passing over them.
 
     `only` restricts the pass to the named kinds. A mutation control already
     knows which rows can catch its mutation, and the rows that cannot are pure
