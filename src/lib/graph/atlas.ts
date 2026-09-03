@@ -1235,12 +1235,16 @@ function dimFill(color: string, surface: string): string {
  *   unless the anchor is hovered, which shows the first HOVER_DUST_MAX. An island node (`island`) is drawn dim and nameless until
  *   `lod.islandsSolid`.
  * - HOVER, the round-2 spec: no-hover passthrough, the hovered node itself,
- *   its neighbors, everyone else muted and blanked. Neighbors are also named
- *   (`forceLabel`) when there are at most NEIGHBOR_LABEL_MAX of them: the
+ *   its neighbors, everyone else muted and blanked. The hovered node and, when
+ *   there are at most NEIGHBOR_LABEL_MAX of them, its neighbors are LIFTED:
+ *   `highlighted` makes sigma redraw their discs and labels on the hover
+ *   layer, above every label the grid paints, so a lit dot is never buried
+ *   under a neighbouring name. Neighbors are named (`forceLabel`) because the
  *   whole point of lighting them is to show what the node connects to, and
- *   small nodes never earn a label from sigma's size threshold on their own.
- *   Past the cap the label grid decides, so a hub with dozens of memories
- *   does not turn into a wall of text.
+ *   small nodes never earn a label from sigma's size threshold on their own;
+ *   where those names land is layoutFocusLabels' job. Past the cap the label
+ *   grid decides, so a hub with dozens of memories does not turn into a wall
+ *   of text.
  */
 export function nodeDisplay(
   state: HoverState,
@@ -1259,9 +1263,11 @@ export function nodeDisplay(
     base = { ...attrs, color: dimFill(attrs.color as string, palette.surface), label: "" };
   }
   if (state.hovered === null) return base;
-  if (nodeId === state.hovered) return { ...attrs, forceLabel: true, zIndex: 2 };
+  if (nodeId === state.hovered) return { ...attrs, forceLabel: true, highlighted: true, zIndex: 2 };
   if (state.neighbors.has(nodeId)) {
-    return state.neighbors.size <= NEIGHBOR_LABEL_MAX ? { ...attrs, forceLabel: true, zIndex: 1 } : { ...attrs, zIndex: 1 };
+    return state.neighbors.size <= NEIGHBOR_LABEL_MAX
+      ? { ...attrs, forceLabel: true, highlighted: true, zIndex: 1 }
+      : { ...attrs, zIndex: 1 };
   }
   return { ...base, color: palette.edge, label: "", zIndex: 0 };
 }
@@ -1326,26 +1332,53 @@ export function drawRadialNodeLabel(
   halo?: string,
 ): void {
   if (!data.label) return;
-  const pad = (data.size as number) + 8;
   const gx = graph.getNodeAttribute(data.key, "x") as number;
   const gy = graph.getNodeAttribute(data.key, "y") as number;
   const angle = Math.atan2(-gy, gx);
   const sector = Math.round((angle + Math.PI) / (Math.PI / 2)) % 4;
+  const side: LabelSide = sector === 0 ? "right" : sector === 2 ? "left" : sector === 1 ? "below" : "above";
+  drawNodeLabelAt(context, data, settings, labelAnchor(data.x as number, data.y as number, data.size as number, side), halo);
+}
 
-  let x = data.x as number;
-  let y = data.y as number;
-  if (sector === 0 || sector === 2) {
-    const isRight = sector === 0;
-    context.textAlign = isRight ? "left" : "right";
-    context.textBaseline = "middle";
-    x += isRight ? pad : -pad;
-  } else {
-    const isBelow = sector === 1;
-    context.textAlign = "center";
-    context.textBaseline = isBelow ? "top" : "bottom";
-    y += isBelow ? pad : -pad;
+/** Which side of its dot a label sits on. */
+export type LabelSide = "left" | "right" | "above" | "below";
+
+/** A resolved label position: the canvas anchor plus how the text hangs off it. */
+export interface LabelPlacement {
+  x: number;
+  y: number;
+  align: CanvasTextAlign;
+  baseline: CanvasTextBaseline;
+}
+
+/** Anchor for a label on `side` of a dot at (x, y) of radius `size`, `push`
+ *  extra px further out. The same geometry drawRadialNodeLabel always used. */
+export function labelAnchor(x: number, y: number, size: number, side: LabelSide, push = 0): LabelPlacement {
+  const pad = size + 8 + push;
+  switch (side) {
+    case "right":
+      return { x: x + pad, y, align: "left", baseline: "middle" };
+    case "left":
+      return { x: x - pad, y, align: "right", baseline: "middle" };
+    case "below":
+      return { x, y: y + pad, align: "center", baseline: "top" };
+    case "above":
+      return { x, y: y - pad, align: "center", baseline: "bottom" };
   }
+}
 
+/** Paint one label at a resolved placement: the shared 12px face at 85% ink
+ *  over an optional ground-coloured halo. */
+export function drawNodeLabelAt(
+  context: CanvasRenderingContext2D,
+  data: Record<string, any>,
+  settings: Record<string, any>,
+  at: LabelPlacement,
+  halo?: string,
+): void {
+  if (!data.label) return;
+  context.textAlign = at.align;
+  context.textBaseline = at.baseline;
   context.font = NODE_LABEL_FONT;
   context.fillStyle = settings.labelColor?.color ?? "#000000";
   context.globalAlpha = 0.85;
@@ -1353,8 +1386,117 @@ export function drawRadialNodeLabel(
     context.lineJoin = "round";
     context.lineWidth = NODE_LABEL_HALO_WIDTH;
     context.strokeStyle = halo;
-    context.strokeText(data.label, x, y);
+    context.strokeText(data.label, at.x, at.y);
   }
-  context.fillText(data.label, x, y);
+  context.fillText(data.label, at.x, at.y);
   context.globalAlpha = 1;
+}
+
+/** A node as the focus layout sees it: viewport px, CSS-px radius, its name. */
+export interface FocusLabelNode {
+  key: string;
+  x: number;
+  y: number;
+  size: number;
+  label: string;
+}
+
+/** Height of one 12px label line, in CSS px, for collision boxes. */
+const LABEL_LINE_HEIGHT = 14;
+/** Clearance kept around a lit dot and between two names, in CSS px. */
+const LABEL_CLEARANCE = 2;
+
+interface Box {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+function overlaps(a: Box, b: Box): boolean {
+  return (
+    a.x < b.x + b.w + LABEL_CLEARANCE &&
+    a.x + a.w + LABEL_CLEARANCE > b.x &&
+    a.y < b.y + b.h + LABEL_CLEARANCE &&
+    a.y + a.h + LABEL_CLEARANCE > b.y
+  );
+}
+
+function boxFor(at: LabelPlacement, width: number): Box {
+  const x = at.align === "left" ? at.x : at.align === "right" ? at.x - width : at.x - width / 2;
+  const y =
+    at.baseline === "top" ? at.y : at.baseline === "bottom" ? at.y - LABEL_LINE_HEIGHT : at.y - LABEL_LINE_HEIGHT / 2;
+  return { x, y, w: width, h: LABEL_LINE_HEIGHT };
+}
+
+function discBox(node: FocusLabelNode): Box {
+  const r = node.size + LABEL_CLEARANCE;
+  return { x: node.x - r, y: node.y - r, w: 2 * r, h: 2 * r };
+}
+
+/** The side of `from` that points away from (dx, dy): the dominant axis wins. */
+function sideAway(dx: number, dy: number): LabelSide {
+  if (Math.abs(dx) >= Math.abs(dy)) return dx >= 0 ? "right" : "left";
+  return dy >= 0 ? "below" : "above";
+}
+
+const SIDES: LabelSide[] = ["right", "left", "above", "below"];
+
+/**
+ * Where the names of a focused neighborhood go. A hover or a search jump
+ * lights one node and its neighbors and names them all; in a tight cluster
+ * the plain radial rule stacks those names on top of each other and over the
+ * lit dots themselves, and the last one painted wins. This pass lays them
+ * out instead:
+ *
+ * - each name radiates AWAY from the focus (a neighbor right of the focus
+ *   hangs its name to the right), the focus's own name away from where its
+ *   neighbors sit, so the cluster reads as a hub with spokes;
+ * - names are placed nearest-first and never overlap a placed name or any
+ *   lit dot; a name whose preferred side is taken tries the other sides,
+ *   then its preferred side pushed further out;
+ * - a name that fits nowhere is left off the map rather than painted over
+ *   something. Its dot stays lit and hoverable.
+ *
+ * Coordinates are viewport CSS px; `measure` is the canvas text width for
+ * the label font. Returns a placement per node key that got one.
+ */
+export function layoutFocusLabels(
+  focus: FocusLabelNode,
+  neighbors: FocusLabelNode[],
+  measure: (text: string) => number,
+): Map<string, LabelPlacement> {
+  const placed: Box[] = [focus, ...neighbors].map(discBox);
+  const out = new Map<string, LabelPlacement>();
+  const tryPlace = (node: FocusLabelNode, preferred: LabelSide) => {
+    if (!node.label) return;
+    const width = measure(node.label);
+    const candidates: Array<[LabelSide, number]> = [
+      [preferred, 0],
+      ...SIDES.filter((side) => side !== preferred).map((side): [LabelSide, number] => [side, 0]),
+      [preferred, LABEL_LINE_HEIGHT],
+      [preferred, 2 * LABEL_LINE_HEIGHT],
+    ];
+    for (const [side, push] of candidates) {
+      const at = labelAnchor(node.x, node.y, node.size, side, push);
+      const box = boxFor(at, width);
+      if (placed.some((other) => overlaps(box, other))) continue;
+      placed.push(box);
+      out.set(node.key, at);
+      return;
+    }
+  };
+  // The focus faces away from the centroid of its neighbors.
+  let cx = 0;
+  let cy = 0;
+  for (const n of neighbors) {
+    cx += n.x - focus.x;
+    cy += n.y - focus.y;
+  }
+  tryPlace(focus, neighbors.length === 0 ? "right" : sideAway(-cx, -cy));
+  const byDistance = [...neighbors].sort(
+    (a, b) => Math.hypot(a.x - focus.x, a.y - focus.y) - Math.hypot(b.x - focus.x, b.y - focus.y),
+  );
+  for (const n of byDistance) tryPlace(n, sideAway(n.x - focus.x, n.y - focus.y));
+  return out;
 }
