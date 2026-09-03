@@ -15,17 +15,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 // to write would manufacture that finding out of a green run. The third case
 // below — green command, unwritable ledger — is the one that matters.
 
-// Every case here spawns node -> Git Bash -> attest.sh, which costs a few
-// hundred milliseconds on an idle box and several seconds when other agents are
-// building on the same machine: the lock case below measured 2.9s alone and
-// over 5s under a full parallel run of scripts/. At vitest's 5000ms default a
-// red here is therefore a statement about the HOST, not about attest.sh -- an
-// unmeasured run wearing the same red as a real behavioural failure, which is
-// the exact confusion this wrapper exists to prevent in the ledger. Raised at
-// file scope (it touches no other suite) so a slow host reports slowly instead
-// of falsely; the cases that poll, or spawn twelve writers, keep their own
-// larger budgets at the call site, and those are the ones a genuine hang would
-// still be caught by.
+// Every case spawns node -> Git Bash -> attest.sh: a few hundred milliseconds
+// idle, and measured here, 2.9s for the lock case alone and over 5s under a
+// full parallel run of scripts/. At vitest's 5000ms default a red is a
+// statement about the HOST, not about attest.sh. Raised at file scope (it
+// touches no other suite); the cases that poll or spawn twelve writers keep
+// their own larger budgets at the call site, and those are the ones a genuine
+// hang is still caught by.
 vi.setConfig({ testTimeout: 30_000 });
 
 const root = resolve(import.meta.dirname, "..");
@@ -166,37 +162,28 @@ describe("attest.sh: the run is recorded, or the wrapper fails", () => {
     expect(() => readFileSync(ledger, "utf8")).toThrow();
   });
 
-  // The two commands that used to walk out of the wrapper before it could write
-  // anything. The arguments were executed by the wrapper's own shell, so a
-  // builtin able to end that shell ended the WRAPPER: `exit` returned from it at
-  // the call site, and `exec` replaced it outright. Both left status 0 and no
-  // ledger row — and the sweep reads a missing row as "the smoke never ran", so
-  // silence behind a green exit is the one answer this file may not give.
-  // Measured before the fix: `bash scripts/attest.sh exit 0` and
-  // `bash scripts/attest.sh exec true` each exited 0 with no ledger file at all.
-  it("records `exit 0`, which used to return from the wrapper itself", () => {
+  // The two commands that can walk out of the wrapper before it writes
+  // anything. The arguments run in the wrapper's own shell, so a builtin able to
+  // end that shell ends the WRAPPER: `exit` returns from it at the call site and
+  // `exec` replaces it outright. Measured without the containing subshell:
+  // `bash scripts/attest.sh exit 0` and `bash scripts/attest.sh exec true` each
+  // exited 0 with no ledger file at all — and the sweep reads a missing row as
+  // "the smoke never ran", so silence behind a green exit is the one answer
+  // this wrapper may not give.
+  it.each([
+    ["records `exit 0`, which used to return from the wrapper itself", ["exit", "0"]],
+    ["records `exec`, which used to replace the wrapper outright", ["exec", "true"]],
+  ])("%s", (_title, args) => {
     const dir = makeTempRoot();
     const ledger = resolve(dir, "attest.jsonl");
 
-    const result = runAttest(["exit", "0"], { WENLAN_ATTEST_LEDGER: ledger });
+    const result = runAttest(args, { WENLAN_ATTEST_LEDGER: ledger });
 
     expect(result.status, result.stderr).toBe(0);
     const rows = readLedger(ledger);
     expect(rows).toHaveLength(1);
-    expect(rows[0].command).toBe("exit 0");
+    expect(rows[0].command).toBe(args.join(" "));
     expect(rows[0].status).toBe(0);
-  });
-
-  it("records `exec`, which used to replace the wrapper outright", () => {
-    const dir = makeTempRoot();
-    const ledger = resolve(dir, "attest.jsonl");
-
-    const result = runAttest(["exec", "true"], { WENLAN_ATTEST_LEDGER: ledger });
-
-    expect(result.status, result.stderr).toBe(0);
-    const rows = readLedger(ledger);
-    expect(rows).toHaveLength(1);
-    expect(rows[0].command).toBe("exec true");
   });
 
   // A non-zero `exit` must still reach the caller through the subshell, or the
@@ -332,13 +319,12 @@ describe("attest.sh: concurrent writers", () => {
 
   // ---- the stamp is what makes the lock a lock ----
   //
-  // Round 15: `LOCK_HELD=1` followed the owner write unconditionally, and the
-  // stamp was `$(date +%s || printf 0)`. A holder that cannot stamp is
-  // indistinguishable from a crashed one -- the unstamped-lock breaker removes
-  // it after ~2s -- and a stamp of 0 makes a LIVE holder look about 1.7 billion
-  // seconds old, so any waiter reclaims it immediately. Both hand the lock to a
-  // second writer while the first still believes it holds it, which is the
-  // interleaving the lock exists to remove.
+  // `LOCK_HELD=1` following the owner write unconditionally, or a stamp of
+  // `$(date +%s || printf 0)`, both hand the lock to a second writer while the
+  // first still believes it holds it: a holder that cannot stamp is
+  // indistinguishable from a crashed one and the unstamped-lock breaker removes
+  // it after ~2s, and a stamp of 0 makes a LIVE holder look about 1.7 billion
+  // seconds old, so any waiter reclaims it immediately.
   //
   // Driven through PATH, never by editing the script: the stub goes in a
   // directory prepended INSIDE the shell, because the MSYS runtime puts its own
@@ -399,49 +385,38 @@ describe("attest.sh: concurrent writers", () => {
     return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
   }
 
-  it("refuses the lock when the clock cannot be read, instead of stamping it 0", () => {
+  // A stamp of 0 makes a LIVE lock reclaimable by the next writer that looks at
+  // it, and a non-numeric stamp is rejected by `lock_age_s`, so every waiter
+  // reads that lock as unstamped and breaks it — the same outcome as never
+  // stamping. The second row also pins the duration guard: with `[ -n ... ]` in
+  // place of the numeric test the wrapper died at
+  // `$(( END_EPOCH - START_EPOCH ))` with `not: unbound variable`, after the
+  // command ran and before any row, never reaching the lock at all.
+  it.each([
+    [
+      "refuses the lock when the clock cannot be read, instead of stamping it 0",
+      "#!/usr/bin/env bash\nexit 1\n",
+    ],
+    [
+      "refuses the lock when the clock answers something that is not a time",
+      '#!/usr/bin/env bash\nprintf %s "not-a-time"\n',
+    ],
+  ])("%s", (_title, dateStub) => {
     const dir = makeTempRoot();
     const ledger = resolve(dir, "attest.jsonl");
 
     const result = runAttestWithStubs(
       ["echo", "green"],
       { WENLAN_ATTEST_LEDGER: ledger, WENLAN_ATTEST_LOCK_WAIT_S: "1" },
-      { date: "#!/usr/bin/env bash\nexit 1\n" },
+      { date: dateStub },
     );
 
     expect(result.stderr).not.toContain("STUB date NOT IN EFFECT");
-    // A stamp of 0 would have been accepted by the old code and would make this
-    // live lock reclaimable by the next writer that looked at it.
+    expect(result.stderr).not.toContain("unbound variable");
     expect(result.stderr).toContain("cannot read a usable clock");
     expect(result.stderr).toContain("was NOT recorded");
     expect(result.status).toBe(1);
     // Nothing recorded, and nothing left holding the ledger either.
-    expect(existsSync(ledger)).toBe(false);
-    expect(existsSync(`${ledger}.lock`)).toBe(false);
-  }, 60_000);
-
-  it("refuses the lock when the clock answers something that is not a time", () => {
-    const dir = makeTempRoot();
-    const ledger = resolve(dir, "attest.jsonl");
-
-    const result = runAttestWithStubs(
-      ["echo", "green"],
-      { WENLAN_ATTEST_LEDGER: ledger, WENLAN_ATTEST_LOCK_WAIT_S: "1" },
-      { date: '#!/usr/bin/env bash\nprintf %s "not-a-time"\n' },
-    );
-
-    expect(result.stderr).not.toContain("STUB date NOT IN EFFECT");
-    // `lock_age_s` rejects a non-numeric stamp, so writing one produces a lock
-    // that every waiter reads as unstamped and breaks -- the same outcome as
-    // never stamping it.
-    //
-    // This case also pins the duration guard: with `[ -n ... ]` in place of the
-    // numeric test, the wrapper died at `$(( END_EPOCH - START_EPOCH ))` with
-    // `not: unbound variable` -- after the command ran, before any row -- and
-    // never reached the lock at all. Measured here before the guard was added.
-    expect(result.stderr).not.toContain("unbound variable");
-    expect(result.stderr).toContain("cannot read a usable clock");
-    expect(result.status).toBe(1);
     expect(existsSync(ledger)).toBe(false);
     expect(existsSync(`${ledger}.lock`)).toBe(false);
   }, 60_000);
@@ -481,13 +456,12 @@ describe("attest.sh: concurrent writers", () => {
     expect(existsSync(ledger)).toBe(false);
   }, 60_000);
 
-  // ROUND 5. The write's status was read; the READ-BACK's was thrown away. The
-  // check was one `[ "$(cat "$LOCK_DIR/owner" 2>/dev/null)" != "$$ $stamp" ]`,
-  // which compares TEXT: a `cat` that prints the expected `PID timestamp` and
-  // then exits non-zero satisfies "not unequal", and LOCK_HELD became 1 on a
-  // read that failed. Reading the stamp back exists to tell a stamp that is on
-  // disk from one that only appeared to be written, and half of that question
-  // is the status.
+  // The write's status is not enough; the READ-BACK's matters too. A check of
+  // `[ "$(cat "$LOCK_DIR/owner" 2>/dev/null)" != "$$ $stamp" ]` compares TEXT,
+  // so a `cat` that prints the expected `PID timestamp` and then exits non-zero
+  // satisfies "not unequal" and LOCK_HELD becomes 1 on a read that failed.
+  // Reading the stamp back exists to tell a stamp that is on disk from one that
+  // only appeared to be written, and half of that question is the status.
   //
   // The stub prints the real bytes and then fails, which is the shape of a read
   // error after the buffer was already flushed -- the one shape that cannot be
@@ -521,12 +495,12 @@ describe("attest.sh: concurrent writers", () => {
     expect(existsSync(ledger)).toBe(false);
   }, 60_000);
 
-  // ROUND 5, the other end of the same lock. `rm -f`/`rmdir` ran with their
-  // statuses dropped and `LOCK_HELD=0` underneath them, so a lock that could
-  // not be removed was spelled exactly like one that was: the row is written,
-  // the wrapper exits 0, and the lock it says it released is still on disk --
-  // where it makes every later writer wait LOCK_WAIT_S and then refuse to
-  // record ITS run, with nothing in this run's output to explain it.
+  // The other end of the same lock. `rm -f`/`rmdir` with their statuses dropped
+  // and `LOCK_HELD=0` underneath spells a lock that could not be removed
+  // exactly like one that was: the row is written, the wrapper exits 0, and the
+  // lock it says it released is still on disk — where it makes every later
+  // writer wait LOCK_WAIT_S and then refuse to record ITS run, with nothing in
+  // this run's output to explain it.
   it("does not exit 0 claiming a release that did not happen", () => {
     const dir = makeTempRoot();
     const ledger = resolve(dir, "attest.jsonl");
