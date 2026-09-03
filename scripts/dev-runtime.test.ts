@@ -903,8 +903,11 @@ describe("dev runtime outcome marker", () => {
     // believed it held a lock whose owner nothing had recorded — and the next
     // command reads an owner-less lock, which is precisely the state S4 above
     // now refuses. One dropped status manufactures the other finding's input.
+    // And it is a CREATE-OR-FAIL write: `set -C` is what stops a run whose
+    // directory was broken and retaken from stamping its name over the new
+    // holder's record and returning "acquired" to both of them.
     expect(code, "the lock owner write is not checked").toMatch(
-      /if ! printf '%s\\n' "\$\$" >"\$LOCK_OWNER_FILE"; then/,
+      /if ! \( set -C; printf '%s\\n' "\$token" >"\$LOCK_OWNER_FILE" \) 2>\/dev\/null; then/,
     );
     // And the flag the EXIT trap releases on is set only after that write has
     // been shown to have happened, not before it is attempted.
@@ -1786,6 +1789,10 @@ describe("dev runtime lock release and recovery", () => {
       // did not declare it would abort inside the trap — which is the one place
       // this file's contract cannot express a failure.
       "RUNTIME_LOCK_STOLEN=0",
+      // The release compares the owner file against this run's ACQUISITION
+      // token rather than against `$$`, and `acquire_runtime_lock` mints one.
+      'RUNTIME_LOCK_TOKEN=""',
+      "RUNTIME_LOCK_GEN=0",
       "RUNTIME_EXIT_RAN=0",
       "RESULT_EMITTED=0",
       "RESULT_KIND=ok",
@@ -1863,7 +1870,11 @@ describe("dev runtime lock release and recovery", () => {
   const releaseRun = (shims: Record<string, string> = {}): Run =>
     drive(['eval "$WENLAN_TEST_FIXTURE"', RELEASE_DRIVER].join("\n"), releaseFns, { shims });
 
-  const FIXTURE_OWNED = 'mkdir -p "$LOCK_DIR"; printf "%s\\n" "$$" >"$LOCK_OWNER_FILE"';
+  // The owner file carries this run's acquisition token, which is what the
+  // release compares against; a bare `$$` is somebody else's record now.
+  const FIXTURE_OWNED =
+    'mkdir -p "$LOCK_DIR"; RUNTIME_LOCK_TOKEN="$$ 1.1.1"; ' +
+    'printf "%s\\n" "$RUNTIME_LOCK_TOKEN" >"$LOCK_OWNER_FILE"';
   const FIXTURE_DIR_ONLY = 'mkdir -p "$LOCK_DIR"';
   const FIXTURE_UNREMOVABLE = 'mkdir -p "$LOCK_DIR/squatter"';
   const FIXTURE_OTHER_OWNER = 'mkdir -p "$LOCK_DIR"; printf "999999\\n" >"$LOCK_OWNER_FILE"';
@@ -1927,7 +1938,8 @@ describe("dev runtime lock release and recovery", () => {
   // Leaving it alone is right; calling that a release is not.
   it("refuses to report ok when the lock is recorded to another run", () => {
     const run = withFixture(FIXTURE_OTHER_OWNER);
-    expect(run.stderr).toContain("is recorded to PID 999999");
+    expect(run.stderr).toContain("recorded to another acquisition");
+    expect(run.stderr).toContain("[999999]");
     expect(lastLine(run.stderr), run.stderr).toBe("DEV_RUNTIME_RESULT: unknown");
     expect(run.status).not.toBe(0);
     // ROUND 6, and it is about the WORDS, because the status was already
@@ -2213,6 +2225,7 @@ describe("dev runtime lock release and recovery", () => {
     "list_dir_tristate",
     "listing_has_name",
     "lock_owner_file_appeared",
+    "lock_new_token",
     "acquire_runtime_lock",
   ];
   const ACQUIRE_DRIVER = [
@@ -2249,7 +2262,9 @@ describe("dev runtime lock release and recovery", () => {
         '( sleep 0.5; rmdir "$LOCK_DIR" ) &',
       ].join("\n"),
     );
-    expect(run.stdout.trim(), run.stderr).toMatch(/^rc=0 held=1 owner=\d+$/);
+    // `PID gen.nonce.nonce`: the owner record names an acquisition, so two
+    // generations of the directory cannot compare equal.
+    expect(run.stdout.trim(), run.stderr).toMatch(/^rc=0 held=1 owner=\d+ \d+\.\d+\.\d+$/);
   }, 60_000);
 
   // And the answer that must NOT change: a lock that is there throughout and
