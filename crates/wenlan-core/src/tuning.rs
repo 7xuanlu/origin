@@ -426,7 +426,7 @@ pub struct ConfidenceConfig {
 /// T21 Stage 1 — archive-not-delete soft eviction policy.
 ///
 /// Controls which stale, low-value memories the refinery's `evict` phase
-/// flips to `supersede_mode='archive'` (recoverable, never hard-deleted).
+/// flips to `supersede_mode='evicted'` (recoverable, never hard-deleted).
 /// All gates are conservative and the feature is opt-in via
 /// `WENLAN_ENABLE_EVICTION`; see [`crate::db::eviction_enabled`].
 #[derive(Debug, Clone, Deserialize)]

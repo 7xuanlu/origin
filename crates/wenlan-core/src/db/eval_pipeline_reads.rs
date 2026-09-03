@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::MemoryDB;
+use super::{not_self_archived, MemoryDB};
 use crate::error::WenlanError;
 
 impl MemoryDB {
     pub(crate) async fn eval_pipeline_corpus_contents(&self) -> Result<Vec<String>, WenlanError> {
         let conn = self.conn.lock().await;
+        let live = not_self_archived("memories");
         let mut rows = conn
             .query(
-                "SELECT content FROM memories WHERE chunk_index = 0 \
-                 AND supersede_mode <> 'archive'",
+                &format!("SELECT content FROM memories WHERE chunk_index = 0 AND {live}"),
                 (),
             )
             .await

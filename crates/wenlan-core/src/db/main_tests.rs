@@ -24184,6 +24184,246 @@ async fn list_unconfirmed_memories_respects_limit() {
     assert_eq!(items.len(), 2);
 }
 
+// ==================== supersede_mode is not row state ====================
+
+/// Seed the fixture the three regression tests below share: a stored decision
+/// (`make_memory_doc` stamps it `supersede_mode='archive'` exactly as the store
+/// path does), a plain fact, a fact `apply_merge` folded away, and a fact
+/// `evict_stale` soft-evicted. `upsert_documents` overwrites `supersede_mode`
+/// unconditionally, so the two self-state markers are applied afterwards.
+async fn seed_self_state_fixture(db: &MemoryDB) {
+    let docs = [
+        ("selfstate_decision", "decision"),
+        ("selfstate_fact", "fact"),
+        ("selfstate_merged_away", "fact"),
+        ("selfstate_evicted", "fact"),
+    ]
+    .into_iter()
+    .map(|(sid, memory_type)| {
+        make_memory_doc(
+            sid,
+            &format!("Self-state fixture memory content for {sid}"),
+            memory_type,
+            "alpha",
+            "test-agent",
+        )
+    })
+    .collect();
+    db.upsert_documents(docs).await.unwrap();
+
+    let conn = db.conn.lock().await;
+    // `apply_merge` writes this onto each original it folded away.
+    conn.execute(
+        "UPDATE memories SET supersede_mode = 'archive' \
+         WHERE source_id = 'selfstate_merged_away' AND source = 'memory'",
+        (),
+    )
+    .await
+    .unwrap();
+    // `evict_stale` writes this.
+    conn.execute(
+        "UPDATE memories SET supersede_mode = 'evicted' \
+         WHERE source_id = 'selfstate_evicted' AND source = 'memory'",
+        (),
+    )
+    .await
+    .unwrap();
+    // Guard the premise: the decision really does carry the archive stamp, so a
+    // green assertion cannot come from the stamp having quietly changed.
+    let mut rows = conn
+        .query(
+            "SELECT supersede_mode FROM memories \
+             WHERE source_id = 'selfstate_decision' AND source = 'memory' AND chunk_index = 0",
+            (),
+        )
+        .await
+        .unwrap();
+    let mode: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(
+        mode, "archive",
+        "premise: the store path stamps decisions with supersede_mode='archive'"
+    );
+}
+
+fn assert_keeps_decision_drops_residue(ids: &[&str], reader: &str) {
+    assert!(
+        ids.contains(&"selfstate_decision"),
+        "{reader} must keep a stored decision; got {ids:?}"
+    );
+    assert!(
+        ids.contains(&"selfstate_fact"),
+        "{reader} must keep a plain fact; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"selfstate_merged_away"),
+        "{reader} must drop an apply_merge original; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"selfstate_evicted"),
+        "{reader} must drop an evicted row; got {ids:?}"
+    );
+}
+
+/// Regression: the Home recent-activity feed (`GET /api/memory/recent`) tested
+/// `supersede_mode` as row state and dropped every decision, because the store
+/// path stamps every decision `'archive'` to say how it supersedes.
+#[tokio::test]
+async fn list_recent_memories_keeps_decisions_but_not_merge_or_eviction_residue() {
+    let (db, _dir) = test_db().await;
+    seed_self_state_fixture(&db).await;
+
+    let items = db.list_recent_memories(10, None).await.unwrap();
+    let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+    assert_keeps_decision_drops_residue(&ids, "list_recent_memories");
+}
+
+/// Regression: the Home "Worth a glance" strip (`GET /api/memory/unconfirmed`)
+/// read the same column the same way and dropped every unconfirmed decision.
+#[tokio::test]
+async fn list_unconfirmed_memories_keeps_decisions_but_not_merge_or_eviction_residue() {
+    let (db, _dir) = test_db().await;
+    seed_self_state_fixture(&db).await;
+
+    let items = db.list_unconfirmed_memories(10).await.unwrap();
+    let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+    assert_keeps_decision_drops_residue(&ids, "list_unconfirmed_memories");
+}
+
+/// The `confirmed = false` branch of `list_filtered_confirmed_scoped` mirrors
+/// the unconfirmed reader's self-state exclusions. On a fixture with no pending,
+/// episode, or hide-superseded rows (the extra filters only this reader carries)
+/// the two must return the same set, decision included.
+#[tokio::test]
+async fn list_filtered_confirmed_false_agrees_with_unconfirmed_reader_on_decisions() {
+    let (db, _dir) = test_db().await;
+    seed_self_state_fixture(&db).await;
+
+    let filtered = db
+        .list_filtered_confirmed_scoped(Some("memory"), None, &ReadScope::Global, Some(false), 10)
+        .await
+        .unwrap();
+    let mut filtered_ids: Vec<&str> = filtered.iter().map(|r| r.source_id.as_str()).collect();
+    filtered_ids.sort_unstable();
+    assert_keeps_decision_drops_residue(
+        &filtered_ids,
+        "list_filtered_confirmed_scoped(confirmed = false)",
+    );
+
+    let unconfirmed = db.list_unconfirmed_memories(10).await.unwrap();
+    let mut unconfirmed_ids: Vec<&str> = unconfirmed.iter().map(|i| i.id.as_str()).collect();
+    unconfirmed_ids.sort_unstable();
+    assert_eq!(
+        filtered_ids, unconfirmed_ids,
+        "the two unconfirmed-review surfaces must agree on self-state exclusions"
+    );
+}
+
+/// `apply_merge_with_title` stamps EVERY original it folds away with
+/// `supersede_mode = 'archive'`, but it writes a `supersedes` link for
+/// `source_ids[0]` alone. Production always calls it with a whole cluster
+/// (`synthesis/distill.rs`), so originals past the first end up with no
+/// superseder row anywhere, and the surfaces that read the same row disagree:
+///
+///   * search self-excludes only `'evicted'` and hides a row only when some
+///     `'hide'`-mode superseder names it, so a merged-away original past the
+///     first is still returned;
+///   * every list reader and the distillation pool go through
+///     `not_self_archived`, which reads `'archive'` on a non-decision as the
+///     merge marker and drops the same row.
+///
+/// A merged-away DECISION past the first is worse: `not_self_archived`
+/// deliberately keeps `'archive'` on a decision, so nothing drops it and the
+/// content the merge folded up stays fully live everywhere.
+///
+/// Ignored: the fix does not fit in `apply_merge_with_title`. `memories.supersedes`
+/// is a single TEXT column on the superseder row, compared with `=` by
+/// `superseder_not_exists` and by the chunk triggers, so one merged row cannot
+/// name N predecessors without a schema change plus a matching update to every
+/// reader's superseder test.
+#[tokio::test]
+#[ignore = "confirmed bug: apply_merge links only source_ids[0]; the fix needs a multi-predecessor link, not a local edit"]
+async fn apply_merge_leaves_originals_past_the_first_without_a_superseder_link() {
+    let (db, _dir) = test_db().await;
+
+    let originals = ["merge_link_a", "merge_link_b", "merge_link_c"];
+    let docs = originals
+        .iter()
+        .map(|sid| {
+            make_memory_doc(
+                sid,
+                &format!("Ferris the crab guards memory safety, note {sid}"),
+                "fact",
+                "eng",
+                "claude",
+            )
+        })
+        .collect();
+    db.upsert_documents(docs).await.unwrap();
+
+    let source_ids: Vec<String> = originals.iter().map(|s| s.to_string()).collect();
+    let merged_id = db
+        .apply_merge(
+            &source_ids,
+            "Ferris the crab guards memory safety across all three notes",
+        )
+        .await
+        .unwrap();
+
+    // Premise: the merge stamped all three originals but linked only the first.
+    {
+        let conn = db.conn.lock().await;
+        for sid in originals {
+            let mut rows = conn
+                .query(
+                    "SELECT supersede_mode FROM memories \
+                     WHERE source_id = ?1 AND source = 'memory' AND chunk_index = 0",
+                    libsql::params![sid],
+                )
+                .await
+                .unwrap();
+            let mode: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(mode, "archive", "{sid} must carry the merge stamp");
+        }
+        let mut rows = conn
+            .query(
+                "SELECT supersedes FROM memories \
+                 WHERE source_id = ?1 AND source = 'memory' AND chunk_index = 0",
+                libsql::params![merged_id.as_str()],
+            )
+            .await
+            .unwrap();
+        let supersedes: Option<String> = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            supersedes.as_deref(),
+            Some("merge_link_a"),
+            "premise: the merged row names exactly one predecessor"
+        );
+    }
+
+    // The invariant a merge is supposed to establish: nothing it folded away is
+    // still reachable. `merge_link_b` and `merge_link_c` still are.
+    let results = db
+        .search_memory(
+            "Ferris crab memory safety",
+            20,
+            None,
+            &ReadScope::Global,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let hits: Vec<&str> = results.iter().map(|r| r.source_id.as_str()).collect();
+    for sid in originals {
+        assert!(
+            !hits.contains(&sid),
+            "search must not return {sid} after apply_merge folded it away; got {hits:?}"
+        );
+    }
+}
+
 // ==================== list_recent_pages_with_badges ====================
 
 /// Insert a page row with explicit Unix-second timestamps and version.
