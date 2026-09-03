@@ -634,11 +634,22 @@ stage_windows_daemon() {
 # Windows and answers with the real on-disk path, and is realpath(3) on POSIX,
 # which is what this always used. Only something that exists can be resolved, so
 # the non-existent tail is peeled off first and re-attached afterwards.
-canonicalize_path() {
+#
+# ONE SPAWN FOR MANY PATHS. Every call is a `node` process, and the
+# production-root guard below used to make one per path per call: 36 of them at
+# file scope, 33 resolving the same eleven roots, about ten seconds on Windows
+# before this script does anything at all. So the primitive takes a LIST and
+# prints one resolved line per argument, in order, and the single-path spelling
+# is a wrapper on it. A path containing a newline would break that framing; the
+# caller counts the lines it gets back and refuses when the count is wrong,
+# which is the same direction every other unmeasured answer here takes.
+canonicalize_paths() {
   node -e '
     const fs = require("node:fs");
     const path = require("node:path");
-    let resolved = path.resolve(process.argv[1]);
+    const out = [];
+    for (const arg of process.argv.slice(1)) {
+    let resolved = path.resolve(arg);
     // Win32 drops trailing dots and spaces from every component, so
     // `...\wenlan.` opens `...\wenlan`. Node resolves through the extended
     // `\\?\` form, where they are literal instead, so it would call that a
@@ -669,8 +680,14 @@ canonicalize_path() {
         resolved = parent;
       }
     }
-    process.stdout.write(resolved.split(path.sep).join("/") + suffix);
-  ' "$1"
+    out.push(resolved.split(path.sep).join("/") + suffix);
+    }
+    process.stdout.write(out.join("\n") + "\n");
+  ' "$@"
+}
+
+canonicalize_path() {
+  canonicalize_paths "$1"
 }
 
 # Windows resolves paths case-insensitively, and `realpath` hands back whatever
@@ -754,26 +771,60 @@ reject_verbatim_path() {
   fi
 }
 
-refuse_production_path() {
-  local label="$1" value="$2" canonical root resolved within_rc
-  local -a roots=(
-    "$HOME/Library/Application Support/wenlan"
-    "$HOME/Library/Application Support/origin"
-    "$HOME/Library/LaunchAgents"
-    "$HOME/Library/Logs/com.wenlan.desktop"
-    "$HOME/Library/Logs/com.origin.desktop"
-    "$HOME/.config/wenlan-mcp"
-    "$HOME/.config/origin-mcp"
-    "$HOME/.wenlan"
-    "$HOME/.origin"
-  )
-  # The Windows half of the same list the app enforces in
-  # `production_runtime_roots`. Only appended when the variable is actually set:
-  # an empty root would canonicalize to the working directory and refuse the
-  # whole checkout.
-  if [[ -n "${LOCALAPPDATA:-}" ]]; then
-    roots+=("$LOCALAPPDATA/wenlan" "$LOCALAPPDATA/origin")
+PRODUCTION_ROOTS=(
+  "$HOME/Library/Application Support/wenlan"
+  "$HOME/Library/Application Support/origin"
+  "$HOME/Library/LaunchAgents"
+  "$HOME/Library/Logs/com.wenlan.desktop"
+  "$HOME/Library/Logs/com.origin.desktop"
+  "$HOME/.config/wenlan-mcp"
+  "$HOME/.config/origin-mcp"
+  "$HOME/.wenlan"
+  "$HOME/.origin"
+)
+# The Windows half of the same list the app enforces in
+# `production_runtime_roots`. Only appended when the variable is actually set:
+# an empty root would canonicalize to the working directory and refuse the
+# whole checkout.
+if [[ -n "${LOCALAPPDATA:-}" ]]; then
+  PRODUCTION_ROOTS+=("$LOCALAPPDATA/wenlan" "$LOCALAPPDATA/origin")
+fi
+PRODUCTION_ROOTS_RESOLVED=()
+PRODUCTION_ROOTS_READY=0
+
+# Resolve the roots ONCE. They do not vary between calls, and there are three
+# calls at file scope, so this used to be 33 `node` spawns resolving the same
+# eleven paths.
+#
+# exit: 0 the resolved list is ready, 1 it could not be established -- which is
+# not "no root matched". The caller refuses on it, exactly as the per-path
+# version refused a root that would not resolve: a comparison that did not run
+# is not a path outside production.
+resolve_production_roots() {
+  local out rc=0 line
+  local -a lines=()
+  if (( PRODUCTION_ROOTS_READY == 1 )); then
+    return 0
   fi
+  out="$(canonicalize_paths "${PRODUCTION_ROOTS[@]}")" || rc=$?
+  (( rc == 0 )) || return 1
+  while IFS= read -r line; do
+    lines+=("$line")
+  done <<<"$out"
+  # A SHORT ANSWER IS NOT A PARTIAL ANSWER. The resolved roots are matched by
+  # POSITION against the names they came from, so one missing line would shift
+  # every root after it onto the wrong name and the guard would compare against
+  # a list nobody wrote. An empty line is the same failure one step in.
+  (( ${#lines[@]} == ${#PRODUCTION_ROOTS[@]} )) || return 1
+  for line in "${lines[@]}"; do
+    [[ -n "$line" ]] || return 1
+  done
+  PRODUCTION_ROOTS_RESOLVED=("${lines[@]}")
+  PRODUCTION_ROOTS_READY=1
+}
+
+refuse_production_path() {
+  local label="$1" value="$2" canonical root resolved within_rc i total
   # A path that could not be canonicalized cannot be compared against the roots,
   # and "the comparison did not run" is not "it is not production". Under
   # `set -e` this aborted the script with node's own status and no message,
@@ -783,10 +834,15 @@ refuse_production_path() {
   canonical="$(canonicalize_path "$value")" || refuse_unsafe \
     "error: could not resolve $label for the production-root check: $value" \
     "       an unresolvable path cannot be shown to be outside production"
-  for root in "${roots[@]}"; do
-    resolved="$(canonicalize_path "$root")" || refuse_unsafe \
-      "error: could not resolve the production root $root" \
-      "       refusing to check $label against a root that would not resolve"
+  if ! resolve_production_roots; then
+    refuse_unsafe \
+      "error: could not resolve the production roots" \
+      "       refusing to check $label against roots that would not resolve"
+  fi
+  total="${#PRODUCTION_ROOTS_RESOLVED[@]}"
+  for (( i = 0; i < total; i++ )); do
+    root="${PRODUCTION_ROOTS[i]}"
+    resolved="${PRODUCTION_ROOTS_RESOLVED[i]}"
     within_rc=0
     path_is_within "$canonical" "$resolved" || within_rc=$?
     case "$within_rc" in
