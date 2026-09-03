@@ -396,6 +396,13 @@ fn modified_unix_seconds(metadata: &fs::Metadata) -> i64 {
 /// `pdf_extract` (via `lopdf`) can panic on malformed/truncated input; wrapping
 /// in `catch_unwind` upholds the "one bad file never aborts" contract. This is
 /// a sync CPU function — callers on async paths wrap it in `spawn_blocking`.
+///
+/// That guard covers panics only, and only panics. A stack overflow aborts the
+/// process instead of unwinding, so it escapes `catch_unwind` entirely — which
+/// is exactly RUSTSEC-2026-0187, where a ~21 KB PDF holding a 10,000-deep
+/// nested array `SIGABRT`s any caller of `lopdf`. The lopdf `>= 0.42` floor is
+/// what fixes that, not this wrapper. Keep the depth limit in the dependency,
+/// and do not read this `catch_unwind` as making arbitrary PDF input safe.
 pub fn extract_pdf_text(bytes: &[u8]) -> Result<String, String> {
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pdf_extract::extract_text_from_mem(bytes)
