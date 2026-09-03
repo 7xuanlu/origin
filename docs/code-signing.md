@@ -90,12 +90,48 @@ Two consequences of choosing the Foundation tier, both worth knowing before appl
 
 Signing is a submission from inside the workflow, not a local `signtool` call: [`signpath/github-action-submit-signing-request`](https://github.com/SignPath/github-action-submit-signing-request) uploads the built installer, waits for the approval, and downloads the signed file. The pieces to add to `app-bundle-windows` in `release.yml`, in order:
 
-1. Upload `*-setup.exe` as a GitHub artifact and submit it, guarded on a `SIGNPATH_CONFIGURED` flag the way the macOS steps are guarded by `APPLE_SIGNING_CONFIGURED`, so a fork without the secret still builds. Raise the action's `wait-for-completion-timeout-in-seconds` past its 600-second default, because it is waiting for a person.
-2. **Set `output-artifact-directory`, and overwrite the built installer with what comes back.** The input is optional and its absence is silent: the action's manifest describes it as "Path where the signed artifact will be saved. If not specified, the task will not download the signed artifact from SignPath". *Stage app bundle assets and checksums* then finds the original unsigned `*-setup.exe` under `target/x86_64-pc-windows-msvc/release/bundle/nsis` exactly as it does today, and a green run publishes the unsigned file. Write the returned file back over that same path — note `skip-decompress` defaults to `false`, so the action extracts the returned archive into the directory — and fail the job if the path is not newer than the submission.
+1. Upload `*-setup.exe` as a GitHub artifact and submit it, guarded on a `SIGNPATH_CONFIGURED` flag the way the macOS steps are guarded by `APPLE_SIGNING_CONFIGURED`, so a fork without the secret still builds. `SIGNPATH_CONFIGURED` is derived from **all four** required secrets, not from the token alone — a sentinel that measures one fifth of what its name claims is a sentinel a reader will trust for the other four fifths. Raise the action's `wait-for-completion-timeout-in-seconds` past its 600-second default, because it is waiting for a person.
+2. **Set `output-artifact-directory`, and overwrite the built installer with what comes back.** The input is optional and its absence is silent: the action's manifest describes it as "Path where the signed artifact will be saved. If not specified, the task will not download the signed artifact from SignPath". *Stage app bundle assets and checksums* then finds the original unsigned `*-setup.exe` under `target/x86_64-pc-windows-msvc/release/bundle/nsis` exactly as it does today, and a green run publishes the unsigned file. Write the returned file back over that same path — note `skip-decompress` defaults to `false`, so the action extracts the returned archive into the directory — then prove the swap actually happened. Not by timestamp: `skip-decompress` extraction restores the archive entry’s own mtime, so a correctly signed installer can come back older than the file submitted, and a stale leftover can come back newer. Assert instead that exactly one `*-setup.exe` exists on each side, that the returned name matches the built one, and that its SHA-256 **differs** from the submitted file’s — identical bytes mean nothing was signed. `Get-AuthenticodeSignature` in step 5 is what makes the difference *authentic* rather than merely present.
 3. **Re-sign the updater artifact, with the key in scope.** The `.sig` beside the installer is computed over the unsigned bytes, so Authenticode signing invalidates it. Delete it and re-run `pnpm tauri signer sign`, the same repair the macOS path makes after stapling. `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` are `env:` on *Build Windows desktop app bundle* alone, so the new step needs its own copy of both or it cannot sign at all. Regenerating the sidecar `.sig` does not disturb the installer's Authenticode signature, but nothing else may touch those bytes after signing.
 4. Take the SHA-256 checksums from the signed installer, not the unsigned one.
-5. Verify with `Get-AuthenticodeSignature`: status must be `Valid` **and** the subject must be SignPath Foundation, so a silently skipped download cannot pass as a signed build. Guard it the same way.
+5. Verify with `Get-AuthenticodeSignature`: status must be `Valid` **and** the publisher must be SignPath Foundation, so a silently skipped download cannot pass as a signed build. Guard it the same way. Two details that are easy to get wrong and impossible to see afterwards:
+   - Compare with **`-cne`, not `-ne`**. PowerShell's `-ne`, `-eq` and `-like` are all case-**insensitive**, so a check written to demand one exact publisher name also accepts `signpath foundation` and every other casing. A certificate is an identity document.
+   - The comparison uses `GetNameInfo(SimpleName)`, which is the common name alone — a different full distinguished name carrying the same common name still passes. Closing that needs the real `Subject`, and nobody here has seen SignPath Foundation's certificate. So the step writes `Subject`, `Issuer` and `Thumbprint` to the run log **unconditionally and before the comparison**: the first signed build's log is the only place those values will ever appear, and the run that most needs them is the one that failed. Pin them afterwards (there is a `TODO` in the step saying so). Do not invent them in advance — a pinned string nobody has verified is a gate that fails the first real build for the wrong reason.
 6. Prove it on a clean machine through the first-run gauntlet's `windows-nsis` leg.
+
+### The switch: `vars.SIGNPATH_ACTIVE`
+
+Presence is not a requirement. `SIGNPATH_CONFIGURED` answers "are the secrets here"; it cannot answer "were they supposed to be", and the difference is the whole hole:
+
+> Every signing step in `app-bundle-windows` is guarded on `SIGNPATH_CONFIGURED`. With no secrets, all five skip, the ORIGINAL unsigned installer is staged, hashed, uploaded — and the job is green. Today that is correct: the application is pending and every fork is in this state. The day the Foundation accepts the application, a repository whose secrets were never installed (or were installed on an environment this job does not use, or resolve as empty) produces **exactly the same green unsigned release**.
+
+So `release.yml` computes a second, independent sentinel:
+
+```yaml
+SIGNPATH_CONFIGURED: ${{ secrets.SIGNPATH_API_TOKEN != '' && secrets.SIGNPATH_ORGANIZATION_ID != '' && secrets.SIGNPATH_PROJECT_SLUG != '' && secrets.SIGNPATH_SIGNING_POLICY_SLUG != '' }}
+SIGNPATH_REQUIRED: ${{ github.repository == '7xuanlu/wenlan' && vars.SIGNPATH_ACTIVE == 'true' }}
+```
+
+`vars.` and not `secrets.`, deliberately: a secret's value cannot be read back by a human or printed in a log, so a switch stored as a secret is a switch nobody can audit. It is compared to the literal `'true'`, so `false`, `0`, `no` and `TRUE` all read as off.
+
+The unguarded *Check SignPath configuration is all-or-nothing, and present when required* step near the top of the job then fails the build when `SIGNPATH_REQUIRED` is true and the four secrets are not all readable, naming each missing one. It runs before the ~40-minute bundle build, so a misconfigured repository is told in seconds. The four combinations:
+
+| `SIGNPATH_REQUIRED` | `SIGNPATH_CONFIGURED` | Result |
+|---|---|---|
+| false | false | green, unsigned installer, stated in the log. Today's upstream state and every fork's. |
+| false | true | green, signed. Signing works before the switch is thrown; the switch only makes it mandatory. |
+| true | true | green, signed. The intended end state. |
+| true | false | **the job fails before building**, naming each missing secret. Never publishes an unsigned installer. |
+
+**Turning signing on is therefore two actions, not one**: install the four secrets, then set the repository variable `SIGNPATH_ACTIVE` to `true` (Settings → Secrets and variables → Actions → Variables). Doing only the first leaves a repository that signs but would silently stop signing if a secret were removed; doing only the second fails the next release loudly, which is the safe half.
+
+`.github/workflows/signpath-status.yml` is what stops the gap between those two actions from lasting. It runs weekly on a schedule as well as on demand, and it reports three states that used to be one:
+
+- **nothing wired** — reported, exits 0. An unwired fork and an unwired upstream are both the expected steady state, and it says explicitly that whether the Foundation has *accepted* the application is UNMEASURED, not "pending".
+- **accepted but not activated** — the API accepts the credentials and `vars.SIGNPATH_ACTIVE` is not `'true'`. **Red**, because this is precisely the state in which a tag release ships a green unsigned installer.
+- **could not measure** — an HTTP 200 whose body does not parse, no HTTP status at all, or an undocumented status. Its own verdict, never folded into success. It previously reported a malformed 200 as "still a working credential", which is a claim about a payload nobody could read.
+
+It also resolves the project and signing-policy slugs rather than asserting them, and does it by **differential probe**: each slug is queried as configured and again with a slug that cannot exist, and only a *difference* between the two answers counts as a measurement. If the API ignores the filter, both answers are identical and the slug is reported UNMEASURED — never validated on the strength of a route that never looked at it.
 
 Two limits to plan around.
 
