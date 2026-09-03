@@ -49,17 +49,13 @@ Wenlan runs as one local daemon. The desktop app carries that daemon inside it; 
 
 ### Desktop app
 
-**[Download Wenlan for macOS](https://github.com/7xuanlu/wenlan/releases/latest)** (Apple Silicon), open the `.dmg`, and drag the app to Applications. To upgrade, drag the new app over the old one and open it: a running Wenlan quits and the new version starts (Wenlan 0.17.0 and older must be quit by hand first).
+Download from the [Releases page](https://github.com/7xuanlu/wenlan/releases/latest):
 
-Nothing else to install. The app bundles the daemon, CLI, and MCP connector, starts the daemon on launch, and offers to connect the AI clients it detects: the plugin for Claude Code and Codex, an MCP entry for the rest. From there you read Pages, inspect the Source behind any citation, and curate the knowledge system.
+- **macOS (Apple Silicon):** open the `.dmg` and drag Wenlan to Applications. The app is signed and notarized, so there is no warning on first launch. From the terminal instead: `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"` (downloads, checks the SHA-256, moves it to Applications).
+- **Windows x64:** run the `-setup.exe`. It is not signed yet, so when SmartScreen says "Windows protected your PC", choose "More info", then "Run anyway".
+- **Linux:** no desktop build yet; use the headless runtime below.
 
-The app is signed with an Apple Developer ID certificate and notarized by Apple, so macOS opens it on a first launch with no warning to click through. If you would rather install it from the terminal, one command downloads it, checks it against GitHub's published SHA-256, and moves it into Applications.
-
-```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
-```
-
-On Windows x64, run the `-setup.exe` from the same [Releases](https://github.com/7xuanlu/wenlan/releases/latest) page. It installs the daemon, CLI, and MCP connector along with the runtime libraries they load, so there is nothing else to install. The installer is not signed yet, so SmartScreen says "Windows protected your PC": choose "More info", then "Run anyway". Linux has no desktop build yet; use the headless runtime below.
+The app bundles the daemon, CLI, and MCP connector, starts the daemon on launch, and offers to connect the AI clients it detects: the plugin for Claude Code and Codex, an MCP entry for the rest. To upgrade, drag the new app over the old one and open it (Wenlan 0.17.0 and older must be quit by hand first).
 
 <a id="claude-code-in-30-seconds"></a>
 

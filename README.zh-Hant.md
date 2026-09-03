@@ -51,17 +51,13 @@ Wenlan 以單一本地 daemon 運行。桌面 app 內建這個 daemon；無 GUI 
 
 ### 桌面 app
 
-**[下載 macOS 版 Wenlan](https://github.com/7xuanlu/wenlan/releases/latest)**（Apple Silicon），打開 `.dmg`，把 app 拖進「應用程式」。升級時把新 app 拖到舊 app 上覆蓋，再打開它：正在執行的 Wenlan 會自動結束，新版本隨即啟動（Wenlan 0.17.0 及更早的版本需要先手動結束）。
+從 [Releases 頁面](https://github.com/7xuanlu/wenlan/releases/latest)下載：
 
-不需要再安裝其他東西。App 內已打包 daemon、CLI 與 MCP 連接器，啟動時會自動執行 daemon，並會為偵測到的 AI 用戶端提供接入：Claude Code 與 Codex 安裝 plugin，其餘用戶端寫入 MCP 設定。之後你就可以閱讀 Page、檢查任一引用背後的 Source，並整理整個知識體系。
+- **macOS（Apple Silicon）：** 打開 `.dmg`，把 Wenlan 拖進「應用程式」。App 已簽署並通過公證，首次啟動不會有警告。也可以改用終端機安裝：`/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"`（下載、核對 SHA-256、放進「應用程式」）。
+- **Windows x64：** 執行 `-setup.exe`。安裝包尚未簽署，SmartScreen 顯示「Windows 已保護您的電腦」時，點選「其他資訊」，再點「仍要執行」。
+- **Linux：** 暫時沒有桌面版，請使用下面的無 GUI runtime。
 
-這個版本使用 Apple Developer ID 憑證簽署，並通過了 Apple 的 notarization（公證），首次啟動不會再被 macOS 擋下，也不需要額外點擊確認。如果你更習慣用指令列安裝，一條指令會下載它、用 GitHub 發布的 SHA-256 核對下載檔案，並把它放進「應用程式」。
-
-```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
-```
-
-Windows x64 請在同一個 [Releases](https://github.com/7xuanlu/wenlan/releases/latest) 頁面下載 `-setup.exe` 並執行。安裝包內含 daemon、CLI 與 MCP 連接器，以及它們執行時要載入的函式庫，不需要再裝別的東西。安裝包尚未簽署，SmartScreen 會顯示「Windows 已保護您的電腦」：點選「其他資訊」，再點「仍要執行」。Linux 暫時沒有桌面版，請使用下面的無 GUI runtime。
+App 內已打包 daemon、CLI 與 MCP 連接器，啟動時會自動執行 daemon，並會為偵測到的 AI 用戶端提供接入：Claude Code 與 Codex 安裝 plugin，其餘用戶端寫入 MCP 設定。升級時把新 app 拖到舊 app 上覆蓋並開啟（Wenlan 0.17.0 及更早的版本需要先手動結束）。
 
 <a id="claude-code-in-30-seconds"></a>
 
