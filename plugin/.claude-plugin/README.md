@@ -2,20 +2,22 @@
 
 A living knowledge base your agents build as they work. What they learn becomes source-cited wiki pages that refresh between sessions, so each new thread starts from your latest work.
 
-## 30-Second Setup
+## Setup
 
 ```text
 0s   /plugin marketplace add 7xuanlu/wenlan
      /plugin install wenlan@7xuanlu-wenlan
 5s   restart Claude Code
-10s  /setup  auto-installs local runtime if missing, configures local memory,
+10s  /wenlan:setup  auto-installs local runtime if missing, configures local memory,
             verifies runtime + MCP + round-trip, prints "Wenlan ready"
-30s  /brief  (or /capture <something to remember>)
+30s  /capture <something to remember>  (or /brief)
 ```
 
-`/setup` is self-healing — if the local runtime isn't running and the `wenlan`
+The first run downloads a ~210 MB embedding model, so allow a few minutes.
+
+`/wenlan:setup` is self-healing — if the local runtime isn't running and the `wenlan`
 CLI isn't on PATH, it runs the install one-liner for you. No copy/paste,
-no restart loop. The `SessionStart` hook only nudges you toward `/setup`
+no restart loop. The `SessionStart` hook only nudges you toward `/wenlan:setup`
 if the runtime ever stops.
 
 ## Install
@@ -33,7 +35,7 @@ The runner picks the MCP server binary from four paths, in order:
 
 1. **Filesystem override** — if `plugin/bin/wenlan-mcp.local` exists (typically a symlink to a locally-built binary, gitignored), the runner exec's it. Most reliable: survives plugin reloads that don't re-read env.
 2. **Env var override** — `WENLAN_MCP_DEV_BIN=/abs/path/to/wenlan-mcp` (or the legacy `ORIGIN_MCP_DEV_BIN`). Convenient if you already export it; requires Claude Code to inherit the var at startup.
-3. **Installed runtime** — `~/.wenlan/bin/wenlan-mcp`, when `/setup` has installed it.
+3. **Installed runtime** — `~/.wenlan/bin/wenlan-mcp`, when `/wenlan:setup` has installed it.
 4. **Default** — `npx -y wenlan-mcp@^<version>`, where the version is read from the sibling `plugin.json` at spawn time (`@latest` if it cannot be read). What end users get before local setup completes.
 
 To set up the filesystem override during dev:
@@ -48,12 +50,13 @@ Reload the plugin (`/reload-plugins`) and the wrapper picks the local binary on 
 ## Daily Commands
 
 ```text
-/setup      set up + verify Wenlan works (run once, or to diagnose)
+/wenlan:setup   set up + verify Wenlan works (run once, or to diagnose)
 /help       one-screen reference
 /brief      load identity + topic context (start of session)
 /capture    save one durable memory in flow
 /recall     search local memory
-/distill    synthesize pages from clusters (scoped to current repo)
+/lint       diagnose or repair memory quality and hygiene
+/distill    synthesize pages from clusters (scoped to the active Space)
 /pages      browse + open distilled pages (wenlan pages)
 /curate     audit pending captures or revisions
 /forget     delete a memory by ID
@@ -76,7 +79,7 @@ Browse with `open ~/.wenlan/` (Finder), `code ~/.wenlan/` (VS Code), or symlink 
 
 ## Local memory and agent-side model phases
 
-By default `/setup` configures **local memory**: no model download, no API
+By default `/wenlan:setup` configures **local memory**: no model download, no API
 key, no prompts. The daemon stores, embeds, dedupes, and serves hybrid
 search. Model-backed work like classification, entity extraction, page
 synthesis, and reranking stays opt-in.
@@ -107,6 +110,7 @@ The actual skill instructions live in [`../skills`](../skills):
 - `brief`: load session context
 - `capture`: save one durable memory
 - `recall`: targeted lookup
+- `lint`: diagnose or repair memory quality and hygiene
 - `distill`: refresh wiki pages
 - `pages`: browse + open distilled pages (wenlan pages)
 - `curate`: audit pending captures or revisions

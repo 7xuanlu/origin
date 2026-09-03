@@ -270,8 +270,8 @@ a1b2c3d distill: 4 pages
 
 这个循环分成四步：
 
-1. **找到最新知识。** 打开相关 Page、搜索，或使用 `/recall <query>`；`/brief [topic]` 读取当前 Space Brief；提供 topic 时，会另行附上同一 Space 的相关上下文。其他 AI 工具可使用等价的 page、search、recall 与 brief 工具。
-2. **工作时随手保存与查找。** `/capture <thing>` 保存决策、经验、踩坑或事实，并记录来源。`/recall <query>` 只取回相关内容，不加载全部历史。
+1. **工作时随手保存与查找。** `/capture <thing>` 保存决策、经验、踩坑或事实，并记录来源。`/recall <query>` 只取回相关内容，不加载全部历史。
+2. **找到最新知识。** 打开相关 Page、搜索，或使用 `/recall <query>`；`/brief [topic]` 读取 Brief（Space 的滚动项目摘要，由 `/handoff` 首次写入）；提供 topic 时，会另行附上同一 Space 的相关上下文。其他 AI 工具可使用等价的 page、search、recall 与 brief 工具。
 3. **闭合循环。** `/handoff` 记录本次改动，并把类型化的逐项更新应用到当前 Space Brief。
 4. **让 wiki 保持最新。** `/distill` 主动建立或刷新页面。可选的模型流程会在两次工作之间补充已保存内容、连接相关知识，并刷新符合条件的页面。`/lint` 检查知识库健康状态；`/curate` 让你审核页面更新提案，以及可选 Reconcile 流程产生的冲突项目。
 

@@ -88,6 +88,8 @@ Need only the headless runtime on macOS Apple Silicon?
 npx -y wenlan setup
 ```
 
+`npx` requires Node.js; without it, run `curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/install.sh | bash` then `wenlan setup --basic`.
+
 This downloads the prebuilt CLI, daemon, and MCP connector, starts the local runtime, and verifies it. No Rust toolchain or Cargo is required. Linux x64/ARM64 with glibc has an automated [shell setup path](docs/setup-with-ai.md#install-the-runtime); Windows x64 uses the matching archive from [Releases](https://github.com/7xuanlu/wenlan/releases/latest). macOS Intel currently has [no supported complete-runtime install](crates/wenlan-cli/README.md#macos-intel).
 
 Manual and client-specific instructions: [AI-assisted setup](docs/setup-with-ai.md) · [Claude Code plugin](plugin/.claude-plugin/README.md) · [Codex plugin](plugin-codex/README.md) · [CLI and MCP](crates/wenlan-cli/README.md).
@@ -151,7 +153,7 @@ Within the entity graph, a configured enrichment model extracts typed Entities, 
 - **Communities that compound:** Label propagation groups Entities by relation density, weighted by the relation count between each pair. These groups can organize optional corpus summaries while Entity links add retrieval context.
 - **Correction without erasure:** Related claims, corrections, and explicit supersession stay inspectable together while original Sources and Memory history remain.
 
-During retrieval, dense entity matching finds query-relevant entities. When eligible graph links exist, the default graph-memory stream boosts linked Memories as a third [RRF](https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf) signal. The path is data- and scope-dependent, and Space boundaries still apply. [How the graph path works ->](docs/technical-foundations.md#graph-assisted-retrieval)
+During retrieval, dense entity matching finds query-relevant entities. When eligible graph links exist, the default graph-memory stream boosts linked Memories as a third [RRF](https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf) signal. The path is data- and scope-dependent, and Space boundaries (Spaces are defined under Capabilities) still apply. [How the graph path works ->](docs/technical-foundations.md#graph-assisted-retrieval)
 
 <a id="retrieval"></a>
 
@@ -268,8 +270,8 @@ The system above becomes a small daily loop: start with relevant knowledge, capt
 
 The loop has four steps:
 
-1. **Find current knowledge.** Open a relevant Page, search, or use `/recall <query>`; `/brief [topic]` reads the current Space Brief, and a topic appends separately labeled context from that same Space. Clients without plugin commands use the equivalent page, search, recall, and brief tools.
-2. **Capture and find knowledge while you work.** `/capture <thing>` saves a decision, lesson, gotcha, or fact with its source. `/recall <query>` retrieves only what is relevant instead of loading your whole history.
+1. **Capture and find knowledge while you work.** `/capture <thing>` saves a decision, lesson, gotcha, or fact with its source. `/recall <query>` retrieves only what is relevant instead of loading your whole history.
+2. **Find current knowledge.** Open a relevant Page, search, or use `/recall <query>`; `/brief [topic]` reads the Brief — the Space's rolling project snapshot, first written by `/handoff` — and a topic appends separately labeled context from that same Space. Clients without plugin commands use the equivalent page, search, recall, and brief tools.
 3. **Close the loop.** `/handoff` records what changed and applies typed item-level updates to the current Space Brief.
 4. **Keep the wiki current.** `/distill` deliberately creates or refreshes pages. Between sessions, optional model-backed passes can enrich captures, connect related entities, and refresh eligible pages. `/lint` checks knowledge health; `/curate` brings proposed revisions and any conflict-review items created by the optional reconcile pass to you.
 

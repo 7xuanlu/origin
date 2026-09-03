@@ -21,7 +21,8 @@ codex plugin add wenlan@7xuanlu-wenlan
 
 Start a new Codex thread after installing so the skills and MCP server load.
 Then try `/setup`, `/brief`, `/capture <memory>`, `/recall <query>`,
-`/lint [deep|repair] [scope]`, `/pages <query>`, or `/handoff`.
+`/lint [deep|repair] [scope]`, `/pages <query>`, `/distill`, `/curate`,
+`/forget`, `/help`, or `/handoff`.
 
 ## Development
 
@@ -33,8 +34,9 @@ codex plugin add wenlan@7xuanlu-wenlan
 ```
 
 The plugin runner uses `~/.wenlan/bin/wenlan-mcp` when available and falls back
-to `npx -y wenlan-mcp@^0.17.6`. It passes `--agent-name codex` so captures are
-labeled as Codex writes.
+to the pinned `npx` version in
+[`bin/wenlan-mcp-runner.sh`](bin/wenlan-mcp-runner.sh). It passes
+`--agent-name codex` so captures are labeled as Codex writes.
 
 Before changing plugin skills, manifests, MCP runner wiring, or the local
 marketplace, run the shared Claude/Codex contract checks:
