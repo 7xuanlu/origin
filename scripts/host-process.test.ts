@@ -13,12 +13,10 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { branchesOnUnmeasured, probeCallSites } from "./lib/probe-call-sites";
 
-// Every case here spawns node, then Git Bash, then a shim or two. On an idle
-// machine that is a few hundred milliseconds; under load it is seconds, and at
-// the 5s default the assertion being reported is about the HOST, not about the
-// library — a failure indistinguishable from a real one, which is the exact
-// defect this file exists to prevent, aimed at itself. Individual cases that
-// poll or drive twice raise it further at their own site.
+// Every case spawns node, then Git Bash, then a shim or two: a few hundred
+// milliseconds idle, seconds under load. At the 5s default the assertion being
+// reported would be about the HOST, not the library. Cases that poll or drive
+// twice raise it further at their own site.
 vi.setConfig({ testTimeout: 30_000 });
 
 // scripts/lib/host-process.sh carries ONE invariant, and it is the reason this
@@ -28,43 +26,35 @@ vi.setConfig({ testTimeout: 30_000 });
 //   MEASUREMENT.
 //
 // Every helper is tri-state — measured / negative / could not measure — so the
-// interesting case is always the THIRD one. A suite that only covers "found"
-// and "not found" is how the two-state versions of these helpers survived: a
-// missing tool produced empty output, and empty output read as "port free" and
-// as "process dead". So every helper below is exercised in all three states,
-// and the wrappers are additionally checked for the inverse mistake, where a
-// genuine negative gets reported as unmeasured.
+// interesting case is always the THIRD one: a suite covering only "found" and
+// "not found" is how the two-state versions survived, where a missing tool
+// produced empty output and empty output read as "port free" and as "process
+// dead". Every helper is exercised in all three states, and the wrappers are
+// additionally checked for the inverse mistake, a genuine negative reported as
+// unmeasured.
 //
-// The Windows branches run on every platform. The library lets a POSIX host opt
-// INTO them with WENLAN_HOST_PROCESS_PLATFORM=windows (one-way: a real Windows
-// host can never be talked out of its identity-checked paths), and the tools
-// those branches call are replaced with shims on PATH. Without that, none of
-// this would ever run — `pnpm test` only runs in the macOS `app-check` lane.
+// The Windows branches run on every platform: a POSIX host opts INTO them with
+// WENLAN_HOST_PROCESS_PLATFORM=windows (one-way — a real Windows host can never
+// be talked out of its identity-checked paths) and the tools they call are
+// shimmed on PATH. Without that none of this would ever run, because `pnpm
+// test` only runs in the macOS `app-check` lane.
 
 const root = resolve(import.meta.dirname, "..");
 // WENLAN_HOST_PROCESS_LIB names the library under test, defaulting to the
-// shipped one. The negative-control harness
-// (scripts/negative-controls/posix-probes-negative-controls.py) reverts a
-// fix and re-runs this suite; it used to do that by patching the shipped file
-// in place, which any concurrently running suite would then read. That is how a
-// vitest run of these three files came back "2 failed" on a library that was
-// correct on disk before and after — a red that was not about the code, and, if
-// the timing had inverted, a green that was not either.
+// shipped one, so the negative-control harness
+// (scripts/negative-controls/posix-probes-negative-controls.py) can revert a
+// fix and re-run this suite without patching the shipped file in place, which
+// any concurrently running suite would then read.
 //
-// The override is locked to the exact BYTES the harness meant to test (round
-// 13b, finding 6). A boolean flag was not enough: `WENLAN_HOST_PROCESS_LIB` and
-// a flag reading "1" are both just strings, and a pair of them inherited from a
-// shell — or exported by a wrapper that outlived the harness that set them —
-// sends an ordinary `pnpm test` at a valid old copy while the shipped library
-// is broken. That is the same wrong-subject green the override exists to
-// prevent, moved one step out; and worse, the identity test itself USED to
-// return early whenever the flag was set, so the one row in the ledger that
-// watches for this was the row the stale pair switched off.
-//
-// So the flag is the sha256 of the override file's contents. Only something
-// that has just written that file can know it, a stale value stops matching the
-// moment the file changes or is deleted, and the identity test asserts rather
-// than returns.
+// The override is locked to the exact BYTES the harness meant to test.
+// WENLAN_HOST_PROCESS_LIB_CONTROL is the sha256 of the override file's
+// contents: only something that has just written that file can know it, and a
+// stale value stops matching the moment the file changes or is deleted. A
+// boolean flag would not do — two strings inherited from a shell, or exported
+// by a wrapper that outlived the harness, aim an ordinary `pnpm test` at a
+// valid old copy while the shipped library is broken. For the same reason the
+// identity test below ASSERTS rather than returning early when the flag is
+// set: a row that switches itself off is the row that stops watching.
 const shippedLibPath = resolve(root, "scripts/lib/host-process.sh");
 const libOverride = process.env.WENLAN_HOST_PROCESS_LIB;
 const libOverrideDigest = process.env.WENLAN_HOST_PROCESS_LIB_CONTROL ?? "";
@@ -80,30 +70,19 @@ if (libOverride && sha256(overrideText) !== libOverrideDigest) {
       "both, or have the negative-control harness hash the file it just wrote.",
   );
 }
-// And the digest is a claim about CONTENT, not about TIME (round 13c, finding
-// 6). A harness that hashes the file by re-reading it hashes whatever is at that
-// path — so if its write silently did not happen, it hashes the copy the LAST
-// run left there, the flag matches, and this suite runs the previous mutation
-// while reporting on the current one. Two stale things agreeing is not a
-// measurement.
+// The digest is a claim about CONTENT, not about AUTHORSHIP: a harness that
+// hashes the file by re-reading it hashes whatever is at that path, so a write
+// that silently did not happen hashes the copy the LAST run left there, the
+// flag matches, and this suite runs the previous mutation while reporting on
+// the current one. Two stale things agreeing is not a measurement.
 //
-// Round 13c answered that with a fifteen-minute age window, and round 13d was
-// right that an age window is the wrong shape of answer: it is evidence of
-// RECENCY, not evidence that this invocation wrote the file. Round 13d's
-// replacement — a declared "written after" moment compared against the file's
-// mtime — was the same shape one notch tighter, and round 13e found the notch:
-// mtime is stored to two seconds on some filesystems, so the rule had to allow
-// two seconds of slack, and a leftover from less than two seconds earlier still
-// passed. Every version of this argument that reasons from TIME has a window,
-// and the window is the hole.
-//
-// So authorship is established by a secret instead. The harness generates a
-// nonce for this write, puts it in the bytes it writes, and names it in the
-// environment; the override must carry exactly that nonce on a line of its own.
-// A leftover from any earlier write carries an earlier nonce and is refused
-// however old or new it is, because age has stopped being the question. Only a
-// writer that knew this run's nonce could have produced these bytes, which is
-// the property the whole lock was reaching for.
+// Anything reasoning from TIME has a window and the window is the hole — mtime
+// is stored to two seconds on some filesystems, so an age rule must allow two
+// seconds of slack and a leftover from one second earlier passes. Authorship is
+// established by a secret instead: the harness generates a nonce, writes it
+// into the bytes and names it in the environment, and the override must carry
+// exactly that nonce on a line of its own. A leftover from an earlier write
+// carries an earlier nonce and is refused however old or new it is.
 //
 // The line is control scaffolding rather than library text, so every comparison
 // against the shipped library strips it first.
@@ -159,11 +138,10 @@ function makeTempRoot(): string {
 // so the test asserts on the helper's own status and state rather than on any
 // side effect.
 // PATH is re-prepended INSIDE the shell rather than by the caller: Git for
-// Windows' bash.exe puts /mingw64/bin and /usr/bin at the front of PATH before
-// the script runs, so a shim dir handed in from outside loses to /usr/bin/ps
-// (though it does win for netstat and tasklist, which live nowhere on that
-// path — a difference that would have made this suite silently exercise the
-// real `ps` while claiming to exercise a stub).
+// Windows' bash.exe puts /mingw64/bin and /usr/bin at the front before the
+// script runs, so a shim dir handed in from outside loses to /usr/bin/ps — but
+// wins for netstat and tasklist, which live nowhere on that path. That
+// asymmetry silently exercises the real `ps` against a stub's expectations.
 const DRIVER = `#!/usr/bin/env bash
 set -uo pipefail
 if [ -n "\${WENLAN_TEST_SHIM_DIR:-}" ]; then
@@ -173,12 +151,10 @@ if [ -n "\${WENLAN_TEST_SHIM_DIR:-}" ]; then
   PATH="$shim_dir:$PATH"
   export PATH
 fi
-# The "this tool does not exist" cases used to be written as an early
-# \`if (process.platform === "win32") return;\` in the test body, because on
-# Windows \`netstat\` and \`tasklist\` are always on PATH — so on this platform
-# they were tests with NO ASSERTION IN THEM, counted among the passes. PATH is
-# replaced rather than prepended here instead, so absence is absence on every
-# host and the case can actually fail. cygpath is resolved above, before this.
+# PATH is REPLACED, not prepended, for the "this tool does not exist" cases:
+# \`netstat\` and \`tasklist\` are always on PATH on Windows, so skipping the case
+# there leaves it with no assertion in it, counted among the passes. cygpath is
+# resolved above, before this.
 if [ "\${WENLAN_TEST_ISOLATE_PATH:-}" = "1" ]; then
   PATH="\${shim_dir:-}"
   export PATH
@@ -323,13 +299,11 @@ const localisedListeningRow = (port: number, pid: string) =>
 const tasklistRow = (image: string, pid: string) =>
   `"${image}","${pid}","Console","1","9,000 K"`;
 
-// Round 13e reopened this. The old fixture was two rows, and the old probe
-// accepted two rows as a table — so the suite's own "demonstrably a table"
-// negative was itself the well-formed fragment the probe is supposed to
-// refuse. The probe now asks for three things, and the fixture supplies all
-// three: every line a CSV row, the System process (pid 4, present on every
-// Windows NT kernel), and at least ten rows. These are the "everything else on
-// the machine" part; the real table has 268.
+// The probe asks for three things and this fixture supplies all three: every
+// line a CSV row, the System process (pid 4, present on every Windows NT
+// kernel), and at least ten rows. A two-row fixture is the well-formed fragment
+// the probe is supposed to refuse, so it cannot stand for a whole table. These
+// are the "everything else on the machine" part; the real table has 268.
 const TASKLIST_BACKGROUND = [
   tasklistRow("System", "4"),
   tasklistRow("Registry", "132"),
@@ -352,14 +326,12 @@ const psHeader = "      PID    PPID    PGID     WINPID   TTY         UID    STIM
 const psRow = (pid: string, winpid: string, stime: string, command: string) =>
   `${pid.padStart(9)}${"0".padStart(8)}${"0".padStart(8)}${winpid.padStart(11)}  ?${" ".repeat(14)}0${stime.padStart(9)} ${command}`;
 
-// Round 13f. `process_image_path` now asks `ps -W` for the same two
-// completeness witnesses `process_is_alive` asks of `tasklist`: WINPID 4, the
-// System process, which exists on every Windows NT kernel from boot to
-// shutdown, and a floor of ten rows. Every fixture below used to be a header
-// and ONE row — which is to say, the suite's own "found" and "not found" cases
-// were the well-formed fragment the fix forbids, exactly as the tasklist
-// fixtures were in round 13e. These rows are the "everything else on the
-// machine" part; the real table has 277 of them.
+// `process_image_path` asks `ps -W` for the same two completeness witnesses
+// `process_is_alive` asks of `tasklist`: WINPID 4, the System process, which
+// exists on every Windows NT kernel from boot to shutdown, and a floor of ten
+// rows. A header plus ONE row is the fragment that fix forbids, so it cannot
+// stand for a whole table here either. These rows are the "everything else on
+// the machine" part; the real table has 277 of them.
 //
 // A `ps -W` row is PID PPID PGID WINPID, four numbers, and the library's row
 // shape reads only those, so the MSYS pid here is arbitrary and the WINPID is
@@ -428,10 +400,9 @@ describe("host-process.sh: the suite is reading the shipped library", () => {
       "listener_pid_for_port",
     );
     // Written by THIS run, not merely consistent with it. The digest is a claim
-    // about bytes; two stale things can agree about bytes indefinitely, and no
-    // window over mtime can separate them — round 13e walked through the last
-    // one at under two seconds. The nonce is unguessable, so carrying it is
-    // authorship rather than recency.
+    // about bytes and two stale things can agree about bytes indefinitely; no
+    // window over mtime separates them, because mtime granularity is seconds.
+    // The nonce is unguessable, so carrying it is authorship, not recency.
     const carried = [...actual.matchAll(OVERRIDE_NONCE_LINE)].map((m) => m[1]);
     expect(carried, "the override does not carry exactly one control nonce").toHaveLength(
       1,
@@ -496,9 +467,9 @@ describe("host-process.sh: listener_pid_for_port is tri-state", () => {
     expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
   });
 
-  // Not "it returns 2" but "it does not answer FREE about a port that is
-  // held". Run against a table where 135 has a listener, the old guard
-  // answered rc=1 for the padded spelling of that same port.
+  // Not "it returns 2" but "it does not answer FREE about a port that is held":
+  // a range check that normalises and a lookup that does not answer rc=1 for
+  // the padded spelling of a port this table says is busy.
   it("never reports a HELD port as free, however the port is spelled", () => {
     for (const arg of ["0000000135", "000135", "0135"]) {
       const result = runDriver(["listener", arg], {
@@ -523,17 +494,11 @@ describe("host-process.sh: listener_pid_for_port is tri-state", () => {
     }
   });
 
-  it("reports COULD NOT MEASURE when the listener table command fails", () => {
-    const result = runDriver(["listener", "17931"], {
-      shims: [shim("netstat", "exit 1")],
-    });
-    expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
-  });
-
-  it("reports COULD NOT MEASURE when the listener table comes back empty", () => {
-    const result = runDriver(["listener", "17931"], {
-      shims: [shim("netstat", "exit 0")],
-    });
+  it.each([
+    ["reports COULD NOT MEASURE when the listener table command fails", "exit 1"],
+    ["reports COULD NOT MEASURE when the listener table comes back empty", "exit 0"],
+  ])("%s", (_title, body) => {
+    const result = runDriver(["listener", "17931"], { shims: [shim("netstat", body)] });
     expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
   });
 
@@ -548,11 +513,10 @@ describe("host-process.sh: listener_pid_for_port is tri-state", () => {
     expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
   });
 
-  // Round 13d, 13c-new finding 3. The old schema gate was "any line whose
-  // first token is TCP or UDP", which `TCP diagnostic text` satisfies — and
-  // the numeric-pid check downstream never sees it, because no row matched the
-  // port at all. So the gate was passed by output that is not a table, and the
-  // miss came back as a measured negative.
+  // A schema gate of "any line whose first token is TCP or UDP" is satisfied by
+  // `TCP diagnostic text`, and the numeric-pid check downstream never sees it
+  // because no row matched the port at all — so output that is not a table
+  // passes the gate and the miss comes back as a measured negative.
   it("reports COULD NOT MEASURE for output that starts with TCP but is not a table", () => {
     const result = runDriver(["listener", "17931"], {
       shims: [
@@ -565,12 +529,10 @@ describe("host-process.sh: listener_pid_for_port is tri-state", () => {
     expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
   });
 
-  // And the reason the gate could not simply demand the word LISTENING: it is
-  // localised. `TCP` and the wildcard foreign address are not, and measured
-  // against this host's real table the wildcard-foreign shape selects exactly
-  // the 34 LISTENING rows and no others. Before this, a German Windows read
-  // every busy port as free — the precise failure the `lsof` gate existed to
-  // prevent, reintroduced by a translated word.
+  // The gate cannot demand the word LISTENING: it is localised, so a German
+  // Windows reads every busy port as free. `TCP` and the wildcard foreign
+  // address are not localised, and measured against this host's real table the
+  // wildcard-foreign shape selects exactly the 34 LISTENING rows and no others.
   it("finds the listener in a table whose State column is translated", () => {
     const result = runDriver(["listener", "17931"], {
       shims: [shim("netstat", netstatTable([localisedListeningRow(17931, "4242")]))],
@@ -585,20 +547,16 @@ describe("host-process.sh: listener_pid_for_port is tri-state", () => {
     expect(result.stdout.trim(), result.stderr).toBe("rc=1 out=");
   });
 
-  // ROUND 4, and the defect is inside the round-13d remedy above. That rule
-  // rejected `TCP diagnostic text` — a malformed line whose FIRST TOKEN was
-  // already a protocol name — and nothing else. A status-0 `WARNING: partial
-  // results` or `Access denied`, merged by the `2>&1` beside perfectly valid
-  // rows, begins with neither word, so no rule looked at it at all: the
-  // validator passed on the valid rows, the port query found nothing for our
-  // port in the truncated remainder, and the function returned 1. MEASURED
-  // FREE, from a table netstat itself had complained about — and that answer
-  // is what deletes an ownership record and starts a second daemon on an
-  // occupied port. The comment claimed merged warnings were fatal; the code
-  // did not enforce it.
+  // A rule that only rejects a malformed line whose FIRST TOKEN is a protocol
+  // name does not see a status-0 `WARNING: partial results` or `Access denied`
+  // merged by the `2>&1` beside perfectly valid rows: the validator passes on
+  // the valid rows, the port query finds nothing in the truncated remainder,
+  // and the function returns MEASURED FREE about a table netstat complained
+  // about — which is what deletes an ownership record and starts a second
+  // daemon on an occupied port.
   //
   // The port asked for is deliberately absent from the rows that ARE there, so
-  // this case is exactly the one that used to come back "free".
+  // this case is exactly the one that would come back "free".
   it("reports COULD NOT MEASURE for a diagnostic merged after valid rows", () => {
     const result = runDriver(["listener", "17931"], {
       shims: [
@@ -692,17 +650,13 @@ describe("host-process.sh: listener_pid_for_port is tri-state", () => {
     expect(result.stdout.trim(), result.stderr).toBe("rc=0 out=4242");
   });
 
-  // ROUND 5. The two rules above are a GRAMMAR, and a grammar cannot see a
-  // table that was cut after a well-formed row: every surviving row validates,
-  // the port query finds nothing for our port in what arrived, and the answer
-  // came back 1 — MEASURED FREE, from a table that stopped early. That answer
-  // is what deletes an ownership record and starts a second daemon on a held
-  // port, which is the same consequence as every other case in this describe.
-  //
-  // The witness is the UDP section: netstat prints all of TCP and then all of
-  // UDP, so a UDP row means the stream got past every TCP row there was. This
-  // fixture is the real table shape with the UDP section (and any TCP rows
-  // after the cut) missing — well-formed, and not whole.
+  // The two rules above are a GRAMMAR, and a grammar cannot see a table cut
+  // after a well-formed row: every surviving row validates, the port query
+  // finds nothing in what arrived, and the answer is MEASURED FREE from a table
+  // that stopped early. The witness is the UDP section — netstat prints all of
+  // TCP and then all of UDP, so a UDP row means the stream got past every TCP
+  // row there was. This fixture is the real shape with that section missing:
+  // well-formed, and not whole.
   it("reports COULD NOT MEASURE for a table that stopped inside the TCP section", () => {
     const result = runDriver(["listener", "17931"], {
       shims: [
@@ -723,20 +677,16 @@ describe("host-process.sh: listener_pid_for_port is tri-state", () => {
   });
 
   it("reports COULD NOT MEASURE when no listener table command exists at all", () => {
-    // This case USED to begin `if (process.platform === "win32") return;`,
-    // because `netstat` is always on PATH here — so on Windows, the platform
-    // this branch exists for, it was a test with no assertion in it that
-    // reported as a pass. PATH is emptied instead, which makes absence real on
-    // every host and makes the case able to fail.
-    //
-    // Absence must be 2. A 1 here would mean "no listener", which is the defect.
+    // PATH is emptied rather than the case skipped on Windows, where `netstat`
+    // is always present: a skip on the one platform this branch exists for is a
+    // test with no assertion in it. Absence must be 2; a 1 here would mean "no
+    // listener", which is the defect.
     const result = runDriver(["listener", "17931"], { isolatePath: true });
     expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
   });
 });
 
-// THE PLATFORM ITSELF, which every branch in this file rests on and which was
-// the last command substitution here whose failure became an ordinary value.
+// THE PLATFORM ITSELF, which every branch in this file rests on.
 //
 // `case "$(uname -s)" in … *) HOST_IS_WINDOWS=0` has nowhere to put a status: a
 // `uname` that is missing, or that fails, or that prints nothing, yields the
@@ -784,11 +734,9 @@ describe("host-process.sh: the platform is measured, not assumed", () => {
   });
 });
 
-// The POSIX branch is the one that runs on the ubuntu and macos CI lanes, and
-// until Codex Sol pointed at it in the Phase 4 review every case above forced
-// the Windows branch, so it had no behavioural coverage at all -- while
-// carrying the very defect the tri-state exists to prevent: `|| hit=""`
-// collapsed every nonzero lsof status, tool failure included, into "port free".
+// The POSIX branch is the one that runs on the ubuntu and macos CI lanes, so it
+// needs behavioural coverage of its own: every case above forces the Windows
+// branch.
 //
 // lsof returns 1 for "nothing matched" AND for "an error was detected", so the
 // status alone cannot separate them. With -t the only thing on stdout is pids,
@@ -828,14 +776,12 @@ describe("host-process.sh: listener_pid_for_port, POSIX branch", () => {
     expect(posix("    exit 1").stdout.trim()).toBe("rc=1 out=");
   });
 
-  // THE case, and the one the old `|| hit=""` got wrong: lsof ran, lsof
-  // failed, and the answer was "port free".
+  // THE case `|| hit=""` gets wrong: lsof ran, lsof failed, answer "port free".
   //
-  // Note what this shim does NOT prove on its own. It writes to stderr while
-  // the library passes `-w`, which real lsof honours — so this fixture is a
-  // control that could never reproduce the failure it is named after. It is
-  // kept because "text alongside status 1" must stay unmeasured, and the case
-  // BELOW is the one that reproduces the real shape.
+  // What this shim does NOT prove on its own: it writes to stderr while the
+  // library passes `-w`, which real lsof honours, so it cannot reproduce the
+  // failure it is named after. It is kept because "text alongside status 1"
+  // must stay unmeasured; the case BELOW is the real shape.
   it("reports COULD NOT MEASURE when lsof exits 1 with an error on stderr", () => {
     const result = posix(
       `    echo "lsof: status error on /proc/1/fd: Permission denied" >&2\n    exit 1`,
@@ -845,10 +791,8 @@ describe("host-process.sh: listener_pid_for_port, POSIX branch", () => {
 
   // THE REAL SHAPE, and the reason the case above cannot stand alone. `-w` is
   // in the command line specifically to SUPPRESS lsof's warnings, so an lsof
-  // that hit an unreadable /proc, mount or device exits 1 having said NOTHING
-  // — which is byte for byte the shape of "nothing matched". A silent 1 was
-  // read as "port free" and `start_runtime` went on to bind a port nobody had
-  // looked at.
+  // that hit an unreadable /proc, mount or device exits 1 having said NOTHING —
+  // byte for byte the shape of "nothing matched", and read as "port free".
   //
   // It is separated from a real absence by a second read that covers the same
   // scan: lsof exits 0 only when it detected no error anywhere, so a status-0
@@ -896,9 +840,8 @@ describe("host-process.sh: listener_pid_for_port, POSIX branch", () => {
   });
 
   it("reports COULD NOT MEASURE when lsof is not installed", () => {
-    // The original Windows failure, now answered rather than fatal: Git Bash
-    // has no lsof, which is why the smokes' `command -v lsof || fail` gate
-    // stopped /verify dead on this platform.
+    // Git Bash has no lsof at all, which is why a `command -v lsof || fail`
+    // gate stops the smokes dead on this platform.
     const result = runDriver(["listener", "17931"], { posixBranch: true });
     expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
   });
@@ -940,12 +883,11 @@ describe("host-process.sh: process_is_alive is tri-state", () => {
     expect(result.stdout.trim(), result.stderr).toBe("rc=1");
   });
 
-  // Round 13d, new finding 1. `tasklist //FI "PID eq N"` exits 0 and prints
-  // this notice for an absent pid — and exits 0 and prints one line of prose
-  // for anything else that goes wrong, too. The old rule was "anything not
-  // starting with a quote is absence", so every status-0 diagnostic was a dead
-  // process, and the caller's next move is to delete a live daemon's ownership
-  // record. A single line of prose is now what it always was: unmeasured.
+  // `tasklist //FI "PID eq N"` exits 0 and prints this notice for an absent pid
+  // — and exits 0 and prints one line of prose for anything else that goes
+  // wrong, too. Under "anything not starting with a quote is absence" every
+  // status-0 diagnostic is a dead process, and the caller's next move is to
+  // delete a live daemon's ownership record.
   it("reports COULD NOT MEASURE for a status-0 line of prose, not a negative", () => {
     const notice = `printf '%s\\n' 'INFO: No tasks are running which match the specified criteria.'`;
     expect(runDriver(["alive", "4242"], { shims: [shim("tasklist", notice)] }).stdout.trim()).toBe(
@@ -957,63 +899,46 @@ describe("host-process.sh: process_is_alive is tri-state", () => {
     );
   });
 
-  it("reports COULD NOT MEASURE for a table too short to be a process table", () => {
-    // One CSV row is not a machine's process list; it is a fragment. Reading
-    // "your pid is not in this fragment" as absence is the same defect one
-    // level in.
-    const result = runDriver(["alive", "4242"], {
-      shims: [shim("tasklist", emitLines([tasklistRow("System", "4")]))],
-    });
-    expect(result.stdout.trim(), result.stderr).toBe("rc=2");
-  });
-
-  // Round 13e, new finding 2, verbatim: "process_is_alive calls the output a
-  // process table once it sees only two CSV-shaped rows. Its negative test
-  // supplies exactly such a fabricated two-row fragment." Both halves are
-  // pinned here — the fragment is well-formed CSV and contains pid 4, so
-  // neither of the other two conditions catches it. Only the row floor does.
-  it("reports COULD NOT MEASURE for a well-formed fragment that contains pid 4", () => {
-    const fragment = emitLines([tasklistRow("System", "4"), tasklistRow("svchost.exe", "1576")]);
-    const result = runDriver(["alive", "4242"], { shims: [shim("tasklist", fragment)] });
-    expect(result.stdout.trim(), result.stderr).toBe("rc=2");
-  });
-
-  // A full-length table that is not a process table. The floor and the CSV
-  // shape both pass; only the System process catches this one.
-  it("reports COULD NOT MEASURE for a full table with no System process in it", () => {
-    const noSystem = emitLines(TASKLIST_BACKGROUND.filter((row) => !row.includes('","4","')));
-    const result = runDriver(["alive", "4242"], { shims: [shim("tasklist", noSystem)] });
-    expect(result.stdout.trim(), result.stderr).toBe("rc=2");
-  });
-
-  // stderr is merged into the capture, so a status-0 warning is a line that is
-  // not a row. Dropping it left the warning invisible beside a table that may
-  // be missing the very process being asked about.
-  it("reports COULD NOT MEASURE for a table with a warning merged into it", () => {
-    const withWarning = `${tasklistTable([])}\necho 'WARNING: the RPC server is unavailable.' >&2`;
-    const result = runDriver(["alive", "4242"], { shims: [shim("tasklist", withWarning)] });
-    expect(result.stdout.trim(), result.stderr).toBe("rc=2");
-  });
-
-  // The shipped form was `tasklist … | grep -q '^"'`: a tasklist that failed
-  // produced no output, grep found nothing, and the answer was "dead". The
-  // caller then deleted the ownership record of a running daemon.
-  it("reports COULD NOT MEASURE when the process table command fails", () => {
-    const result = runDriver(["alive", "4242"], { shims: [shim("tasklist", "exit 1")] });
-    expect(result.stdout.trim(), result.stderr).toBe("rc=2");
-  });
-
-  it("reports COULD NOT MEASURE when the process table says nothing at all", () => {
-    // Silence is not the "no tasks" notice: tasklist always says something, so
-    // an empty stdout is an anomaly and must not read as absence.
-    const result = runDriver(["alive", "4242"], { shims: [shim("tasklist", "exit 0")] });
+  // One fixture per rule the probe applies, each one caught by that rule alone:
+  //   too short          one CSV row is a fragment, not a machine's process list
+  //   pid-4 fragment     well-formed CSV carrying the System process, so only
+  //                      the ten-row floor catches it
+  //   no System process  full length and well-formed, so only pid 4 catches it
+  //   merged warning     stderr is merged in, so a status-0 warning is a line
+  //                      that is not a row; discarded, it would be invisible
+  //                      beside a table missing the process being asked about
+  //   exit 1             `tasklist … | grep -q '^"'` finds nothing and answers
+  //                      "dead", after which the caller deletes the ownership
+  //                      record of a running daemon
+  //   exit 0             tasklist always says something, so silence is an
+  //                      anomaly and not the "no tasks" notice
+  it.each([
+    [
+      "reports COULD NOT MEASURE for a table too short to be a process table",
+      () => emitLines([tasklistRow("System", "4")]),
+    ],
+    [
+      "reports COULD NOT MEASURE for a well-formed fragment that contains pid 4",
+      () => emitLines([tasklistRow("System", "4"), tasklistRow("svchost.exe", "1576")]),
+    ],
+    [
+      "reports COULD NOT MEASURE for a full table with no System process in it",
+      () => emitLines(TASKLIST_BACKGROUND.filter((row) => !row.includes('","4","'))),
+    ],
+    [
+      "reports COULD NOT MEASURE for a table with a warning merged into it",
+      () => `${tasklistTable([])}\necho 'WARNING: the RPC server is unavailable.' >&2`,
+    ],
+    ["reports COULD NOT MEASURE when the process table command fails", () => "exit 1"],
+    ["reports COULD NOT MEASURE when the process table says nothing at all", () => "exit 0"],
+  ])("%s", (_title, body) => {
+    const result = runDriver(["alive", "4242"], { shims: [shim("tasklist", body())] });
     expect(result.stdout.trim(), result.stderr).toBe("rc=2");
   });
 
   it("reports COULD NOT MEASURE when no process table command exists at all", () => {
-    // The same repair as the listener case above: `tasklist` is always on PATH
-    // on Windows, so the early `return` made this an assertion-free pass on the
-    // one platform whose branch it covers.
+    // `tasklist` is always on PATH on Windows, so skipping this case there
+    // makes it an assertion-free pass on the one platform its branch covers.
     const result = runDriver(["alive", "4242"], { isolatePath: true });
     expect(result.stdout.trim(), result.stderr).toBe("rc=2");
   });
@@ -1038,9 +963,9 @@ describe("host-process.sh: process_is_alive is tri-state", () => {
 // is what the fix consults whenever kill declines to confirm.
 describe("host-process.sh: process_is_alive, POSIX branch", () => {
   // A pid inside every plausible pid_max (Linux defaults to 4194304) and not in
-  // use. The previous value, 4294967290, was PAST bash's own integer range:
-  // measured here, `kill -0` answers "arguments must be process or job IDs",
-  // which is the question being REJECTED, not answered — pinned below.
+  // use. 4294967290 is PAST bash's own integer range: measured here, `kill -0`
+  // answers "arguments must be process or job IDs", which is the question being
+  // REJECTED, not answered — pinned below.
   const GONE = "999999";
   const posixAlive = (body: string, env?: Record<string, string>) =>
     runDriver(["alive", GONE], { posixBranch: true, shims: [shim("ps", body)], env });
@@ -1054,12 +979,11 @@ describe("host-process.sh: process_is_alive, POSIX branch", () => {
     expect(posixAlive("exit 1").stdout.trim()).toBe("rc=1");
   });
 
-  // Round 13e, reopened 13c-new#2. Under Linux `hidepid=invisible` another
-  // user's process is absent from /proc entirely, so `ps -p` is silent with
-  // status 1 — the exact shape of a real absence — while `kill -0` fails with
-  // EPERM, which is the kernel confirming the process EXISTS. Reading only
-  // kill's status discarded that proof and answered "dead", and the caller's
-  // next move after "dead" is to delete the ownership record.
+  // Under Linux `hidepid=invisible` another user's process is absent from /proc
+  // entirely, so `ps -p` is silent with status 1 — the exact shape of a real
+  // absence — while `kill -0` fails with EPERM, which is the kernel confirming
+  // the process EXISTS. Reading only kill's status discards that proof and
+  // answers "dead", after which the caller deletes the ownership record.
   it("reports COULD NOT MEASURE for a silent ps when kill says EPERM, not ESRCH", () => {
     const result = posixAlive("exit 1", { WENLAN_HOST_PROCESS_FORCE_EPERM: "1" });
     expect(result.stdout.trim(), result.stderr).toBe("rc=2");
@@ -1111,10 +1035,10 @@ describe("host-process.sh: process_image_path is tri-state", () => {
   });
 
   // Measured on a real host: 214 of 246 `ps -W` rows carried a two-token STIME
-  // ("Aug 27"), so the old `for (i = 8; i <= NF; i++)` parse prefixed the image
-  // with a stray day number. A daemon that outlived midnight stopped matching
-  // its own recorded path and `stop` refused to stop it — a WRONG NEGATIVE,
-  // which is the same family of lie as an unmeasured one.
+  // ("Aug 27"), so a `for (i = 8; i <= NF; i++)` parse prefixes the image with a
+  // stray day number. A daemon that outlives midnight then stops matching its
+  // own recorded path and `stop` refuses to stop it — a WRONG NEGATIVE, the
+  // same family of lie as an unmeasured one.
   it("reads the image column by offset, so a two-token STIME cannot corrupt it", () => {
     const result = runDriver(["image", "4242"], {
       shims: [
@@ -1138,21 +1062,19 @@ describe("host-process.sh: process_image_path is tri-state", () => {
     expect(result.stdout.trim(), result.stderr).toBe("rc=1 out=");
   });
 
-  it("reports COULD NOT MEASURE when the snapshot command fails", () => {
-    const result = runDriver(["image", "4242"], { shims: [shim("ps", "exit 1")] });
+  it.each([
+    ["reports COULD NOT MEASURE when the snapshot command fails", "exit 1"],
+    ["reports COULD NOT MEASURE when the snapshot comes back empty", "exit 0"],
+  ])("%s", (_title, body) => {
+    const result = runDriver(["image", "4242"], { shims: [shim("ps", body)] });
     expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
   });
 
-  it("reports COULD NOT MEASURE when the snapshot comes back empty", () => {
-    const result = runDriver(["image", "4242"], { shims: [shim("ps", "exit 0")] });
-    expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
-  });
-
-  // Round 13d, new finding 1. The parse takes the image from the COMMAND
-  // column's offset and the pid from WINPID's field index. Under the old
-  // `col > 0 &&` guard a header carrying neither skipped every row, printed
-  // nothing, and fell through to the "no such pid" return — a failed parse
-  // wearing a measured negative, for a pid that was in the table all along.
+  // The parse takes the image from the COMMAND column's offset and the pid from
+  // WINPID's field index. Under a `col > 0 &&` guard a header carrying neither
+  // skips every row, prints nothing, and falls through to the "no such pid"
+  // return — a failed parse wearing a measured negative, for a pid that was in
+  // the table all along.
   it("reports COULD NOT MEASURE when the snapshot header is not the one it parses", () => {
     const noCommand = psHeader.replace("COMMAND", "CMDLINE");
     const noWinpid = psHeader.replace("WINPID", "WPID  ");
@@ -1168,35 +1090,22 @@ describe("host-process.sh: process_image_path is tri-state", () => {
     // second or two, so the 5s default measures the machine, not the parse.
   }, 60_000);
 
-  // Round 13f. One case per completeness witness, and both are about the
-  // difference between "this pid is not running" and "this is not the whole
-  // table". The pid asked about is in NEITHER fixture, so a parse that accepts
-  // them answers rc=1 — a measured negative — to a question nothing measured,
-  // and the caller acts on it by deleting a live daemon's ownership record.
-  // Neither witness proves the table is COMPLETE; the residual is stated in
-  // lib/host-process.sh and in scripts/AGENTS.md.
-  it("reports COULD NOT MEASURE for a ps -W table with no System process in it", () => {
+  // One case per completeness witness, both about the difference between "this
+  // pid is not running" and "this is not the whole table". The pid asked about
+  // is in NEITHER fixture, so a parse that accepts them answers rc=1 — a
+  // measured negative — to a question nothing measured, and the caller acts on
+  // it by deleting a live daemon's ownership record. Neither witness proves the
+  // table is COMPLETE; that residual is stated in lib/host-process.sh and in
+  // scripts/AGENTS.md.
+  it.each([
+    ["reports COULD NOT MEASURE for a ps -W table with no System process in it", psTableNoSystem],
+    ["reports COULD NOT MEASURE for a ps -W table too short to be a process table", psTableTooShort],
+  ])("%s", (_title, table) => {
     const result = runDriver(["image", "4242"], {
       shims: [
         shim(
           "ps",
-          psTableNoSystem([
-            psRow("7100", "7100", "10:23:45", "C:\\Windows\\System32\\spoolsv.exe"),
-          ]),
-        ),
-      ],
-    });
-    expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
-  });
-
-  it("reports COULD NOT MEASURE for a ps -W table too short to be a process table", () => {
-    const result = runDriver(["image", "4242"], {
-      shims: [
-        shim(
-          "ps",
-          psTableTooShort([
-            psRow("7100", "7100", "10:23:45", "C:\\Windows\\System32\\spoolsv.exe"),
-          ]),
+          table([psRow("7100", "7100", "10:23:45", "C:\\Windows\\System32\\spoolsv.exe")]),
         ),
       ],
     });
@@ -1204,16 +1113,14 @@ describe("host-process.sh: process_image_path is tri-state", () => {
   });
 });
 
-// Round 13g. `windows_pid_for_job` asks `ps -W` the SAME question
-// `process_image_path` asks it — which row is mine, and what is it running —
-// keyed on the MSYS pid instead of the Windows one. It had its own copy of the
-// parse, and every hardening above landed on the other copy: `NF < 8`, the word
-// count round 13f removed, with neither completeness witness beside it. So a
-// header plus an eight-word warning, or a short partial table, spun its bounded
-// poll for ten seconds and then returned 1 — "the process never appeared" — for
-// a table nothing had managed to read. It fails SAFE, because the caller
-// refuses to start either way; it reports the WRONG STATE, and all three
-// callers branch on the difference.
+// `windows_pid_for_job` asks `ps -W` the SAME question `process_image_path`
+// asks it — which row is mine, and what is it running — keyed on the MSYS pid
+// instead of the Windows one. A SECOND COPY of the parse is the defect: every
+// hardening lands on one of them, and the other goes on counting words, so a
+// header plus an eight-word warning or a short partial table spins the bounded
+// poll for ten seconds and returns 1, "the process never appeared", for a table
+// nothing managed to read. It fails SAFE — the caller refuses to start either
+// way — and reports the WRONG STATE, which all three callers branch on.
 //
 // The pid asked for is ABSENT from every fixture below, which is what makes
 // these cases able to fail: a parse that accepts the table answers "never
@@ -1246,17 +1153,13 @@ describe("host-process.sh: windows_pid_for_job is tri-state", () => {
   });
 
 
-  // ROUND 4 (Codex Sol), NEW FINDING 3. This loop was `for _ in $(seq 1 100)`.
-  // A `seq` that cannot run — absent, broken, a PATH that lost /usr/bin —
-  // yields the empty word list, the body never executes, and the function falls
-  // straight through to `return 1`: "the process never appeared", from a
-  // hundred measurements that did not happen. Nothing distinguishes it from the
-  // honest terminal negative, and its caller's response is to give up on a
-  // daemon it has just spawned — leaving it running with no ownership record.
-  //
-  // The loop is arithmetic now, so `seq` is not on the path at all. A `seq`
-  // that exits 127 sits on PATH here to say so, and the answer has to come from
-  // the table rather than from the tool.
+  // `for _ in $(seq 1 100)` with a `seq` that cannot run — absent, broken, a
+  // PATH that lost /usr/bin — yields the empty word list, the body never
+  // executes, and the function falls through to `return 1`: "the process never
+  // appeared", from a hundred measurements that did not happen, and the caller
+  // gives up on a daemon it has just spawned, leaving it running with no
+  // ownership record. The loop is arithmetic, so a `seq` exiting 127 sits on
+  // PATH here and the answer still has to come from the table.
   it("finds the pid even when `seq` cannot run", () => {
     const result = runDriver(["jobpid", JOB, SERVER], {
       shims: [
@@ -1291,16 +1194,12 @@ describe("host-process.sh: windows_pid_for_job is tri-state", () => {
     // host's load rather than the poll.
   }, 60_000);
 
-  // THE TERMINAL NEGATIVE, which had no case at all: there were "found",
-  // "could not measure" and "negative then found", and nothing that ran the
-  // window out. That is the one answer this helper is allowed to give after a
-  // hundred readable tables that did not contain the row -- and it is the one
-  // the `rc == 2` early return above it must never be able to become, because
-  // the caller's response to 1 and to 2 differ in what they print and in
-  // whether they call the reap a measurement.
-  //
+  // THE TERMINAL NEGATIVE: the one answer this helper may give after a hundred
+  // readable tables that did not contain the row, and the one the `rc == 2`
+  // early return above must never become — the caller's responses to 1 and to 2
+  // differ in what they print and in whether they call the reap a measurement.
   // A hundred rounds at 0.1s is ten seconds of sleeping plus a hundred `ps`
-  // spawns, which is why nothing had paid for it before. It is paid here once.
+  // spawns, paid here once.
   it("reports the MEASURED NEGATIVE after a full window of readable tables", () => {
     const counted = [
       `count="$(dirname "$0")/ps.count"`,
@@ -1317,16 +1216,12 @@ describe("host-process.sh: windows_pid_for_job is tri-state", () => {
     expect(result.stdout.trim(), result.stderr).toBe("rc=1 out=");
   }, 120_000);
 
-  // ROUND 5, and it is the case above with its WINDOW taken away. The round-4
-  // fix moved the round COUNT off `seq`; the DELAY stayed a bare `sleep 0.1`
-  // whose status nothing read, and every caller invokes this from the left of a
-  // `||`, which disables errexit through the whole body. So a `sleep` that
-  // fails does not stop the loop: all hundred polls run back to back in
-  // microseconds and the answer is the same terminal 1 the case above earns
-  // with ten real seconds of readable tables. A ten-second window that took ten
-  // milliseconds is not a window, and "the process never appeared" is not
-  // something it measured. `start_runtime`'s response to that 1 is to give up
-  // on a daemon it has just spawned.
+  // The case above with its WINDOW taken away. Moving the round COUNT off `seq`
+  // is not enough: a bare `sleep 0.1` whose status nothing reads, invoked from
+  // the left of a `||` (which disables errexit through the whole body), lets a
+  // failing `sleep` run all hundred polls back to back in microseconds and
+  // return the same terminal 1 the case above earns with ten real seconds. A
+  // ten-second window that took ten milliseconds is not a window.
   //
   // The table is the same measured-absent one, so the ONLY difference between
   // this case and the one above is whether the delay happened.
@@ -1344,23 +1239,24 @@ describe("host-process.sh: windows_pid_for_job is tri-state", () => {
     expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
   }, 60_000);
 
-  // THE case for this finding. Eight words, so the removed `NF < 8` counted it
-  // as a row — the nine-word one next door is the same point for the other
-  // copy, and the four-word one is what both rules already caught.
-  it("reports COULD NOT MEASURE for a job snapshot with an eight-word warning in it", () => {
-    const result = jobpid(
-      psTable(["ps: warning: the process table was read late", strangerRow]),
-    );
-    expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
-  });
-
-  it("reports COULD NOT MEASURE for a job snapshot too short to be a process table", () => {
-    const result = jobpid(psTableTooShort([strangerRow]));
-    expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
-  });
-
-  it("reports COULD NOT MEASURE for a job snapshot with no System process in it", () => {
-    const result = jobpid(psTableNoSystem([strangerRow]));
+  // The warning is EIGHT WORDS, which an `NF < 8` word count reads as a row —
+  // the nine-word one next door is the same point for the other copy of the
+  // parse, and a four-word one is what both rules already catch.
+  it.each([
+    [
+      "reports COULD NOT MEASURE for a job snapshot with an eight-word warning in it",
+      () => psTable(["ps: warning: the process table was read late", strangerRow]),
+    ],
+    [
+      "reports COULD NOT MEASURE for a job snapshot too short to be a process table",
+      () => psTableTooShort([strangerRow]),
+    ],
+    [
+      "reports COULD NOT MEASURE for a job snapshot with no System process in it",
+      () => psTableNoSystem([strangerRow]),
+    ],
+  ])("%s", (_title, table) => {
+    const result = jobpid(table());
     expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
   });
 
@@ -1376,16 +1272,11 @@ describe("host-process.sh: windows_pid_for_job is tri-state", () => {
   }, 60_000);
 });
 
-// Round 13d, 13c-new finding 2. The POSIX branch is the one macOS and the
-// ubuntu lane run. `ps -p` exits 1 both when the pid is gone and when ps itself
-// had a problem, and `kill -0` reports EPERM and ESRCH with the same status —
-// so a live process owned by another user, queried by a `ps` that failed, was
-// two failed measurements agreeing on a negative neither of them made.
-// Round 13e, new finding 2: `2>/dev/null` on the Windows snapshots threw away
-// the one signal that says the tool had something to complain about, so a
-// status-0 warning could sit beside a table that was missing the very process
-// being asked about. stderr is merged now, and "every line is a row" is what
-// makes the merge fatal rather than decorative.
+// `2>/dev/null` on the Windows snapshots throws away the one signal that says
+// the tool had something to complain about, so a status-0 warning can sit
+// beside a table missing the very process being asked about. stderr is merged
+// instead, and "every line is a row" is what makes the merge fatal rather than
+// decorative.
 describe("host-process.sh: a contaminated Windows snapshot is unmeasured", () => {
   const warned = (body: string) => `${body}\necho 'ps: warning: /proc unavailable' >&2`;
 
@@ -1395,22 +1286,18 @@ describe("host-process.sh: a contaminated Windows snapshot is unmeasured", () =>
     expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
   });
 
-  // Round 13f. The rule that makes the merge above fatal used to be `NF < 8` —
-  // a WORD COUNT, not a row shape. The warning above has four words and was
-  // caught by it; this one has nine, so the old floor counted it as a row and
-  // the stderr merge was decorative for exactly the lines it was added to
-  // catch. The shape is structural now: PID PPID PGID WINPID, four numbers,
-  // which every one of this host's 277 rows begins with and no diagnostic
-  // does. Field counts run 8 to 15, so the old floor could not have been a
-  // ceiling either.
+  // An `NF < 8` WORD COUNT catches the four-word warning above and counts this
+  // nine-word one as a row, which makes the stderr merge decorative for exactly
+  // the lines it was added to catch. The rule is structural instead: PID PPID
+  // PGID WINPID, four numbers, which every one of this host's 277 rows begins
+  // with and no diagnostic does. Field counts run 8 to 15, so no word count is
+  // a ceiling either.
   //
   // The line sits in the stream at a fixed position rather than arriving on
-  // stderr, deliberately. `2>&1` gives no ordering guarantee between a
-  // buffered stdout and an unbuffered stderr, and a diagnostic that lands
-  // FIRST is read as the header instead — rc=2 for a different reason, which
-  // would make this case pass whatever the row rule said. The merge itself is
-  // what the case above proves; this one is about what the merge is checked
-  // against.
+  // stderr, deliberately: `2>&1` gives no ordering guarantee between a buffered
+  // stdout and an unbuffered stderr, and a diagnostic that lands FIRST is read
+  // as the header instead — rc=2 for a different reason, which would make this
+  // case pass whatever the row rule said.
   it("refuses a ps -W snapshot with a nine-word diagnostic in the table", () => {
     const result = runDriver(["image", "4242"], {
       shims: [
@@ -1465,11 +1352,11 @@ describe("host-process.sh: process_image_path, POSIX branch", () => {
     expect(result.stdout.trim(), result.stderr).toBe("rc=1 out=");
   });
 
-  // Round 13e, reopened 13c-new#2: the same hidepid hole as in
-  // process_is_alive. Silent ps, status 1, and a kill that failed with EPERM
-  // rather than ESRCH — two failed measurements agreeing on a negative that
-  // neither of them made. The caller reads "none" as "a different binary" and
-  // kills nothing, or deletes the record.
+  // The same hidepid hole as in process_is_alive: silent ps, status 1, and a
+  // kill that failed with EPERM rather than ESRCH — two failed measurements
+  // agreeing on a negative neither of them made. The caller reads "none" as "a
+  // different binary" and kills nothing, or deletes the record.
+  //
   // The title must stay distinct from the process_is_alive case above it: the
   // negative-control harness keys per-test states by title, so two tests with
   // one name collapse to one entry and a must_survive check silently scores
@@ -1483,10 +1370,9 @@ describe("host-process.sh: process_image_path, POSIX branch", () => {
     expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
   });
 
-  // Round 13e, new finding: `ps` exiting 0 with nothing to say. A pid ps lists
-  // always has a command, so silence on the success path is a broken probe —
-  // and it used to fall through to the function's final `[[ -n "$out" ]] ||
-  // return 1` and be reported as "no such process".
+  // `ps` exiting 0 with nothing to say. A pid ps lists always has a command, so
+  // silence on the success path is a broken probe — and a trailing
+  // `[[ -n "$out" ]] || return 1` reports it as "no such process".
   it("reports COULD NOT MEASURE when ps succeeds and prints nothing", () => {
     const result = runDriver(["image", "999999"], {
       posixBranch: true,
@@ -1599,20 +1485,17 @@ describe("host-process.sh: shape contracts the behaviour above cannot reach", ()
   });
 
   it("reads the `ps -W` table in exactly one place", () => {
-    // The behavioural cases above cannot see this, and it is the whole shape of
-    // round 13g's finding: `process_image_path` and `windows_pid_for_job` ask
-    // the same table the same question, and while there were two parses every
-    // hardening landed on one of them. Three rounds of witnesses went into the
-    // first copy; the second still counted words. A second call site is fine, a
-    // second PARSE is the defect, so what is pinned is the number of places
-    // that run the command at all.
+    // The behavioural cases above cannot see this. `process_image_path` and
+    // `windows_pid_for_job` ask the same table the same question, and while
+    // there are two parses every hardening lands on one of them. A second call
+    // site is fine, a second PARSE is the defect, so what is pinned is the
+    // number of places that run the command at all.
     //
-    // Round 13h: across the REPOSITORY, not across this library. The third copy
-    // was in `scripts/dev-runtime.sh`'s `reap_staged_daemon` — the same table,
-    // the same four witnesses, maintained separately — and this row could not
-    // see it, because it only ever read the file the fix had landed in. A
-    // repo-wide claim needs a repo-wide check, so every shell file that sources
-    // this library is counted too, comments stripped from each.
+    // Across the REPOSITORY, not across this library: a copy has also lived in
+    // `scripts/dev-runtime.sh`'s `reap_staged_daemon` — the same table, the same
+    // four witnesses, maintained separately — which a check reading only the
+    // library cannot see. Every shell file that sources this library, and the
+    // scaffolding they share, is counted too, comments stripped from each.
     const strip = (text: string) =>
       text
         .split("\n")
@@ -1622,7 +1505,12 @@ describe("host-process.sh: shape contracts the behaviour above cannot reach", ()
     // which are always the shipped ones.
     const searched: [string, string][] = [
       [libPath, code()],
-      ...["scripts/dev-runtime.sh", "scripts/smoke-cli.sh", "scripts/smoke-mcp.sh"].map(
+      ...[
+        "scripts/dev-runtime.sh",
+        "scripts/smoke-cli.sh",
+        "scripts/smoke-mcp.sh",
+        "scripts/lib/smoke-common.sh",
+      ].map(
         (relative) =>
           [relative, strip(readFileSync(resolve(root, relative), "utf8"))] as [string, string],
       ),
@@ -1764,19 +1652,16 @@ describe("the tri-state library is the one every caller uses", () => {
 });
 
 // A skill is instructions to a future agent, so a fenced block in one is code:
-// it will be pasted and run as written, and the prose two paragraphs below
-// telling the reader to use the library instead will not be. `run-wenlan` shipped
+// it gets pasted and run as written, and the prose two paragraphs below telling
+// the reader to use the library instead does not. A block such as
 //
 //   netstat -ano | awk '$1=="TCP" && $2 ~ /:17878$/ && $4=="LISTENING" {print $5 ...
 //
-// as the runnable Windows listener check. That is two-state where the question
-// has three: a netstat that is missing or killed, a table whose columns moved,
-// and a non-English Windows whose State column reads ABHOEREN all produce the
-// same no-match as a genuinely free port — the exact substitution
-// `listener_pid_for_port` exists to remove, republished as the recommended
-// recipe. The pid block beside it had the matching defect: it computed the
-// COMMAND column's header offset, said in prose that a field index is unsafe,
-// and then read `$4` and never used the offset it had just computed.
+// is two-state where the question has three: a netstat that is missing or
+// killed, a table whose columns moved, and a non-English Windows whose State
+// column reads ABHOEREN all produce the same no-match as a genuinely free port
+// — the exact substitution `listener_pid_for_port` exists to remove, published
+// as the recommended recipe.
 describe("the run-wenlan skill's runnable blocks use the tri-state library", () => {
   const skillPath = ".claude/skills/run-wenlan/SKILL.md";
   // Comments stripped, like the shape contracts above: what a future agent RUNS
