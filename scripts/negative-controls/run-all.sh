@@ -275,7 +275,51 @@ hasher_answers_a_known_question() {
   return 0
 }
 
-declare -A SNAPSHOT=()
+# Two parallel INDEXED arrays, not an associative one. macOS ships bash 3.2,
+# which has no associative arrays at all: the declaration is a syntax error, and
+# a subscript such as `SNAPSHOT[a-drift-guard.py]` is then parsed as arithmetic.
+# The same construct in dev-runtime.sh broke the macOS app-check lane rather
+# than degrading, so it is not used anywhere in this directory.
+#
+# `snapshot_get` keeps exact-key semantics: a hit exits 0 and prints the stored
+# value, a miss exits 1 and prints nothing, so a file that was never hashed
+# stays distinguishable from one whose stored digest is the empty string. The
+# match is `=` on the whole key, never a pattern or a substring. `${#arr[@]}` is
+# safe on an empty array under `set -u` where `"${arr[@]}"` is not, so every
+# walk here is by index.
+SNAPSHOT_KEYS=()
+SNAPSHOT_VALS=()
+
+# exit: 0 the key is present (its value on stdout), 1 no such key.
+snapshot_get() {
+  local i n="${#SNAPSHOT_KEYS[@]}"
+  for (( i = 0; i < n; i++ )); do
+    if [ "${SNAPSHOT_KEYS[$i]}" = "$1" ]; then
+      printf '%s' "${SNAPSHOT_VALS[$i]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+snapshot_put() {
+  local i n="${#SNAPSHOT_KEYS[@]}"
+  for (( i = 0; i < n; i++ )); do
+    if [ "${SNAPSHOT_KEYS[$i]}" = "$1" ]; then
+      SNAPSHOT_VALS[$i]="$2"
+      return 0
+    fi
+  done
+  SNAPSHOT_KEYS[$n]="$1"
+  SNAPSHOT_VALS[$n]="$2"
+}
+
+# Every recorded key, one per line, in insertion order; callers sort.
+snapshot_names() {
+  local i n="${#SNAPSHOT_KEYS[@]}"
+  for (( i = 0; i < n; i++ )); do printf '%s\n' "${SNAPSHOT_KEYS[$i]}"; done
+}
+
 snapshot_take() {
   local row base d rc bases=()
   for row in "${REGISTRY[@]}"; do
@@ -289,7 +333,7 @@ snapshot_take() {
     d="$(sha256_of "$here/$base")"
     rc=$?
     case "$rc" in
-      0) SNAPSHOT["$base"]="$d" ;;
+      0) snapshot_put "$base" "$d" ;;
       2) echo "FATAL: sha256sum answered about a DIFFERENT file than $base. The line"
          echo "  it printed does not name $here/$base, so whatever it hashed, the"
          echo "  receipt cannot be bound to the file this runner is about to execute."
@@ -306,10 +350,11 @@ snapshot_take() {
 }
 
 snapshot_print() {
-  local base
+  local base was
   echo "harness revisions this receipt covers (sha256, first 16):"
-  for base in $(printf '%s\n' "${!SNAPSHOT[@]}" | sort); do
-    printf '  %-40s %s\n' "$base" "${SNAPSHOT[$base]:0:16}"
+  for base in $(snapshot_names | sort); do
+    was="$(snapshot_get "$base")" || was=""
+    printf '  %-40s %s\n' "$base" "${was:0:16}"
   done
 }
 
@@ -494,10 +539,11 @@ crlf_position_is_earned() {
 # edited mid-sweep", and printing the other under that headline would be a
 # misdiagnosis pointing the next reader at an editor rather than at their PATH.
 snapshot_drift() {
-  local base now rc moved=0
-  for base in $(printf '%s\n' "${!SNAPSHOT[@]}" | sort); do
+  local base now was rc moved=0
+  for base in $(snapshot_names | sort); do
     now="$(sha256_of "$here/$base")"
     rc=$?
+    was="$(snapshot_get "$base")" || was=""
     if (( rc == 2 )); then
       echo "  $base -- COULD NOT MEASURE: sha256sum printed a well-formed digest line"
       echo "      naming a DIFFERENT file, so this is an answer about something else."
@@ -509,8 +555,8 @@ snapshot_drift() {
       echo "      state is unknown. Not a match and not a mismatch; the receipt cannot"
       echo "      cover it either way."
       moved=$((moved + 1))
-    elif [ "$now" != "${SNAPSHOT[$base]}" ]; then
-      echo "  $base -- MOVED: ${SNAPSHOT[$base]:0:16} at the start, ${now:0:16} now"
+    elif [ "$now" != "$was" ]; then
+      echo "  $base -- MOVED: ${was:0:16} at the start, ${now:0:16} now"
       moved=$((moved + 1))
     fi
   done
@@ -727,12 +773,12 @@ drift_lines=""
 if hasher_answers_a_known_question; then
   drift_lines="$(snapshot_drift)" || drifted=$?
 else
-  drift_lines="$(for base in $(printf '%s\n' "${!SNAPSHOT[@]}" | sort); do
+  drift_lines="$(for base in $(snapshot_names | sort); do
       echo "  $base -- COULD NOT MEASURE: the hasher stopped reproducing a known"
       echo "      SHA-256 (see above), so this file's end state is unknown. Not a"
       echo "      match and not a mismatch."
     done)"
-  drifted=${#SNAPSHOT[@]}
+  drifted=${#SNAPSHOT_KEYS[@]}
 fi
 if (( drifted )); then
   echo
