@@ -8,8 +8,9 @@ green** — so the assertion it guards is measured rather than assumed.
 They live in the tracked tree on purpose: a control nobody else can run is a
 claim, not a control.
 
-There are **ten executable harnesses** and one runner. Run them through
-`run-all.sh`; ten hand-typed command lines produce ten results and no aggregate.
+There are **eleven executable harnesses** and one runner. Run them through
+`run-all.sh`; eleven hand-typed command lines produce eleven results and no
+aggregate.
 
 | Harness | Defends | Subject |
 | --- | --- | --- |
@@ -21,13 +22,14 @@ There are **ten executable harnesses** and one runner. Run them through
 | `port-precheck-controls.sh` | itself | `scripts/first-run/port-precheck.sh` — the shared-port measurement and the ledger row that carries its verdict. It supplies the cases as well as the controls, because the script had none |
 | `dev-runtime-scan-controls.sh` | itself | `scripts/dev-runtime.sh`'s `reap_staged_daemon` — the `ps -W` scan that decides what to kill, and the WINPID and image path it hands the kill helper. Also case-less before this; the function is extracted by brace matching because the script dispatches on `$1` and cannot be sourced. The parse itself now lives in `scripts/lib/host-process.sh`, so the mutations target a written copy of the library and one targets the call that reaches it |
 | `dev-runtime-record-controls.sh` | itself | `scripts/dev-runtime.sh`'s `read_owned_pid`, `list_dir_tristate` and `listing_has_name` — the three answers (`0` recorded / `1` nothing recorded / `2` recorded but unreadable) that `stop_runtime` and `start_runtime` branch on before anything is deleted or started, and the `ls`/`grep`/`sed` chain each of those answers is assembled from |
+| `dev-runtime-lock-race-controls.sh` | itself | `scripts/dev-runtime.sh`'s `acquire_runtime_lock` — the stale-lock break, driven as two REAL runs of the whole shipped file against one state directory. The ABA it defends has two windows: the owner re-read closes the one before it, and the ATOMIC RENAME closes the one after it, which no re-read can. Each shipped arm is read against the revert that defends its own window; `DEV_RUNTIME_RACE_SLEEP` and `DEV_RUNTIME_RACE_SLEEP_BREAK` (0 in every real run) widen one window each, so the interleaving is arranged rather than sampled |
 | `dev-runtime-stage-controls.sh` | itself | `scripts/dev-runtime.sh`'s `stage_windows_daemon` — the daemon and DLL copies that decide, by CONTENT and not by mtime, what the recorded server path points at, the re-read that proves what landed, the tri-state listing of the directory they come from, and the call site in `start_runtime` that reaches all of it. Extracted by brace matching for the same reason as the two above |
 | `windows-probes-negative-controls.py` | itself | `scripts/first-run/windows-zip.ps1` and `scripts/first-run/windows-nsis.ps1` — the port, health and process-liveness probes, and the `Check` blocks that branch on them. Case-less before this; the probes are *extracted* rather than run, because neither channel script can be executed on a developer machine (each deletes `%LOCALAPPDATA%\wenlan`, the real memorydb and config) |
 
 ## Running them
 
 ```bash
-bash scripts/negative-controls/run-all.sh          # all ten, one receipt
+bash scripts/negative-controls/run-all.sh          # all eleven, one receipt
 bash scripts/negative-controls/run-all.sh --list
 bash scripts/negative-controls/run-all.sh --only replica,inventory
 ```
@@ -44,6 +46,7 @@ bash    scripts/negative-controls/port-precheck-controls.sh
 bash    scripts/negative-controls/dev-runtime-scan-controls.sh
 bash    scripts/negative-controls/dev-runtime-record-controls.sh
 bash    scripts/negative-controls/dev-runtime-stage-controls.sh
+bash    scripts/negative-controls/dev-runtime-lock-race-controls.sh
 python3 scripts/negative-controls/windows-probes-negative-controls.py
 ```
 
@@ -136,18 +139,18 @@ the suite.
 
 The runner's registry is checked against the directory before anything runs: a
 `.sh` or `.py` file here that is not registered is a `REGISTRY GAP` and the
-sweep refuses — otherwise an eleventh harness is simply never run, under a clean
-report of the ten that were.
+sweep refuses — otherwise a twelfth harness is simply never run, under a clean
+report of the eleven that were.
 
-**What a clean sweep does not mean.** It is a statement about ten harnesses,
+**What a clean sweep does not mean.** It is a statement about eleven harnesses,
 not about the repository. Every harness here reverts a *named* property; a
 defect nobody thought of has no control and is not measured by one.
 
-**Seven of the ten defend *themselves*** — count the `itself` rows in the
+**Eight of the eleven defend *themselves*** — count the `itself` rows in the
 `Defends` column: `a-drift-guard-inventory.py`, `a-drift-guard-replica.py`,
 `port-precheck-controls.sh`, `dev-runtime-scan-controls.sh`,
-`dev-runtime-record-controls.sh`, `dev-runtime-stage-controls.sh` and
-`windows-probes-negative-controls.py`. They supply the cases as well as the
+`dev-runtime-record-controls.sh`, `dev-runtime-lock-race-controls.sh`,
+`dev-runtime-stage-controls.sh` and `windows-probes-negative-controls.py`. They supply the cases as well as the
 controls, because the subject had no suite at all, so what they establish is
 that their own extracted cases would notice the reversion, not that any CI lane
 would. Only three point at a suite that exists independently of the harness —
@@ -156,12 +159,13 @@ written for the subject, not extracted by the control that grades it:
 `lib-ps1-negative-controls.sh` at `first-run/lib.test.ps1`, and
 `authenticode-step-receipt.py` at `scripts/release-workflow-contract.test.py`.
 That ratio is the single most important thing on this page, which is why it is
-a number here and not the word "several" — seven tenths of this suite is a
+a number here and not the word "several" — eight elevenths of this suite is a
 closed loop marking its own homework.
 
-And none of this runs in CI: no PR lane
-on this repo runs on Windows, so all ten are a pre-merge step by hand for
-anyone touching the files in the table above.
+And none of this runs in CI: no PR lane runs
+these negative-control harnesses, `lib.test.ps1` or the first-run channels, so
+all eleven are a pre-merge step by hand for anyone touching the files in the
+table above.
 
 ### What the Authenticode receipt does and does not measure
 
