@@ -38487,11 +38487,12 @@ async fn test_global_prelude_summary_rows_respect_space_filter() {
 
 // ── T12: FTS recall hardening integration tests ──────────────────────────
 
-/// Regression guard: with hardening OFF (default), the behavior of
+/// Regression guard: with hardening explicitly OFF, the behavior of
 /// `search_memory` must be byte-identical to pre-T12 — a clean query
-/// ("rust programming") still surfaces the seeded memory.
+/// ("rust programming") still surfaces the seeded memory. Hardening is
+/// default ON since T14, so the unset case is exercised as the "on" arm here.
 #[tokio::test]
-async fn fts_hardening_off_preserves_exact_current_behavior() {
+async fn fts_hardening_default_on_preserves_exact_current_behavior() {
     let (db, _tmp) = test_db().await;
     db.upsert_documents(vec![make_memory_doc(
         "m_rust_prog",
@@ -38503,7 +38504,7 @@ async fn fts_hardening_off_preserves_exact_current_behavior() {
     .await
     .unwrap();
 
-    // Unset flag → legacy path
+    // Unset flag → default ON path
     let results =
         temp_env::async_with_vars([("WENLAN_ENABLE_FTS_HARDENING", None::<&str>)], async {
             db.search_memory(
@@ -38522,17 +38523,17 @@ async fn fts_hardening_off_preserves_exact_current_behavior() {
         .await;
     assert!(
         !results.is_empty(),
-        "flag-OFF: search_memory must return results for clean query"
+        "flag-unset (default ON): search_memory must return results for clean query"
     );
     assert!(
         results.iter().any(|r| r.content.contains("rust")),
-        "flag-OFF: seeded rust memory must appear; got {:?}",
+        "flag-unset (default ON): seeded rust memory must appear; got {:?}",
         results.iter().map(|r| &r.content).collect::<Vec<_>>()
     );
 
-    // Flag ON must also surface the same hit (no regression)
-    let results_on =
-        temp_env::async_with_vars([("WENLAN_ENABLE_FTS_HARDENING", Some("1"))], async {
+    // Flag explicitly OFF must also surface the same hit (legacy path preserved)
+    let results_off =
+        temp_env::async_with_vars([("WENLAN_ENABLE_FTS_HARDENING", Some("0"))], async {
             db.search_memory(
                 "rust programming",
                 10,
@@ -38548,9 +38549,9 @@ async fn fts_hardening_off_preserves_exact_current_behavior() {
         })
         .await;
     assert!(
-        results_on.iter().any(|r| r.content.contains("rust")),
-        "flag-ON: clean query must still surface the seeded memory (silent-zero guard); got {:?}",
-        results_on.iter().map(|r| &r.content).collect::<Vec<_>>()
+        results_off.iter().any(|r| r.content.contains("rust")),
+        "flag-OFF: clean query must still surface the seeded memory; got {:?}",
+        results_off.iter().map(|r| &r.content).collect::<Vec<_>>()
     );
 }
 
@@ -38576,7 +38577,7 @@ async fn fts_hardening_on_handles_special_char_query_without_error() {
 
     // Flag OFF: FTS branch errors, returns Ok but FTS may contribute 0 rows
     let _results_off =
-        temp_env::async_with_vars([("WENLAN_ENABLE_FTS_HARDENING", None::<&str>)], async {
+        temp_env::async_with_vars([("WENLAN_ENABLE_FTS_HARDENING", Some("0"))], async {
             db.search_memory(query, 10, None, &ReadScope::Global, None, None, None, None)
                 .await
                 .unwrap() // must not panic/error regardless

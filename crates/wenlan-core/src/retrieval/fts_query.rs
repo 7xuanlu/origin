@@ -40,14 +40,20 @@ pub fn stopwords() -> &'static HashSet<&'static str> {
     &STOPWORDS
 }
 
-/// Returns `true` iff `WENLAN_ENABLE_FTS_HARDENING` is set to a truthy value
-/// (`"1"`, `"true"`, or `"yes"`, case-insensitive). Any other value or unset
-/// leaves hardening disabled (byte-identical to pre-T12 behavior).
+/// True unless `WENLAN_ENABLE_FTS_HARDENING` is a falsy token (`0`, `false`,
+/// `no`, `off`, case-insensitive). OPT-OUT, default ON.
+///
+/// When OFF, callers fall back to the raw, unsanitized query (pre-T12
+/// behavior), which lets an FTS5 syntax error (e.g. a hyphenated token or a
+/// bare date like `2026-12-15`) silently zero the FTS channel.
 pub fn fts_recall_hardening_enabled() -> bool {
-    std::env::var("WENLAN_ENABLE_FTS_HARDENING")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    match std::env::var("WENLAN_ENABLE_FTS_HARDENING") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
 }
 
 /// Sanitize a raw user query for safe use in an FTS5 `MATCH` expression.
@@ -331,9 +337,9 @@ mod tests {
     // ── fts_recall_hardening_enabled ────────────────────────────────────────
 
     #[test]
-    fn hardening_enabled_truthy_values() {
-        for val in ["1", "true", "yes", "TRUE", "YES", "True"] {
-            temp_env::with_var("WENLAN_ENABLE_FTS_HARDENING", Some(val), || {
+    fn hardening_enabled_by_default_and_for_truthy_values() {
+        for val in [None, Some("1"), Some("true"), Some("yes"), Some("garbage")] {
+            temp_env::with_var("WENLAN_ENABLE_FTS_HARDENING", val, || {
                 assert!(
                     fts_recall_hardening_enabled(),
                     "Expected enabled for value={val:?}"
@@ -343,14 +349,36 @@ mod tests {
     }
 
     #[test]
-    fn hardening_disabled_for_falsy_and_unset() {
-        for val in [Some("0"), Some("false"), Some("garbage"), None] {
-            temp_env::with_var("WENLAN_ENABLE_FTS_HARDENING", val, || {
+    fn hardening_disabled_for_falsy_values() {
+        for val in ["0", "false", "no", "off", "FALSE", "OFF"] {
+            temp_env::with_var("WENLAN_ENABLE_FTS_HARDENING", Some(val), || {
                 assert!(
                     !fts_recall_hardening_enabled(),
                     "Expected disabled for value={val:?}"
                 );
             });
         }
+    }
+
+    #[test]
+    fn hardening_unset_sanitizes_hyphenated_query() {
+        // Unset -> ON by default -> callers should sanitize a hyphenated token
+        // instead of passing it raw to FTS5 (the soak-test regression).
+        temp_env::with_var("WENLAN_ENABLE_FTS_HARDENING", None::<&str>, || {
+            assert!(fts_recall_hardening_enabled());
+            let out = sanitize_fts_query("2026-12-15");
+            assert_eq!(
+                out, "\"2026-12-15\"",
+                "hyphenated date token must be quoted when hardening is on; got: {out}"
+            );
+        });
+    }
+
+    #[test]
+    fn hardening_disabled_returns_raw_query() {
+        // Explicit opt-out -> caller uses the raw, unsanitized query.
+        temp_env::with_var("WENLAN_ENABLE_FTS_HARDENING", Some("0"), || {
+            assert!(!fts_recall_hardening_enabled());
+        });
     }
 }
