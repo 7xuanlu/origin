@@ -134,7 +134,8 @@ fn format_brief(response: &BriefReadResponse) -> String {
             "No Space resolved. Use --space or configure a project mapping.\n".into()
         }
         BriefReadState::BriefNotCreated => format!(
-            "No Brief exists for Space '{}'. The first handoff will create it.\n",
+            "No Brief exists for Space '{}'. Run `wenlan brief update --file <json>` \
+             (or the /handoff plugin command) to create it.\n",
             response.space.as_deref().unwrap_or("unknown")
         ),
         BriefReadState::Ready => response
@@ -263,5 +264,22 @@ mod tests {
         assert!(output.contains("Related Context: release"));
         assert!(!output.contains("secret-space-id"));
         assert!(!output.contains("secret-item-id"));
+    }
+
+    #[test]
+    fn no_brief_hint_names_a_command_the_cli_actually_has() {
+        let response = BriefReadResponse {
+            state: BriefReadState::BriefNotCreated,
+            space: Some("work".into()),
+            brief: None,
+            related_context: None,
+        };
+
+        let output = format_brief(&response);
+
+        // The CLI has no `handoff` subcommand; the hint must point at
+        // something a CLI user can actually run.
+        assert!(!output.contains("The first handoff"));
+        assert!(output.contains("wenlan brief update"));
     }
 }
