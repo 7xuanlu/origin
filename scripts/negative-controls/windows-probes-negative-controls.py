@@ -1,142 +1,96 @@
 #!/usr/bin/env python3
 """Behaviour cases and negative controls for the Windows first-run gauntlet probes.
 
-Three probes in the two Windows channels turned a FAILED measurement into a
-NEGATIVE one, which is this repository's recurring defect:
-
-  1. scripts/first-run/windows-zip.ps1, `port-7878-closed`
-        Get-NetTCPConnection -LocalPort 7878 -State Listen -ErrorAction SilentlyContinue
-     A TCP provider that failed returned an empty array, and an empty array is
-     what a genuinely closed port returns. The gauntlet's last act -- certifying
-     that it left no daemon on the developer's shared production port -- passed
-     by failing to look. This is the same cmdlet and the same flag that
-     scripts/first-run/port-precheck.sh was written to remove from the START of
-     a run, quoted in that script's own header, reintroduced at the END of it.
-
-  2. scripts/first-run/windows-zip.ps1, `Test-HealthReachable`
-        catch { return ($null -ne $_.Exception.Response) }
-     Every exception with no Response mapped to $false -- a DNS failure, a TLS
-     failure, a timeout, a malformed URI -- and $false was also what a refused
-     connection returned. `health-unreachable-after-off` PASSED when the HTTP
-     probe itself broke: a broken probe certifying a clean shutdown.
-
-  3. scripts/first-run/windows-nsis.ps1, `app-exited-after-kill` and
-     `sidecar-exits-after-app`
-        Get-Process ... -ErrorAction SilentlyContinue
-     A process-table read that FAILED produced what a dead process produces --
-     nothing -- so ONE broken read passed BOTH rows at once. Two rows meant to
-     be independent evidence became the same non-observation twice.
-
-The tri-state remedies for those three were reviewed adversarially, and the
-follow-ups are what most of this file now defends. They are the same defect
-worn differently, and each one leaves a probe that LOOKS tri-state:
-
-  B1. A RESET IS NOT A REFUSAL. The health probe counted ConnectFailure with an
-      inner ConnectionReset as `down`. A reset is what a LIVE peer does -- a
-      proxy, a firewall, an HTTP service falling over mid-response -- so that
-      arm let `health-unreachable-after-off` pass with something still on the
-      port. Measured on the reference host, a TcpListener that accepts and
-      closes with LingerState(true, 0) -- indisputably UP -- produces
-      WebException/ReceiveFailure wrapping IOException wrapping
-      SocketException/ConnectionReset. Only ConnectionRefused is the negative.
-
-  B2. A TRI-STATE THAT DIES AT ITS FIRST CALLER BOUNDARY IS NOT A FIX.
-      `Stop-Daemon` computed all three states, PRINTED the answer, and set
-      $LASTEXITCODE to 0. Three outcomes in, one silent success out. It returns
-      the state now and both call sites record a row.
-
-  B3. A WITNESS THAT DOES NOT CO-VARY WITH WHAT IT RATIFIES IS NOT A WITNESS.
-      `Get-ProcessTableWitness` checked that the table held pid 4 and ten rows
-      -- "is this a process table" -- and that was used to ratify "wenlan-server
-      is not in it". The witness is now told which process it is covering.
-
-  B4. A CONTROL THAT CANNOT FAIL IS NOT A CONTROL. The one untrustworthy
-      process-table fixture here was BOTH too short AND missing pid 4, so
-      neither witness was tested alone. There are now fixtures that isolate
-      each, and one whose table contains the very process the targeted read
-      called absent.
-
-  B5. AND NOTHING PINNED THE TIMEOUT. -TimeoutSec was raised 2 -> 5 because a
-      refused loopback connect takes ~2.05 s on the reference host (Windows
-      retries the SYN). The Invoke-WebRequest stubs ignored TimeoutSec, so
-      reverting the constant left every case green. The slow-refusal stub below
-      OBSERVES it.
-
-ROUND 3 went at the remedies again and found the headline defect one level in:
-A TRI-STATE THAT DIES INSIDE THE CALLEE, BEFORE THE CALLER CAN BRANCH. Six more,
-and they are what the newest cases here defend:
-
-  C1. THE SHIPPING GAUNTLET KILLED PROCESSES IT DID NOT START. `Stop-Daemon` ran
-      `Get-Process -Name wenlan-server | Stop-Process -Force`, which selects
-      EVERY process with that name -- a developer's production daemon, another
-      worktree's, a hand-started one -- and the NSIS teardown did the same for
-      `Wenlan, wenlan-server`. `schtasks /delete /tn WenlanServer /f` then
-      removed a registration this run may never have made. Ownership is
-      measured now, by image path AND by "was it already running", and the
-      scheduled task is only ended and deleted when the name was free before the
-      run started.
-
-  C2. NATIVE STDERR COULD STOP THE TRI-STATE BEING RETURNED AT ALL. Measured on
-      the reference host: `& cmd.exe /c "echo x 1>&2 & exit /b 0" 2>&1 | Out-Null`
-      sets `$?` to False under `Continue` and THROWS
-      System.Management.Automation.RemoteException under `Stop`. `schtasks /end`
-      writes a benign line to stderr when the task is not running, so
-      `Stop-Daemon` could throw on its first statement and never reach `return`.
-      Native calls go through `Invoke-Native` now, which pins the preference in
-      its own dynamic scope, keeps stderr as text and hands the exit code back
-      as data.
-
-  C3. "DAEMON STOPPED" WAS ONLY "THE HEALTH SOCKET REFUSED ONCE". `Stop-Daemon`
-      returned the reachability tri-state, so a failed kill, or a daemon that
-      survived and merely unbound 7878, produced ConnectionRefused and both
-      `daemon-stopped-*` rows PASSED over a live process -- after which cleanup
-      deleted its task, install and data directory. The verdict is the
-      owned-process poll now; reachability is reported beside it and decides
-      nothing.
-
-  C4 and C5. THE WITNESSES QUERIED THE PROVIDER WHOSE FAILURE THEY CLAIMED TO
-      DETECT. `Get-PortTargetedWitness` was Get-NetTCPConnection ratifying
-      Get-NetTCPConnection; `Get-ProcessTableWitness` was Get-Process ratifying
-      Get-Process. Both establish only that two reads of one provider agree.
-      The port witness is `netstat -ano` now (iphlpapi, no CIM, no WMI) and the
-      process witness adds Win32_Process (WMI's winmgmt service). Neither
-      witnesses against the KERNEL, and both say so in the source.
-
-  C6 and C7. A malformed listener row threw OUTSIDE the tri-state handler
-      (`[int]"unknown"` does not return, it throws), and the health-timeout
-      override had a floor but no ceiling, so an inherited
-      GAUNTLET_HEALTH_TIMEOUT_SEC=86400 made the twenty-attempt stop loop
-      effectively non-terminating.
-
-This harness does two things, in the order that matters:
+Two things, in the order that matters:
 
   1. CASES -- drive the shipped probes and the shipped `Check` blocks that call
      them, over stubbed cmdlets, and assert the row each records.
   2. CONTROLS -- revert ONE property of one remedy in a copy of the source,
      re-run the cases, and fail when the case that defends it stays green.
 
+THE SUBJECTS are scripts/first-run/windows-zip.ps1, windows-nsis.ps1 and
+lib.ps1. lib.ps1 is driven exactly like the channels: `Get-HealthReachability`
+does not classify its exception itself but asks lib.ps1, and the CIM witnesses
+and `Get-DirPresence` are defined there once instead of once per channel.
+Unstubbed they would trip the stub-escape guard; unmutatable, the rules inside
+them would have no control defending them anywhere. A control whose subject is
+lib.ps1 still reddens the cases of a CHANNEL, because lib.ps1 has no rows of its
+own, and which channel is DERIVED from the control's own must_fail list.
+
+THE DEFECT EVERY CASE HERE IS ABOUT is a FAILED measurement that reads as a
+NEGATIVE one. The shapes it takes, as rules rather than as history:
+
+  A PROVIDER THAT FAILED IS NOT AN EMPTY TABLE. `-ErrorAction SilentlyContinue`
+      on Get-NetTCPConnection or Get-Process returns, when the provider fails,
+      exactly what a closed port and a dead process return -- so ONE broken read
+      passes two rows meant to be independent evidence.
+  AN EXCEPTION WITH NO Response IS NOT A REFUSAL: a DNS failure, a TLS failure,
+      a timeout and a malformed URI all reach `catch` without one, as a refused
+      connection does.
+  A RESET IS NOT A REFUSAL EITHER, and this one is MEASURED: a TcpListener that
+      accepts and closes with LingerState(true, 0) -- indisputably UP -- produces
+      WebException/ReceiveFailure wrapping IOException wrapping
+      SocketException/ConnectionReset. Only ConnectionRefused is the negative.
+  A TRI-STATE THAT DIES AT A CALLER BOUNDARY IS NOT A FIX: three outcomes in,
+      one printed line and $LASTEXITCODE 0 out. The probe returns its state and
+      every call site records a row.
+  A TRI-STATE THAT DIES INSIDE THE CALLEE IS NOT ONE EITHER, by three routes.
+      NATIVE STDERR, measured on the reference host: `& cmd.exe /c "echo x 1>&2
+      & exit /b 0" 2>&1 | Out-Null` sets `$?` False under `Continue` and THROWS
+      System.Management.Automation.RemoteException under `Stop`, and `schtasks
+      /end` writes a benign stderr line when the task is not running -- so a
+      probe can throw on its first statement and never reach `return`. Hence
+      `Invoke-Native`, which pins the preference in its own dynamic scope, keeps
+      stderr as text and hands the exit code back as data. A BARE CAST:
+      `[int]"unknown"` on a malformed listener row throws rather than returning.
+      AN UNBOUNDED OVERRIDE: a health timeout with a floor but no ceiling lets an
+      inherited GAUNTLET_HEALTH_TIMEOUT_SEC=86400 make the twenty-attempt stop
+      loop effectively non-terminating.
+  A WITNESS THAT DOES NOT CO-VARY WITH WHAT IT RATIFIES IS NOT A WITNESS: "is
+      this a process table" (pid 4 present, ten rows) cannot ratify "wenlan-
+      server is not in it", because the targeted read can throw its absence error
+      while the whole-table read CONTAINS the process.
+  A WITNESS MUST NOT QUERY THE PROVIDER WHOSE FAILURE IT CLAIMS TO DETECT. The
+      port witness is `netstat -ano` (iphlpapi, no CIM, no WMI); the process
+      witness adds Win32_Process (WMI's winmgmt service). Neither witnesses
+      against the KERNEL, and both say so in the source.
+  A CONTROL THAT CANNOT FAIL IS NOT A CONTROL: a process-table fixture that is
+      BOTH too short AND missing pid 4 tests neither witness alone.
+  A CONSTANT A NEGATIVE DEPENDS ON IS A MEASUREMENT, AND SOMETHING MUST OBSERVE
+      IT. -TimeoutSec is 5 rather than 2 because a refused loopback connect takes
+      ~2.05 s on the reference host (Windows retries the SYN), so `-TimeoutSec 2`
+      turns every genuine refusal into a Timeout and the negative becomes
+      unreachable in principle. The slow-refusal stub below observes the
+      constant; a stub that ignores TimeoutSec leaves it unpinned.
+  OWNERSHIP IS MEASURED, NEVER ASSUMED. `Get-Process -Name wenlan-server |
+      Stop-Process -Force` selects EVERY process with that name, and `schtasks
+      /delete /tn WenlanServer /f` removes a registration this run may never have
+      made. Ownership is by image path AND by "was it already running", and the
+      task is ended and deleted only when the name was free before the run
+      started. Likewise "the daemon stopped" is the owned-process poll, not one
+      ConnectionRefused: a failed kill, or a survivor that merely unbound 7878,
+      refuses too.
+
 WHY THE SUBJECT IS EXTRACTED RATHER THAN RUN. Neither channel script can be
 executed here at any cost: each calls `Remove-Item -Recurse -Force` on
-%LOCALAPPDATA%\\wenlan, which on a developer machine is the real memorydb,
-config and logs. So the probe functions and the `Check` blocks that call them
-are extracted from the shipped source by brace matching and evaluated in
-isolation -- the same reason and the same technique as
-`dev-runtime-scan-controls.sh`, which extracts `reap_staged_daemon` because
-`dev-runtime.sh` dispatches on "$1" and cannot be sourced. Nothing here
+%LOCALAPPDATA%\\wenlan, which on a developer machine is the real memorydb, config
+and logs. So the probe functions and the `Check` blocks that call them are
+extracted by brace matching and evaluated in isolation -- the same reason and
+technique as `dev-runtime-scan-controls.sh`, which extracts `reap_staged_daemon`
+because `dev-runtime.sh` dispatches on "$1" and cannot be sourced. Nothing here
 installs, uninstalls, binds a port, kills a process, or writes outside a
 temporary directory.
 
-AND WHAT MAKES THAT A GUARANTEE RATHER THAN A HABIT is the extraction guard,
-which ROUND 6 (Codex Sol) found bypassable in three ways and which is now an
-ALLOW-LIST per invocation construct rather than a list of forbidden names. The
-guard used to recognise a command held in a variable and nothing else, so
-`& ("Remove-" + "Item") -LiteralPath "$env:LOCALAPPDATA\\wenlan" -Recurse -Force`
--- which contains no banned token anywhere -- passed every check in this file,
-as did `[System.IO.Directory]::Delete(...)` and `(Get-Item $p).Delete($true)`.
+WHAT MAKES THAT A GUARANTEE RATHER THAN A HABIT is that the extraction guard is
+an ALLOW-LIST per invocation construct, not a list of forbidden names. A guard
+recognising a command held in a variable and nothing else accepts `& ("Remove-" +
+"Item") -LiteralPath "$env:LOCALAPPDATA\\wenlan" -Recurse -Force` -- which
+contains no banned token anywhere -- and accepts
+`[System.IO.Directory]::Delete(...)` and `(Get-Item $p).Delete($true)` as well.
 The call operator, the `::` static member and the `.X()` instance call are the
-only ways extracted PowerShell can invoke anything, and each is now pinned to
-the set the shipped text actually uses. See the block above CALL_TARGET_ALLOWED
-for what that does and does not cover.
+only ways extracted PowerShell can invoke anything, and each is pinned to the set
+the shipped text actually uses. See the block above CALL_TARGET_ALLOWED for what
+that does and does not cover.
 
 WHAT IS STUBBED, NAMED SO NO READER HAS TO INFER IT:
   Get-NetTCPConnection, Get-Process, Invoke-WebRequest, Get-CimInstance -- the
@@ -145,25 +99,25 @@ WHAT IS STUBBED, NAMED SO NO READER HAS TO INFER IT:
       the shipped `Invoke-Native`.
   Start-Sleep -- a no-op, so the shipped ten-second poll loops are measured for
       their BRANCHES rather than for the wall clock.
-  Stop-OwnedServerProcess and Stop-ProcessByImage -- the shipped KILLERS, and
-      they are a SAFETY REQUIREMENT rather than a convenience. Both end in
-      `[System.Diagnostics.Process]...Kill()`. Unstubbed, a driver that reached
-      one would kill a real process on this machine. They are stubbed as
-      RECORDING no-ops so a case can assert what the shipped code decided to
+  Stop-OwnedServerProcess and Stop-ProcessByImage -- the shipped KILLERS, and a
+      SAFETY REQUIREMENT rather than a convenience: both end in
+      `[System.Diagnostics.Process]...Kill()`, so a driver that reached an
+      unstubbed one would kill a real process on this machine. They are stubbed
+      as RECORDING no-ops so a case can assert what the shipped code decided to
       kill, and `GetProcessById`/`.Kill()` are refused in extracted text so a
       future edit cannot move a real kill into an extracted region.
   Stop-Process -- still stubbed and still in MUST_BE_STUBBED although neither
-      channel calls it any more, so a regression that brings it back cannot
-      reach a real process on its first run.
+      channel calls it any more, so a regression that brings it back cannot reach
+      a real process on its first run.
   Check, Record-Row, Reached and Test-SingleStatementBlock -- lib.ps1's own
-      judging rule, MODELLED rather than summarised, including `-ExpectFail`,
-      the reach witness, the single-pipeline AST fallback, and rc=2 for the
-      third state. ROUND 6 found the previous version declaring `-ExpectFail`
-      and never reading it, so the one shipped row that asserts a REFUSAL was
-      judged by the rule for rows that assert a success. The replica's
-      parameter set and rule anchors are now compared against lib.ps1 on every
-      run (SHIPPED_CHECK_RULES), and its outcomes are driven in real processes
-      and then made to come out wrong (REPLICA_MUTATIONS).
+      judging rule, MODELLED rather than summarised, including `-ExpectFail`, the
+      reach witness, the single-pipeline AST fallback, and rc=2 for the third
+      state. A replica that declares `-ExpectFail` and never reads it judges the
+      one shipped row asserting a REFUSAL by the rule for rows asserting a
+      success, so the replica's parameter set and rule anchors are compared
+      against lib.ps1 on every run (SHIPPED_CHECK_RULES) and its outcomes are
+      driven in real processes and then made to come out wrong
+      (REPLICA_MUTATIONS).
   wenlan.exe -- the product CLI, including the `search` verb the -ExpectFail row
       runs, so a refusal after `background off` can be told from an answer.
 
@@ -171,20 +125,19 @@ THE STUBS ARE CHECKED TO STILL BE THE STUBS, by the guard emitted into every
 driver. Measured on the reference host: auto-importing a module that exports a
 same-named function REPLACES a script-scope stub, so after the first
 `NetTCPIP\\Get-NetTCPConnection` call the name resolves to the real provider and
-the driver silently measures the developer's machine instead of the fixture.
-The TCP stubs therefore capture their one real error BEFORE they define
-themselves, and the guard refuses to run a `Check` block if any stubbed name has
-escaped.
+the driver silently measures the developer's machine instead of the fixture. The
+TCP stubs therefore capture their one real error BEFORE they define themselves,
+and the guard refuses to run a `Check` block if any stubbed name has escaped.
 
 The ABSENCE arms do not fabricate an exception: the stub replays a real one --
 for processes by calling the real cmdlet for a process that genuinely does not
-exist, for ports by re-throwing an ErrorRecord captured from the real provider
--- so the id the fix keys on is PowerShell's, not this file's.
+exist, for ports by re-throwing an ErrorRecord captured from the real provider --
+so the id the fix keys on is PowerShell's, not this file's.
 
-ONE STUB RUNS A REAL NATIVE COMMAND, and it is named here rather than buried:
-`schtasks-native-stderr-under-stop` invokes `cmd.exe /c "echo ... 1>&2"`,
-because a PowerShell FUNCTION cannot produce a NativeCommandError and C2 is
-about nothing else. It echoes; it changes nothing.
+ONE STUB RUNS A REAL NATIVE COMMAND, named here rather than buried:
+`schtasks-native-stderr-under-stop` invokes `cmd.exe /c "echo ... 1>&2"`, because
+a PowerShell FUNCTION cannot produce a NativeCommandError and the native-stderr
+rule above is about nothing else. It echoes; it changes nothing.
 
 WHAT THIS DOES NOT PROVE: that the gauntlet installs, uninstalls, or reaches a
 daemon. No product code runs here at all.
@@ -1686,23 +1639,41 @@ CASE_ENV = {
 # --------------------------------------------------------------------------
 ZIP_FUNCS = ["Invoke-Native", "Get-HealthTimeoutSec", "Get-HealthReachability",
              "Get-PortListenerWitness", "Get-PortListenerState",
-             "Get-CimProcessWitness", "Get-CimProcessSet",
              "Get-ServerProcessInventory", "Get-OwnedServerProcesses",
-             "Get-ScheduledTaskWitness", "Get-TaskPresence", "Get-DirPresence",
+             "Get-ScheduledTaskWitness", "Get-TaskPresence",
              "Stop-Daemon"]
-NSIS_FUNCS = ["Get-CimProcessWitness", "Get-CimProcessSet",
-              "Get-ProcessTableWitness", "Get-ProcessLiveness",
-              "Get-OwnedProcessesByImage", "Get-DirPresence"]
-# lib.ps1 is a THIRD subject, and it has to be: `Get-HealthReachability` no
-# longer classifies the exception itself, it asks these three. Extracted and
-# driven exactly like the channel functions -- unstubbed, they would trip the
-# stub-escape guard, and unmutatable, the reset/refusal discrimination would
-# have no control defending it anywhere.
+NSIS_FUNCS = ["Get-ProcessTableWitness", "Get-ProcessLiveness",
+              "Get-OwnedProcessesByImage"]
+# lib.ps1 is a THIRD subject, and it has to be. `Get-HealthReachability` no
+# longer classifies the exception itself, it asks the three classifiers; and
+# the CIM witnesses and `Get-DirPresence` are defined there once instead of
+# once per channel, so this is where they are extracted from now. Driven
+# exactly like the channel functions -- unstubbed, they would trip the
+# stub-escape guard, and unmutatable, the reset/refusal discrimination and the
+# witness co-variance rule would have no control defending them anywhere.
 LIB_FUNCS = ["Get-WebExceptionShape", "Test-ConnectionRefused",
-             "Test-HttpErrorResponse"]
-# A control whose SUBJECT is lib.ps1 still reddens cases of a channel, because
-# lib.ps1 has no rows of its own.
-CONTROL_CASE_CHANNEL = {"lib": "zip"}
+             "Test-HttpErrorResponse", "Get-CimProcessWitness",
+             "Get-CimProcessSet", "Get-DirPresence"]
+# WHICH CHANNEL'S CASES A CONTROL RE-RUNS. A control whose subject is a
+# channel runs that channel's cases. lib.ps1 has no rows of its own, so a
+# control on it runs the channels ITS OWN must_fail cases live in -- DERIVED,
+# not listed. A hard-coded {"lib": "zip"} was right while every lib control
+# was a health classifier; the moment a shared helper moved into lib.ps1 and a
+# control on it named nsis cases, that mapping sent the control at the wrong
+# channel and every one of its required red outcomes would have been reported
+# as "survived" -- a control failure describing a defect that is not there.
+def control_case_channels(subject, must_fail):
+    """The set of channels whose cases this control re-runs."""
+    if subject != "lib":
+        return {subject}
+    # Read off CASES itself -- defined below this point, so it is looked up
+    # at call time rather than at import time.
+    channel_of = {c[0]: c[1] for c in CASES}
+    # An empty or wholly unknown must_fail runs EVERYTHING rather than
+    # nothing: a control that reddens no case must be REPORTED, and a filter
+    # that selected no cases at all would report nothing.
+    return ({channel_of[m] for m in must_fail if m in channel_of}
+            or set(channel_of.values()))
 
 CASES = [
     # --- finding 1: the port probe -------------------------------------
@@ -2691,10 +2662,9 @@ CONTROLS = [
       "sidecar-absent-but-wmi-has-it"]),
 
     ("nc-cim-witness-not-covariant",
-     "C5's co-variance: the independent read stops being asked about the "
-     "process whose absence it ratifies, so it is back to answering 'is this a "
-     "process table'",
-     "nsis",
+     "the independent read stops being asked about the process whose absence "
+     "it ratifies, so it is back to answering 'is this a process table'",
+     "lib",
      """    if ($present.Count -ne 0) {
         return [pscustomobject]@{ Ok = $false
             Detail = ("Get-Process reported no $what, but WMI's Win32_Process table of $($all.Count) rows CONTAINS it (pid " +
@@ -2703,17 +2673,17 @@ CONTROLS = [
      """    if ($false) {
         return [pscustomobject]@{ Ok = $false; Detail = "INJECTED" }
     }""",
-     # ROUND 5: the teardown sweep's absence rests on this same co-variance
-     # rule -- it refuses to believe Get-Process's "no wenlan-server" when the
-     # independent Win32_Process table names one. Deleting the rule reddens it
-     # correctly, so it is part of this control's roster, not an unpinned case.
+     # The teardown sweep's absence rests on this same co-variance rule -- it
+     # refuses to believe Get-Process's "no wenlan-server" when the independent
+     # Win32_Process table names one -- so it belongs on this control's roster
+     # rather than being an unpinned case.
      ["app-absent-but-wmi-has-it", "sidecar-absent-but-wmi-has-it",
       "nsis-sweep-absence-not-ratified"]),
 
     ("nc-cim-witness-shape-not-checked",
-     "C5: the independent table stops being checked for completeness, so a "
+     "the independent table stops being checked for completeness, so a "
      "believable fragment ratifies the absence it was never asked about",
-     "nsis",
+     "lib",
      """    if (-not @($all | Where-Object { $_.ProcessId -eq 4 }).Count) {
         return [pscustomobject]@{ Ok = $false
             Detail = "the Win32_Process table has $($all.Count) rows but no ProcessId 4 (System); it is not the whole table" }
@@ -3746,7 +3716,8 @@ def self_check_can_fail(work, zip_src, lib_src):
 # verifier rather than in the thing verified.
 def crlf_offenders(pairs=None):
     out = []
-    for label, path in (pairs or (("windows-zip.ps1", ZIP), ("windows-nsis.ps1", NSIS))):
+    for label, path in (pairs or (("windows-zip.ps1", ZIP), ("windows-nsis.ps1", NSIS),
+                                  ("lib.ps1", LIB))):
         raw = path.read_bytes()
         n = raw.count(b"\r\n")
         if n:
@@ -4058,7 +4029,7 @@ def self_check(zip_src, lib_src):
     """
     print("self-check: this harness's own guards, made to fire")
     bad = 0
-    shipped_funcs = set(ZIP_FUNCS) | set(NSIS_FUNCS)
+    shipped_funcs = set(ZIP_FUNCS) | set(NSIS_FUNCS) | set(LIB_FUNCS)
     for label, text in MUST_REFUSE_INERT:
         try:
             assert_extract_is_inert(text, "self-check")
@@ -4391,7 +4362,9 @@ def run_all(work, texts, subject_filter=None, label=None):
     supposed to be looking for it. Three buckets out, three branches in every
     caller.
     """
-    todo = [c for c in CASES if not subject_filter or c[1] == subject_filter]
+    # A SET of channels, not one: a control on lib.ps1 can name cases in more
+    # than one channel, because lib.ps1 is shared by all of them.
+    todo = [c for c in CASES if not subject_filter or c[1] in subject_filter]
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         results = list(pool.map(lambda c: run_case(work, texts, c, label), todo))
     buckets = {"pass": [], "fail": [], "unmeasured": []}
@@ -4551,11 +4524,20 @@ def main():
     LOGS.mkdir(parents=True, exist_ok=True)
     zip_bytes_before = ZIP.read_bytes()
     nsis_bytes_before = NSIS.read_bytes()
+    # lib.ps1 too, now that the shared helpers and the ownership acts are
+    # there: it is extracted from and mutated exactly as the channels are, so
+    # an edit landing mid-run would have the first controls scoring one
+    # lib.ps1 and the rest scoring another.
+    try:
+        lib_bytes_before = LIB.read_bytes()
+    except OSError:
+        lib_bytes_before = None
     zip_before = ZIP.read_text(encoding="utf-8")
     nsis_before = NSIS.read_text(encoding="utf-8")
     # lib.ps1 is a driven subject: `Check`'s shipped contract is compared
-    # against the replica in PREAMBLE, AND the three web-exception classifiers
-    # the channels delegate to are extracted from it and mutated by controls.
+    # against the replica in PREAMBLE, AND the web-exception classifiers, the
+    # CIM witnesses and Get-DirPresence -- everything more than one channel
+    # uses -- are extracted from it and mutated by controls.
     try:
         lib_before = LIB.read_text(encoding="utf-8")
     except OSError as e:
@@ -4583,7 +4565,8 @@ def main():
                   "is now whole-file churn" % (label, n, total))
             hard += 1
         print("pre-check: anchors and extractions against the shipped source")
-        for label, text in (("windows-zip.ps1", zip_before), ("windows-nsis.ps1", nsis_before)):
+        for label, text in (("windows-zip.ps1", zip_before), ("windows-nsis.ps1", nsis_before),
+                            ("lib.ps1", lib_before)):
             for pattern, why, ns in source_ban_hits(text):
                 print("  BANNED %s matches %r at %s -- %s"
                       % (label, pattern, ", ".join("%s:%d" % (label, n) for n in ns), why))
@@ -4775,7 +4758,7 @@ def main():
             mtexts[subject] = mutated
             mpassed, mfailed, munmeasured = run_all(
                 work, mtexts,
-                subject_filter=CONTROL_CASE_CHANNEL.get(subject, subject),
+                subject_filter=control_case_channels(subject, must_fail),
                 label=name)
             (LOGS / ("%s.log" % name)).write_text(
                 "passed: %s\nfailed: %s\nunmeasured: %s\n"
@@ -4804,6 +4787,9 @@ def main():
         return 1
     if NSIS.read_bytes() != nsis_bytes_before:
         print("FATAL: scripts/first-run/windows-nsis.ps1 changed during the run")
+        return 1
+    if lib_bytes_before is not None and LIB.read_bytes() != lib_bytes_before:
+        print("FATAL: scripts/first-run/lib.ps1 changed during the run")
         return 1
 
     # SAY WHAT THE NUMBERS ARE. Round-4 review corrected a claim of "89
