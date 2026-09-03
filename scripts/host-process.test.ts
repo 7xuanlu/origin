@@ -613,6 +613,56 @@ describe("host-process.sh: listener_pid_for_port is tri-state", () => {
     expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
   });
 
+  // THE REVIEWER'S FIXTURE, verbatim. The rule above was a BUDGET — "at most
+  // two non-blank lines before the first row" — and the budget exists because
+  // the banner and the header are localised and cannot be matched by text. Two
+  // non-blank lines is therefore also `WARNING: …` sitting directly on top of
+  // the header, which fits exactly, and this branch reported the port MEASURED
+  // CLOSED off a table netstat had complained about. The port asked for is
+  // absent from the rows that ARE there, so "rc=1" is what the defect produces.
+  //
+  // The remedy is a SHAPE: netstat prints blank, banner, blank, header, rows,
+  // so the banner must be separated from the header by a blank line. Here it is
+  // not, and there is no blank line anywhere.
+  it("refuses a warning that fills the preamble budget in place of the banner", () => {
+    const result = runDriver(["listener", "17931"], {
+      shims: [
+        shim(
+          "netstat",
+          emitLines([
+            "WARNING: provider returned partial results",
+            "Proto Local_Address Foreign_Address State PID",
+            "TCP 0.0.0.0:135 0.0.0.0:0 LISTENING 1576",
+            "UDP 0.0.0.0:5353 *:* 2340",
+          ]),
+        ),
+      ],
+    });
+    expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
+  });
+
+  // The same shape rule from the other side, so "refuse every two-line
+  // preamble" cannot pass the case above: netstat's real preamble IS two
+  // non-blank lines, and it must still measure. `still parses the real table
+  // shape, blank lines and all` covers the found direction; this one covers a
+  // header with no banner over it at all, which is the shorter half of "at most
+  // one other non-blank line".
+  it("still measures a preamble that is a bare header with no banner", () => {
+    const result = runDriver(["listener", "17931"], {
+      shims: [
+        shim(
+          "netstat",
+          emitLines([
+            "  Proto  Local Address          Foreign Address        State           PID",
+            listeningRow(17931, "4242"),
+            udpRow,
+          ]),
+        ),
+      ],
+    });
+    expect(result.stdout.trim(), result.stderr).toBe("rc=0 out=4242");
+  });
+
   // Fail-closed in the other direction too: a contaminated table whose rows DO
   // contain the port is still unmeasurable. Being able to find one answer in a
   // stream the tool complained about is not evidence the rest of it arrived,
@@ -1268,6 +1318,28 @@ describe("host-process.sh: windows_pid_for_job is tri-state", () => {
     expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
   });
 
+  // THE OVERFLOW, which the four spellings above do not reach because it is
+  // ALL DIGITS. `^[0-9]+$` passed it and `(( _rounds > 0 ))` — shell arithmetic,
+  // which WRAPS — evaluated 18446744073709551617 as 1 and passed it too, and so
+  // did the `for` loop, so the helper took ONE snapshot of a table that did not
+  // contain the row and returned the terminal negative "never appeared within
+  // the window" about a window that was never established. A measured negative
+  // out of a failed measurement, reachable from a caller's environment.
+  //
+  // The table is the measured-absent one on purpose: the defect's own answer
+  // here is rc=1, not rc=0, so a validation that is merely restored to
+  // "positive integer" still fails this. Only refusing the SPELLING does.
+  it("reports COULD NOT MEASURE for a poll window that overflows shell arithmetic", () => {
+    const result = runDriver(["jobpid", JOB, SERVER], {
+      shims: [shim("ps", psTable([strangerRow])), cygpath],
+      env: { WENLAN_HOST_PROCESS_POLL_ROUNDS: "18446744073709551617" },
+    });
+    expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
+    // The refusal names the value it refused: a silent 2 tells the caller its
+    // window was rejected but not which of its own knobs did it.
+    expect(result.stderr).toContain("18446744073709551617");
+  });
+
   // The case above with its WINDOW taken away. Moving the round COUNT off `seq`
   // is not enough: a bare `sleep 0.1` whose status nothing reads, invoked from
   // the left of a `||` (which disables errexit through the whole body), lets a
@@ -1605,6 +1677,23 @@ describe("host-process.sh: shape contracts the behaviour above cannot reach", ()
     // stderr must be captured, not discarded: with -t it is the only thing
     // that separates "nothing matched" from "the probe broke".
     expect(body).toContain("2>&1");
+    // …and for NETSTAT it must be captured SEPARATELY. `2>&1` there is not a
+    // stricter reading of the table, it is the loss of the only fact that
+    // says which stream a line arrived on — and the preamble rule below it
+    // cannot make up the difference, because its whole job is to tolerate two
+    // lines it is not allowed to match by text. There is no behavioural case
+    // for this: `2>&1` does not order the two streams, so a fixture cannot
+    // pin WHERE a merged diagnostic lands. The shape is what can be pinned.
+    const codeBody = body
+      .split("\n")
+      .filter((line) => !/^\s*#/.test(line))
+      .join("\n");
+    expect(codeBody, "netstat's stderr is merged into the table again").not.toMatch(
+      /netstat -ano[^\n]*2>&1/,
+    );
+    expect(codeBody, "netstat's stderr is not captured at all").toMatch(
+      /netstat -ano 2>"\$_err_file"/,
+    );
   });
 
   it("lets a POSIX host opt into the Windows branch but never the reverse", () => {

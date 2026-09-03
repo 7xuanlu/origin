@@ -497,6 +497,7 @@ lsof_enumerated_listeners() {
 # indistinguishable from "port free".
 listener_pid_for_port() {
   local table hit out rc
+  local _err_file _err_text _netstat_rc
   # An argument that is not a port is not a question this probe can answer, so
   # it is 2 and never "no row matched". Guarded here rather than in the
   # callers because the smokes, dev-runtime.sh and first-run/port-precheck.sh
@@ -516,7 +517,33 @@ listener_pid_for_port() {
     # netstat is the only listener table Windows offers here. Anchoring the
     # port keeps :17895 from matching :178950 or a foreign address.
     command -v netstat >/dev/null 2>&1 || return 2
-    table="$(netstat -ano 2>&1)" || return 2
+    # stderr is captured SEPARATELY, and ANY of it is a refusal.
+    #
+    # This used to be `2>&1`, on the argument that a merged diagnostic would be
+    # caught by the "every non-blank line must be a row" rule below. It is not,
+    # in the one position that matters: `2>&1` does not order the two streams,
+    # so a warning can land in the PREAMBLE, where the rule's whole job is to
+    # tolerate two lines it cannot match (the localised banner and the localised
+    # column header). A reviewer fed exactly that -- `WARNING: provider returned
+    # partial results` ahead of the header -- and this branch reported the port
+    # MEASURED FREE off a table netstat had complained about. A budget that
+    # exists because two lines are unmatchable cannot also be a filter.
+    #
+    # So the two streams are separated at the source. netstat's diagnostics go
+    # to stderr; anything at all there means this read is not a measurement,
+    # whatever the exit status said. The stdout preamble is then a SHAPE rule
+    # (below) rather than a line budget.
+    _err_file="$(mktemp 2>/dev/null)" || return 2
+    [[ -n "$_err_file" ]] || return 2
+    _netstat_rc=0
+    table="$(netstat -ano 2>"$_err_file")" || _netstat_rc=$?
+    _err_text="$(cat "$_err_file" 2>/dev/null)" || { rm -f "$_err_file" 2>/dev/null; return 2; }
+    # Fail-closed on the cleanup too: an unchecked `rm` aborts this function
+    # under errexit with ITS status, which a caller reads as the measured
+    # negative. 2 is the only safe answer to a step whose result is unknown.
+    rm -f "$_err_file" 2>/dev/null || return 2
+    (( _netstat_rc == 0 )) || return 2
+    [[ -z "$_err_text" ]] || return 2
     # netstat always prints a header; silence means it did not run properly.
     [[ -n "$table" ]] || return 2
     # Non-empty is not the same as parseable. A diagnostic, a localised banner,
@@ -536,21 +563,42 @@ listener_pid_for_port() {
     # LISTENING row lacks it. The shape must exist SOMEWHERE in the table, so a
     # table whose columns have moved is unmeasurable rather than empty.
     #
-    # stderr is merged in above rather than dropped, and EVERY non-empty line
-    # must be accounted for: a status-0 `WARNING: partial results` merged beside
-    # real rows begins with neither `TCP` nor `UDP`, so a rule keyed on those
-    # tokens never looks at it and the branch returns MEASURED FREE off a table
-    # netstat itself complained about.
+    # stderr is captured separately above and any of it already refused, and
+    # EVERY non-empty line of stdout must still be accounted for: a status-0
+    # `WARNING: partial results` printed on STDOUT beside real rows begins with
+    # neither `TCP` nor `UDP`, so a rule keyed on those tokens never looks at it
+    # and the branch returns MEASURED FREE off a table netstat itself
+    # complained about.
     #
     # Four rules, all measured against this host's real `netstat -ano` (183
     # lines: 2 blank, 179 protocol rows, exactly 2 non-row lines):
     #
     #   * AFTER the first protocol row, every non-empty line must be a row.
     #     The real table has zero exceptions.
-    #   * BEFORE it, at most 2 non-blank lines. The real preamble is exactly
-    #     two -- the `Active Connections` banner and the column header -- and
-    #     both are LOCALISED, so they can only be counted, not matched. One
-    #     merged diagnostic makes it three.
+    #   * BEFORE it, the preamble must have netstat's own SHAPE, not merely fit
+    #     inside a budget. `netstat -ano` prints: blank, banner, blank, header,
+    #     rows. So the LAST non-blank line before the first row is the header --
+    #     it is the line whose columns this parse is about -- and at most ONE
+    #     other non-blank line may precede it, the banner, which must be
+    #     SEPARATED FROM THE HEADER BY A BLANK LINE. Both lines are LOCALISED,
+    #     so neither can be matched by text; the blank between them is not.
+    #     A bare count of two was the defect: two non-blank lines is also
+    #     `WARNING: provider returned partial results` immediately followed by
+    #     the header, which fits the budget exactly and which a reviewer used to
+    #     get a busy port reported as measured free. A header with nothing at
+    #     all before it is accepted (one non-blank pre-row line); a preamble
+    #     with NO non-blank line is not, because then no line carries the
+    #     columns and there is nothing to have read them from.
+    #
+    #     THE RESIDUAL OF THIS RULE, stated rather than implied: a stdout
+    #     warning that mimics the banner's exact shape -- one non-blank line,
+    #     followed by a blank line, followed by the header -- is
+    #     indistinguishable from the banner and is admitted. It is not
+    #     detectable from the stream, because the banner itself is a line of
+    #     localised prose in that position. What closed the reviewer's case is
+    #     that a diagnostic has to be *positioned* like a banner to survive, and
+    #     that netstat writes its diagnostics to stderr, which is now refused
+    #     outright.
     #   * At least one UDP row. `netstat -ano` prints the whole TCP table then
     #     the whole UDP table (measured: 198 lines, TCP rows 5..97, UDP rows
     #     98..198, no interleaving, no UDP header), so a UDP row WITNESSES THAT
@@ -562,7 +610,9 @@ listener_pid_for_port() {
     #     section is complete, and a one-host observation of it is not a proof
     #     for every Windows version and locale. `tcp_after_udp` exits 4.
     #
-    # THE COSTS, stated: a netstat whose banner runs to three lines, a host with
+    # THE COSTS, stated: a netstat whose preamble is not blank/banner/blank/
+    # header -- a banner that runs to two lines, or one printed with no blank
+    # line under it -- a host with
     # no listening TCP socket, and a host with no UDP endpoint each answer
     # "could not measure" for every port rather than "free". All three refuse to
     # start a daemon rather than collide with one, and on Windows none is
@@ -582,7 +632,12 @@ listener_pid_for_port() {
     # The four exits are distinct for the reader; the caller turns all of them
     # into 2.
     printf '%s\n' "$table" | awk '
-      /^[[:space:]]*$/ { next }
+      # A blank line is not a preamble line, but WHERE it falls is evidence:
+      # `blank` records that one was seen since the last non-blank pre-row
+      # line, which is how the banner is told from a diagnostic sitting
+      # directly on top of the header. After the first row it is irrelevant --
+      # the real table has blank lines among its rows.
+      /^[[:space:]]*$/ { if (!rows) blank = 1; next }
       ($1 == "TCP" && NF == 5 && $5 ~ /^[0-9]+$/) ||
         ($1 == "UDP" && NF == 4 && $4 ~ /^[0-9]+$/) {
           rows = 1
@@ -595,9 +650,15 @@ listener_pid_for_port() {
           if ($1 == "TCP" && ($3 == "0.0.0.0:0" || $3 == "[::]:0" || $3 == "*:*")) found = 1
           next
         }
-      { if (rows) after = 1; else preamble++ }
+      { if (rows) { after = 1; next }
+        preamble++
+        if (preamble == 2) sep = blank
+        blank = 0
+      }
       END {
-        if (after || preamble > 2) exit 2
+        if (after) exit 2
+        if (preamble < 1 || preamble > 2) exit 2
+        if (preamble == 2 && !sep) exit 2
         if (tcp_after_udp) exit 4
         if (!udp) exit 3
         exit(found ? 0 : 1)
@@ -690,9 +751,11 @@ poll_delay() {
 # The window is 100 rounds of `poll_delay 0.1`, ten seconds. Its one caller that
 # needs a SHORTER one is the suite that has to observe the terminal negative,
 # which otherwise pays ten real seconds plus a hundred `ps` spawns per case, so
-# WENLAN_HOST_PROCESS_POLL_ROUNDS overrides the count. It must parse as a
-# positive integer: anything else is a caller that meant to set a window and did
-# not, and running the shipped 100 in its place would report a measurement about
+# WENLAN_HOST_PROCESS_POLL_ROUNDS overrides the count. It must be spelled as a
+# bounded decimal integer, 1 to 99999, and the check is TEXTUAL because shell
+# arithmetic silently wraps (see the guard itself): anything else is a caller
+# that meant to set a window and did not, and running the shipped 100 -- or
+# whatever the value wrapped to -- in its place would report a measurement about
 # a window nobody chose, so the probe answers COULD NOT MEASURE instead. The
 # default is `${VAR-100}` and not `${VAR:-100}` deliberately -- an EMPTY value is
 # something a caller set, not something it left alone, and it is refused like any
@@ -702,7 +765,27 @@ windows_pid_for_job() {
   local job_pid="$1" program="$2" want row winpid command got rc
   local _attempt _rounds
   _rounds="${WENLAN_HOST_PROCESS_POLL_ROUNDS-100}"
-  [[ "$_rounds" =~ ^[0-9]+$ ]] && (( _rounds > 0 )) || return 2
+  # `^[0-9]+$` with `(( _rounds > 0 ))` was not a validation, because the second
+  # half is SHELL ARITHMETIC and shell arithmetic wraps. Measured:
+  # `WENLAN_HOST_PROCESS_POLL_ROUNDS=18446744073709551617` is all digits, so the
+  # regex passes; `(( _rounds > 0 ))` evaluates it as 1, so the guard passes;
+  # and the `for` loop below evaluates it as 1 too, so the helper takes ONE
+  # snapshot and returns status 1 -- "the row never appeared within the window"
+  # -- about a window that was never established. That is a measured negative
+  # from a failed measurement, spelled with the caller's own knob.
+  #
+  # So the override is checked as TEXT, before any arithmetic touches it, and
+  # the accepted spelling is one no arithmetic can reinterpret: decimal digits
+  # only, no sign, no leading zero (so one value has one spelling), and at most
+  # five digits -- a cap of 99999 rounds, which at 0.1s is nearly three hours
+  # and is far past any window a caller means. Anything else is a caller that
+  # meant to set a window and did not, and the answer is COULD NOT MEASURE with
+  # the offending value named, never a poll of whatever the number wrapped to.
+  if ! [[ "$_rounds" =~ ^[1-9][0-9]{0,4}$ ]]; then
+    printf 'host-process: WENLAN_HOST_PROCESS_POLL_ROUNDS=%s is not a poll window this probe can establish (1-99999, decimal digits only, no sign, no leading zero); refusing to measure\n' \
+      "$_rounds" >&2
+    return 2
+  fi
   want="$(normalize_program_path "$program")" || return 2
   for (( _attempt = 0; _attempt < _rounds; _attempt++ )); do
     # One snapshot yields both fields, so the pid and the image it names cannot
