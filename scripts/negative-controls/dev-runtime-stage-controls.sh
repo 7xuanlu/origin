@@ -622,8 +622,7 @@ control nc-stage-destination-not-measured \
 
 control nc-stage-name-collision-decided-by-walk-order \
   'two sources with one name are staged in sequence, so the last one wins' daemon \
-  '      if [[ -n "${staged_digest[$name]:-}" &&
-        "${staged_digest[$name]}" != "$STAGED_FILE_DIGEST" ]]; then' \
+  '      if (( previous_rc == 0 )) && [[ "$previous" != "$STAGED_FILE_DIGEST" ]]; then' \
   '      # INJECTED: each copy was verified on its own, so the set is fine.
       if false; then' \
   two-sources-disagree-refused
