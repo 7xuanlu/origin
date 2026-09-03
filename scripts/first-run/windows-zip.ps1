@@ -111,7 +111,22 @@ function Invoke-Native {
     $ErrorActionPreference = 'Continue'
     $global:LASTEXITCODE = 0
     try {
-        $out = @(& $File @Arguments 2>&1 | ForEach-Object { "$_" })
+        # `2>&1` is what keeps a native command's stderr out of the caller's
+        # error stream under an inherited `Stop` -- that is C2, and it stays.
+        # What changed is WHEN the two streams stop being distinguishable.
+        # This used to stringify inside the same pipeline (`| ForEach-Object {
+        # "$_" }`), which flattened an ErrorRecord into a line that reads
+        # exactly like a line of stdout. A caller whose rule is "any stderr at
+        # all means this read is not a measurement" then had nothing to read.
+        #
+        # So the capture stays UNFLATTENED and the split is made here: an
+        # ErrorRecord is still an ErrorRecord until something asks for its
+        # text. `Output` is unchanged for every caller that only wants the
+        # combined transcript; `ErrorCount`/`ErrorText` are additive, and
+        # Get-PortListenerWitness refuses on them, because its preamble rule
+        # must tolerate two unmatchable localised lines and therefore cannot
+        # also be the thing that catches a diagnostic sitting among them.
+        $raw = @(& $File @Arguments 2>&1)
     } catch {
         # A missing executable, a bad path: the command did not run at all,
         # which is not the same as running and failing.
@@ -122,7 +137,11 @@ function Invoke-Native {
     # The stale rc must not leak into the next Check block; the returned
     # ExitCode above is the copy that is meant to be read.
     $global:LASTEXITCODE = 0
-    return [pscustomobject]@{ Ran = $true; ExitCode = $rc; Output = ($out -join "`n") }
+    $errs = @($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+    $out = @($raw | ForEach-Object { "$_" })
+    return [pscustomobject]@{ Ran = $true; ExitCode = $rc; Output = ($out -join "`n")
+        ErrorCount = $errs.Count
+        ErrorText = (@($errs | ForEach-Object { "$_" }) -join "`n") }
 }
 # The health probe's client timeout, in seconds, and the floor under it.
 #
@@ -388,12 +407,37 @@ function Get-HealthReachability([string]$Url) {
 # The parse is the one scripts/lib/host-process.sh already argues for, ported:
 #
 #   EVERY non-blank line must BE a row -- TCP with five fields, UDP with four,
-#       a numeric pid last -- except at most two before the first row, which is
-#       netstat's own preamble (the banner and the column header, both
-#       localised, so they can only be counted). A status-0 `WARNING: partial
-#       results` merged beside real rows begins with neither protocol name, so
-#       a parse that only inspected lines already starting TCP/UDP never looked
-#       at it and reported a truncated remainder as a measured negative.
+#       a numeric pid last -- except netstat's own preamble before the first
+#       row (the banner and the column header, both localised, so they can only
+#       be counted). A status-0 `WARNING: partial results` merged beside real
+#       rows begins with neither protocol name, so a parse that only inspected
+#       lines already starting TCP/UDP never looked at it and reported a
+#       truncated remainder as a measured negative.
+#   ANY STDERR IS A REFUSAL, and the two streams are kept apart to make that
+#       readable. Invoke-Native no longer flattens an ErrorRecord into a line
+#       of output, so `$r.ErrorCount` is a fact about which stream a line came
+#       from. This is not a refinement of the rule below, it is what makes the
+#       rule below possible: a preamble that must tolerate two unmatchable
+#       localised lines cannot also be the filter that catches a diagnostic
+#       standing among them.
+#   THE PREAMBLE IS A SHAPE, NOT A BUDGET. `netstat -ano` prints blank, banner,
+#       blank, header, rows. The header is therefore the LAST non-blank line
+#       before the first row -- the line whose columns this parse is about --
+#       and at most ONE other non-blank line may precede it, the banner, which
+#       must be SEPARATED FROM THE HEADER BY A BLANK LINE. A bare count of two
+#       was the defect: `WARNING: provider returned partial results` directly
+#       on top of the header is two non-blank lines too, fits the budget
+#       exactly, and a reviewer used it to get a port reported measured closed.
+#       Neither line can be matched by text; the blank line between them is not
+#       localised. A preamble with no non-blank line at all is also refused --
+#       nothing there carries the columns.
+#       THE RESIDUAL OF THIS RULE, stated: a stdout warning that mimics the
+#       banner's exact shape -- one non-blank line, a blank line, then the
+#       header -- is indistinguishable from the banner and is admitted. In that
+#       position the banner IS a line of localised prose, so nothing in the
+#       stream separates them. What closed the reviewer's case is that a
+#       diagnostic must now be POSITIONED like a banner to survive at all, and
+#       that netstat's diagnostics go to stderr, which is refused outright.
 #   LISTENING IS NOT A KEY. netstat's State column is localised -- German
 #       Windows prints ABHOEREN -- so the structural rule is used instead: a
 #       listening socket is the TCP row with a WILDCARD foreign address, because
@@ -420,20 +464,41 @@ function Get-PortListenerWitness([int]$Port) {
         return [pscustomobject]@{ State = "unmeasurable"; OwningProcess = $null
             Detail = "netstat -ano exited $($r.ExitCode): $($r.Output -replace "`r?`n", ' ')" }
     }
+    # Any stderr at all, whatever the exit status said. A zero exit alongside a
+    # complaint is exactly the shape that made this branch report a port free.
+    if ($r.ErrorCount -ne 0) {
+        return [pscustomobject]@{ State = "unmeasurable"; OwningProcess = $null
+            Detail = "netstat -ano exited 0 but wrote $($r.ErrorCount) line(s) to stderr, so this read is not a measurement: $($r.ErrorText -replace "`r?`n", ' ')" }
+    }
     $listening = 0
     $rows = 0
     $preamble = 0
     $notARow = 0
     $udp = 0
     $tcpAfterUdp = 0
+    # Where a blank line falls is evidence, so it is recorded rather than
+    # skipped: `blankSeen` says a blank line has arrived since the last
+    # non-blank pre-row line, and `preambleSep` freezes that answer for the
+    # gap between the banner and the header. After the first row it is
+    # irrelevant -- the real table has blank lines among its rows.
+    $blankSeen = 0
+    $preambleSep = 0
     $hits = New-Object System.Collections.Generic.List[string]
     foreach ($line in @($r.Output -split "`r?`n")) {
         $f = @(($line -split '\s+') | Where-Object { $_ })
-        if ($f.Count -eq 0) { continue }
+        if ($f.Count -eq 0) {
+            if ($rows -eq 0) { $blankSeen = 1 }
+            continue
+        }
         $wellFormed = (($f[0] -eq "TCP" -and $f.Count -eq 5 -and $f[4] -match '^\d+$') -or
                        ($f[0] -eq "UDP" -and $f.Count -eq 4 -and $f[3] -match '^\d+$'))
         if (-not $wellFormed) {
-            if ($rows -ne 0) { $notARow++ } else { $preamble++ }
+            if ($rows -ne 0) { $notARow++ }
+            else {
+                $preamble++
+                if ($preamble -eq 2) { $preambleSep = $blankSeen }
+                $blankSeen = 0
+            }
             continue
         }
         $rows++
@@ -447,6 +512,14 @@ function Get-PortListenerWitness([int]$Port) {
     if ($notARow -ne 0 -or $preamble -gt 2) {
         return [pscustomobject]@{ State = "unmeasurable"; OwningProcess = $null
             Detail = "$($preamble + $notARow) of netstat's lines are not rows this parse understands ($preamble before the first row, where netstat's own preamble is two, and $notARow after it); a table it cannot read cannot witness for $Port" }
+    }
+    # The SHAPE rule, kept separate from the count above so each says which
+    # property failed. Two non-blank pre-row lines with no blank line between
+    # them is a diagnostic standing where the banner stands, not a banner; zero
+    # of them is a table with no header, so nothing there carries the columns.
+    if ($preamble -lt 1 -or ($preamble -eq 2 -and $preambleSep -eq 0)) {
+        return [pscustomobject]@{ State = "unmeasurable"; OwningProcess = $null
+            Detail = "netstat's preamble is not the shape netstat prints ($preamble non-blank line(s) before the first row, blank line between them: $preambleSep; expected blank, banner, blank, header); the last one before the rows must be the header and only a blank-separated banner may precede it, so this table cannot witness for $Port" }
     }
     if ($tcpAfterUdp -ne 0) {
         return [pscustomobject]@{ State = "unmeasurable"; OwningProcess = $null
