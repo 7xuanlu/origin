@@ -25,7 +25,6 @@ RELEASE_FILES = (
     "crates/wenlan-cli/npm/package.json",
     "crates/wenlan-mcp/npm/package.json",
     "plugin-codex/.codex-plugin/plugin.json",
-    "plugin-codex/README.md",
     "plugin-codex/bin/wenlan-mcp-runner.sh",
     "plugin-codex/skills/setup/SKILL.md",
     "plugin/.claude-plugin/plugin.json",

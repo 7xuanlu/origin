@@ -50,10 +50,6 @@ cat > "$TMPDIR_TEST/plugin-codex/bin/wenlan-mcp-runner.sh" <<EOF
 exec npx -y wenlan-mcp@^0.4.1 --agent-name "\${agent_name}" "\$@"
 EOF
 
-cat > "$TMPDIR_TEST/plugin-codex/README.md" <<EOF
-Falls back to npx -y wenlan-mcp@^0.4.1 when no local runtime exists.
-EOF
-
 cat > "$TMPDIR_TEST/app/Cargo.toml" <<EOF
 [package]
 name = "wenlan-app"
@@ -151,7 +147,6 @@ APP_PKG_VER=$(jq -r .version "$TMPDIR_TEST/package.json")
 grep -q '# x-release-please-version' "$TMPDIR_TEST/app/Cargo.toml" || { echo "FAIL: app/Cargo.toml lost its x-release-please-version marker"; exit 1; }
 grep -q '/v0.5.0/install.sh' "$TMPDIR_TEST/plugin/skills/setup/SKILL.md" || { echo "FAIL: setup skill installer not bumped"; exit 1; }
 grep -q 'wenlan-mcp@\^0.5.0' "$TMPDIR_TEST/plugin-codex/bin/wenlan-mcp-runner.sh" || { echo "FAIL: Codex runner pin not bumped"; exit 1; }
-grep -q 'wenlan-mcp@\^0.5.0' "$TMPDIR_TEST/plugin-codex/README.md" || { echo "FAIL: Codex README runner pin not bumped"; exit 1; }
 grep -q '/v0.5.0/install.sh' "$TMPDIR_TEST/plugin-codex/skills/setup/SKILL.md" || { echo "FAIL: Codex setup skill installer not bumped"; exit 1; }
 
 # Cargo.lock: all five workspace members bumped to 0.5.0, exactly as

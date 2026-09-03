@@ -69,14 +69,6 @@ else
 fi
 echo "  Updated $CODEX_PLUGIN_MCP_RUNNER (wenlan-mcp pin)"
 
-CODEX_PLUGIN_README="plugin-codex/README.md"
-if [[ "$(uname)" == "Darwin" ]]; then
-    sed -i '' -E "s|(wenlan-mcp@\\^)[0-9]+\\.[0-9]+\\.[0-9]+|\\1${NEW_VERSION}|g" "$CODEX_PLUGIN_README"
-else
-    sed -i -E "s|(wenlan-mcp@\\^)[0-9]+\\.[0-9]+\\.[0-9]+|\\1${NEW_VERSION}|g" "$CODEX_PLUGIN_README"
-fi
-echo "  Updated $CODEX_PLUGIN_README (wenlan-mcp pin)"
-
 # 5. /setup skill install.sh URL pinned to current tag (not `main`), so the
 # install one-liner is reproducible at the release boundary.
 SETUP_SKILL="plugin/skills/setup/SKILL.md"
