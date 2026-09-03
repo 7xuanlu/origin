@@ -20,10 +20,14 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../../lib/tauri", () => mocks);
 
 import { RemoteAccessPanel } from "./RemoteAccessPanel";
+import { NO, YES, unreadable } from "../../test/readings";
+import type { Reading } from "../../lib/reading";
 
-/** A WireState whose claude_code client has (or lacks) the connector. Pass
- *  `null` for an empty client list (also reads as not-installed). */
-function wireState(hasPlugin: boolean | null) {
+/** A WireState whose claude_code client has, lacks, or could not be read for
+ *  the connector. Pass `null` for an empty client list (also reads as
+ *  not-installed). The parameter is a `Reading`, not a boolean, because the
+ *  third case is the one this row gets wrong. */
+function wireState(hasPlugin: Reading | null) {
   return {
     daemon: { base_url: "", reachable: true, version: null, error: null },
     mcp_binary: { command: "", args: [], candidates: [] },
@@ -34,10 +38,10 @@ function wireState(hasPlugin: boolean | null) {
             {
               client_type: "claude_code",
               name: "Claude Code",
-              detected: true,
+              detected: YES,
               config_path: "~/.claude.json",
-              has_raw_entry: false,
-              has_raw_duplicate: false,
+              has_raw_entry: NO,
+              has_raw_duplicate: NO,
               has_plugin: hasPlugin,
               route: "plugin",
             },
@@ -164,7 +168,7 @@ describe("RemoteAccessPanel", () => {
   // ── Claude.ai row ─────────────────────────────────────────────────────
   // has_plugin true → Ready, nothing to do: no Set up button, no steps.
   it("Claude.ai row: connector installed shows Ready and offers no setup", async () => {
-    mocks.getWireState.mockResolvedValue(wireState(true));
+    mocks.getWireState.mockResolvedValue(wireState(YES));
     renderPanel();
     expect(await screen.findByText("Ready")).toBeInTheDocument();
     expect(
@@ -176,7 +180,7 @@ describe("RemoteAccessPanel", () => {
 
   // has_plugin false → the one-click Set up installs the connector.
   it("Claude.ai row: no connector shows a Set up button that installs the Claude plugin", async () => {
-    mocks.getWireState.mockResolvedValue(wireState(false));
+    mocks.getWireState.mockResolvedValue(wireState(NO));
     renderPanel();
     const setUp = await screen.findByRole("button", { name: "Set up" });
     // Manual fallback is available alongside the one-click path.
@@ -199,6 +203,23 @@ describe("RemoteAccessPanel", () => {
     await waitFor(() => {
       expect(screen.queryByRole("button", { name: "Set up" })).not.toBeInTheDocument();
     });
+  });
+
+  // Round 5, defect 4. The SAME unknown, arriving on a SUCCESSFUL query: the
+  // wire came back, and `has_plugin` inside it says the plugin state could not
+  // be read. `?? false` sent that down the "no connector" path, which is the
+  // one that offers the one-click install this row's own comment says must
+  // never run against unknown state.
+  it("Claude.ai row: a plugin state that could not be read offers manual steps only", async () => {
+    mocks.getWireState.mockResolvedValue(wireState(unreadable("Access is denied. (os error 5)")));
+    renderPanel();
+
+    expect(await screen.findByText("Set up manually")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "Set up" })).not.toBeInTheDocument();
+    });
+    // Nor the opposite mistake: an unread plugin is not a ready connector.
+    expect(screen.queryByText("Ready")).not.toBeInTheDocument();
   });
 
   // ── ChatGPT row ───────────────────────────────────────────────────────

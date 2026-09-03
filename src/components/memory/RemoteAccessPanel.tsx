@@ -12,6 +12,7 @@ import {
   type RemoteAccessStatus,
   type RemoteConnectionTest,
 } from "../../lib/tauri";
+import { readingFailed, readingIsYes } from "../../lib/reading";
 import { Button, Card, StatusChip, Tag, Toggle, WarningTriangleIcon } from "./settings/primitives";
 
 const REMOTE_QUERY_KEY = ["remote-access-status"] as const;
@@ -302,7 +303,14 @@ function ClaudeRow() {
   const [error, setError] = useState("");
 
   const { data: wire, isError } = useQuery({ queryKey: ["wireState"], queryFn: getWireState });
-  const hasPlugin = wire?.clients.find((c) => c.client_type === "claude_code")?.has_plugin ?? false;
+  const claudeCode = wire?.clients.find((c) => c.client_type === "claude_code");
+  const hasPlugin = claudeCode ? readingIsYes(claudeCode.has_plugin) : false;
+  // The comment above says "never a one-click install against unknown state",
+  // and `isError` used to be the only unknown this could see. A `has_plugin`
+  // the app could not READ is the same unknown arriving on a successful
+  // query — it used to fall through `?? false` to "no connector", which is
+  // exactly the state that offers the install that double-registers.
+  const pluginUnknown = isError || (claudeCode ? readingFailed(claudeCode.has_plugin) : false);
 
   const install = async () => {
     setInstalling(true);
@@ -337,7 +345,7 @@ function ClaudeRow() {
         {rowHeading(t("connectMatrix.claudeTitle"))}
         <Tag tone="neutral">{t("intelligence.notConfigured")}</Tag>
       </div>
-      {!isError && (
+      {!pluginUnknown && (
         <div className="flex flex-col gap-1.5">
           <div>
             <Button variant="secondary" size="sm" onClick={install} disabled={installing}>

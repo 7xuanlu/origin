@@ -10,6 +10,7 @@ import {
   type AgentConnection,
   type McpClient,
 } from "../../../../lib/tauri";
+import { readingIsYes } from "../../../../lib/reading";
 import {
   clientTypeFamily,
   describeTrustLevel,
@@ -88,7 +89,10 @@ export default function AgentsSection({ onSetupAgent }: { onSetupAgent?: () => v
   const pendingNoteFamilies = new Set<string>();
   const pendingClients: McpClient[] = [];
   for (const client of mcpClients) {
-    if (!client.already_configured) continue;
+    // A pending row is a CLAIM that this client is configured and waiting for
+    // a restart. Only a measured yes may make it; a failed read makes no claim
+    // in either direction.
+    if (!readingIsYes(client.already_configured)) continue;
     const family = clientTypeFamily(client.client_type) || client.client_type;
     if (connectedFamilies.has(family)) pendingNoteFamilies.add(family);
     else pendingClients.push(client);

@@ -822,7 +822,7 @@ describe("liveInvoke wire_state (setup wizard daemon row)", () => {
     const wire = (await liveInvoke("wire_state")) as {
       daemon: { reachable: boolean; base_url: string };
       mcp_binary: { command: string; candidates: { path: string; exists: boolean; source: string }[] };
-      clients: { client_type: string; route: string; has_plugin: boolean }[];
+      clients: { client_type: string; route: string; has_plugin: { kind: string } }[];
     };
 
     expect(wire.daemon.reachable).toBe(true);
@@ -839,7 +839,7 @@ describe("liveInvoke wire_state (setup wizard daemon row)", () => {
     expect(claudeCode?.route).toBe("plugin");
     // Matches detect_mcp_clients_cmd's fixture: Codex CLI is the one already
     // configured client.
-    expect(codex?.has_plugin).toBe(true);
+    expect(codex?.has_plugin).toEqual({ kind: "yes" });
   });
 });
 

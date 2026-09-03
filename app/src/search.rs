@@ -352,10 +352,36 @@ pub async fn detect_mcp_clients_cmd() -> Result<Vec<crate::mcp_config::McpClient
     Ok(crate::mcp_config::detect_mcp_clients())
 }
 
+/// The client's config path, or a message naming why it could not be given.
+///
+/// An `Option` here would collapse two different failures — a client type this
+/// app does not know, and a home directory the platform would not report — and
+/// report the second as the first ("Unknown client type: claude_code", about a
+/// client that plainly exists).
+fn client_config_path_or_message(client_type: &str) -> Result<std::path::PathBuf, String> {
+    match crate::mcp_config::client_config_path(client_type) {
+        crate::mcp_config::ClientConfigPath::Known(path) => Ok(path),
+        crate::mcp_config::ClientConfigPath::UnknownClient => {
+            Err(format!("Unknown client type: {client_type}"))
+        }
+        crate::mcp_config::ClientConfigPath::Undetermined(why) => Err(format!(
+            "Could not work out where {client_type}'s config file is: {why}. Nothing was changed."
+        )),
+    }
+}
+
+/// Writes the raw `wenlan` MCP entry into `client_type`'s config file.
+///
+/// `Ok` carries the resolver inputs that could NOT be determined while the
+/// command being written was chosen (round 6, D3's boundary defect). An empty
+/// vector means every input was read; a non-empty one means the write
+/// succeeded off a search that skipped candidates it never built. The two used
+/// to be the same `()`, so the UI could only report the first.
 #[tauri::command]
-pub async fn write_mcp_config(client_type: String) -> Result<(), String> {
-    let config_path = crate::mcp_config::client_config_path(&client_type)
-        .ok_or(format!("Unknown client type: {}", client_type))?;
+pub async fn write_mcp_config(
+    client_type: String,
+) -> Result<Vec<crate::mcp_config::UndeterminedInput>, String> {
+    let config_path = client_config_path_or_message(&client_type)?;
     if client_type == "codex_cli" {
         return crate::mcp_config::write_wenlan_entry_toml(&config_path).map_err(|e| e.to_string());
     }
@@ -371,8 +397,7 @@ pub async fn write_mcp_config(client_type: String) -> Result<(), String> {
 /// is an `Err` the UI surfaces verbatim.
 #[tauri::command]
 pub async fn remove_raw_mcp_entry(client_type: String) -> Result<(), String> {
-    let config_path = crate::mcp_config::client_config_path(&client_type)
-        .ok_or(format!("Unknown client type: {}", client_type))?;
+    let config_path = client_config_path_or_message(&client_type)?;
     if client_type == "codex_cli" {
         return crate::mcp_config::remove_wenlan_entry_toml(&config_path)
             .map_err(|e| e.to_string());
@@ -388,8 +413,7 @@ pub async fn remove_raw_mcp_entry(client_type: String) -> Result<(), String> {
 /// entry is an `Err` the UI surfaces verbatim.
 #[tauri::command]
 pub async fn remove_legacy_mcp_entry(client_type: String) -> Result<(), String> {
-    let config_path = crate::mcp_config::client_config_path(&client_type)
-        .ok_or(format!("Unknown client type: {}", client_type))?;
+    let config_path = client_config_path_or_message(&client_type)?;
     if client_type == "codex_cli" {
         return crate::mcp_config::remove_legacy_origin_entry_toml(&config_path)
             .map_err(|e| e.to_string());
@@ -398,13 +422,22 @@ pub async fn remove_legacy_mcp_entry(client_type: String) -> Result<(), String> 
 }
 
 /// Returns the current `wenlan` MCP server entry (command + args) that Wenlan
-/// uses when writing client configs. Prefers a local binary in dev, falls back
-/// to `npx -y wenlan-mcp` otherwise. The frontend uses this to build a
-/// copy-pasteable manual-setup JSON snippet with real values instead of
-/// `/path/to/wenlan-mcp` placeholder text.
+/// uses when writing client configs. Prefers a local binary, falls back to
+/// `npx -y wenlan-mcp` when none is *measured* to be installed. The frontend
+/// uses this to build a copy-pasteable manual-setup JSON snippet with real
+/// values instead of `/path/to/wenlan-mcp` placeholder text.
+///
+/// An `Err` here means the search could not be completed — some candidate
+/// could not be looked at — and the string names the path. It is deliberately
+/// not an `npx` entry: handing the user a copy-pasteable command that was
+/// guessed rather than measured is how defect D reached a shipped config.
 #[tauri::command]
-pub async fn get_wenlan_mcp_entry() -> Result<crate::mcp_config::WenlanMcpEntry, String> {
-    Ok(crate::mcp_config::wenlan_mcp_entry())
+/// Round 6, D3's boundary defect: the report carries `undetermined` alongside
+/// the entry. A copy-pasteable command chosen by a search that could not
+/// determine one of its inputs must not look identical to one chosen by a
+/// search that read them all.
+pub async fn get_wenlan_mcp_entry() -> Result<crate::mcp_config::WenlanMcpEntryReport, String> {
+    crate::mcp_config::wenlan_mcp_entry().map_err(|e| e.to_string())
 }
 
 /// Installs the Wenlan plugin for `client_type` (`"claude_code"` /
@@ -5220,14 +5253,29 @@ pub async fn list_recent_pages(
 
 // ── Lifecycle commands ─────────────────────────────────────────────────────
 
+/// Whether Run at Login is on. A platform without the feature is a measured
+/// `false`; a launchctl that could not be read is an `Err`, never `false` —
+/// the toggle rendering "off" for an unread state is the shipped bug this
+/// guards (the user sees the feature disabled while launchd still starts
+/// Wenlan every boot). The Settings row surfaces the error instead of
+/// painting the toggle.
 #[tauri::command]
 pub async fn is_run_at_login_enabled() -> Result<bool, String> {
     if crate::lifecycle::run_at_login_capability(std::env::consts::OS).is_err() {
         return Ok(false);
     }
-    use crate::lifecycle::{is_run_at_login_enabled as inner, SystemLaunchctl};
-    Ok(inner(&SystemLaunchctl))
+    use crate::lifecycle::{run_at_login_state, LabelState, SystemLaunchctl};
+    match run_at_login_state(&SystemLaunchctl) {
+        LabelState::Loaded => Ok(true),
+        LabelState::NotLoaded => Ok(false),
+        LabelState::Unknown => Err(RUN_AT_LOGIN_UNREADABLE.to_string()),
+    }
 }
+
+/// Returned when launchctl could not be measured. The frontend shows it
+/// verbatim on the Run at Login row.
+pub(crate) const RUN_AT_LOGIN_UNREADABLE: &str =
+    "Could not read the Run at Login state: launchctl did not answer.";
 
 #[tauri::command]
 pub async fn set_run_at_login(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
@@ -5396,6 +5444,10 @@ mod avatar_path_tests {
     #[serial_test::serial]
     fn resolves_missing_legacy_avatar_to_wenlan_copy() {
         let _env = EnvGuard::capture(AVATAR_ENV_KEYS);
+        // `legacy_avatar_storage_dirs()` also probes `legacy_app_data_dir()`,
+        // which neither *_DATA_DIR override moves.
+        let roots = tempfile::tempdir().unwrap();
+        let _roots = crate::test_env::isolate_app_roots(roots.path());
         let current = tempfile::tempdir().unwrap();
         let legacy = tempfile::tempdir().unwrap();
         let filename = "57515813-4419-4116-bea6-21bc66e1a511.jpg";
@@ -5424,6 +5476,9 @@ mod avatar_path_tests {
     #[serial_test::serial]
     fn does_not_resolve_arbitrary_missing_path_to_avatar_copy() {
         let _env = EnvGuard::capture(AVATAR_ENV_KEYS);
+        // See `resolves_missing_legacy_avatar_to_wenlan_copy`.
+        let roots = tempfile::tempdir().unwrap();
+        let _roots = crate::test_env::isolate_app_roots(roots.path());
         let current = tempfile::tempdir().unwrap();
         let filename = "same-name.jpg";
 
@@ -5444,6 +5499,9 @@ mod avatar_path_tests {
     #[serial_test::serial]
     fn does_not_resolve_non_origin_avatar_dir_to_wenlan_copy() {
         let _env = EnvGuard::capture(AVATAR_ENV_KEYS);
+        // See `resolves_missing_legacy_avatar_to_wenlan_copy`.
+        let roots = tempfile::tempdir().unwrap();
+        let _roots = crate::test_env::isolate_app_roots(roots.path());
         let current = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         let filename = "same-name.jpg";

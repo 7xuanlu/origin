@@ -8,6 +8,13 @@ import { daemonMeetsFloor } from "../../src/lib/daemonVersion";
 type Args = Record<string, unknown> | undefined;
 const PAGE_EDIT_DAEMON_FLOOR = "0.14.1";
 
+// The client fixtures below carry `Reading`s, not booleans (src/lib/tauri.ts).
+// Spelling them out inline five times per row buries the fixture, so they get
+// names — the point of the type is that a reader must SEE which of the three
+// a field holds, and `YES`/`NO` keep that visible.
+const YES = { kind: "yes" } as const;
+const NO = { kind: "no" } as const;
+
 class HttpError extends Error {
   status: number;
   body: string;
@@ -964,11 +971,11 @@ export const DEFAULTS: Record<string, unknown> = {
   // screen, could not be pixel-reviewed at all. An empty fixture doesn't render
   // "nothing to see"; it renders a different, misleading screen.
   detect_mcp_clients_cmd: [
-    { name: "Cursor", client_type: "cursor", config_path: "~/.cursor/mcp.json", detected: true, already_configured: false },
-    { name: "Claude Desktop", client_type: "claude_desktop", config_path: "~/Library/Application Support/Claude/claude_desktop_config.json", detected: true, already_configured: false },
-    { name: "Gemini CLI", client_type: "gemini_cli", config_path: "~/.gemini/settings.json", detected: true, already_configured: false },
-    { name: "Codex CLI", client_type: "codex_cli", config_path: "~/.codex/config.toml", detected: true, already_configured: true },
-    { name: "Claude Code", client_type: "claude_code", config_path: "~/.claude.json", detected: true, already_configured: false },
+    { name: "Cursor", client_type: "cursor", config_path: "~/.cursor/mcp.json", detected: YES, already_configured: NO, has_raw_entry: NO, has_raw_duplicate: NO, has_plugin: NO },
+    { name: "Claude Desktop", client_type: "claude_desktop", config_path: "~/Library/Application Support/Claude/claude_desktop_config.json", detected: YES, already_configured: NO, has_raw_entry: NO, has_raw_duplicate: NO, has_plugin: NO },
+    { name: "Gemini CLI", client_type: "gemini_cli", config_path: "~/.gemini/settings.json", detected: YES, already_configured: NO, has_raw_entry: NO, has_raw_duplicate: NO, has_plugin: NO },
+    { name: "Codex CLI", client_type: "codex_cli", config_path: "~/.codex/config.toml", detected: YES, already_configured: YES, has_raw_entry: NO, has_raw_duplicate: NO, has_plugin: YES },
+    { name: "Claude Code", client_type: "claude_code", config_path: "~/.claude.json", detected: YES, already_configured: NO, has_raw_entry: NO, has_raw_duplicate: NO, has_plugin: NO },
   ],
   // WireState (src/lib/tauri.ts) — the "setting up" step's daemon row reads
   // `wire.daemon.reachable` unguarded (app/src/wire_state.rs never returns
@@ -1001,11 +1008,11 @@ export const DEFAULTS: Record<string, unknown> = {
       // no plugin path) — verbatim the real ~/.cursor/mcp.json shape on this
       // machine, so the Diagnostics "remove the old entry" warnbox is
       // pixel-reviewable in preview.
-      { client_type: "cursor", name: "Cursor", detected: true, config_path: "~/.cursor/mcp.json", has_raw_entry: true, has_raw_duplicate: true, has_plugin: false, route: "config" },
-      { client_type: "claude_desktop", name: "Claude Desktop", detected: true, config_path: "~/Library/Application Support/Claude/claude_desktop_config.json", has_raw_entry: false, has_raw_duplicate: false, has_plugin: false, route: "config" },
-      { client_type: "gemini_cli", name: "Gemini CLI", detected: true, config_path: "~/.gemini/settings.json", has_raw_entry: false, has_raw_duplicate: false, has_plugin: false, route: "config" },
-      { client_type: "codex_cli", name: "Codex CLI", detected: true, config_path: "~/.codex/config.toml", has_raw_entry: false, has_raw_duplicate: false, has_plugin: true, route: "plugin" },
-      { client_type: "claude_code", name: "Claude Code", detected: true, config_path: "~/.claude.json", has_raw_entry: false, has_raw_duplicate: false, has_plugin: false, route: "plugin" },
+      { client_type: "cursor", name: "Cursor", detected: YES, config_path: "~/.cursor/mcp.json", has_raw_entry: YES, has_raw_duplicate: YES, has_plugin: NO, route: "config" },
+      { client_type: "claude_desktop", name: "Claude Desktop", detected: YES, config_path: "~/Library/Application Support/Claude/claude_desktop_config.json", has_raw_entry: NO, has_raw_duplicate: NO, has_plugin: NO, route: "config" },
+      { client_type: "gemini_cli", name: "Gemini CLI", detected: YES, config_path: "~/.gemini/settings.json", has_raw_entry: NO, has_raw_duplicate: NO, has_plugin: NO, route: "config" },
+      { client_type: "codex_cli", name: "Codex CLI", detected: YES, config_path: "~/.codex/config.toml", has_raw_entry: NO, has_raw_duplicate: NO, has_plugin: YES, route: "plugin" },
+      { client_type: "claude_code", name: "Claude Code", detected: YES, config_path: "~/.claude.json", has_raw_entry: NO, has_raw_duplicate: NO, has_plugin: NO, route: "plugin" },
     ],
   },
   get_wenlan_mcp_entry: null,
