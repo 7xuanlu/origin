@@ -1,8 +1,17 @@
+// @vitest-environment node
+//
+// These cases spawn processes and read files; nothing here touches a DOM, and
+// building jsdom for each file costs more than every assertion in it.
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { resolveTestBash } from "./lib/test-bash";
+
+// Resolved once for the file rather than per case: on Windows this is Git Bash,
+// never the WSL `bash` that PATH offers first.
+const TEST_BASH = resolveTestBash();
 
 // `scripts/attest.sh` is the portable replacement for `~/.claude/bin/attest.sh`,
 // a personal macOS helper that does not exist in a fresh checkout and does not
@@ -52,14 +61,11 @@ function runAttest(
 
   // Git Bash explicitly on Windows, for the same reason package.json uses it: a
   // bare `bash` on a machine with WSL is the Linux distro.
-  const result =
-    process.platform === "win32"
-      ? spawnSync(process.execPath, ["scripts/run-bash.mjs", attest, ...args], {
-          cwd: root,
-          encoding: "utf8",
-          env: merged,
-        })
-      : spawnSync("bash", [attest, ...args], { cwd: root, encoding: "utf8", env: merged });
+  const result = spawnSync(TEST_BASH, [attest, ...args], {
+    cwd: root,
+    encoding: "utf8",
+    env: merged,
+  });
 
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
@@ -232,12 +238,8 @@ describe("attest.sh: concurrent writers", () => {
       if (value !== undefined) merged[key] = value;
     }
     Object.assign(merged, env);
-    const [command, commandArgs] =
-      process.platform === "win32"
-        ? [process.execPath, ["scripts/run-bash.mjs", attest, ...args]]
-        : ["bash", [attest, ...args]];
     return new Promise((done) => {
-      const child = spawn(command, commandArgs, { cwd: root, env: merged });
+      const child = spawn(TEST_BASH, [attest, ...args], { cwd: root, env: merged });
       let stderr = "";
       child.stderr.on("data", (chunk) => {
         stderr += String(chunk);
@@ -374,14 +376,11 @@ describe("attest.sh: concurrent writers", () => {
       WENLAN_STUB_BIN: bin,
       WENLAN_STUB_NAMES: Object.keys(stubs).join(" "),
     });
-    const result =
-      process.platform === "win32"
-        ? spawnSync(process.execPath, ["scripts/run-bash.mjs", wrapper, ...args], {
-            cwd: root,
-            encoding: "utf8",
-            env: merged,
-          })
-        : spawnSync("bash", [wrapper, ...args], { cwd: root, encoding: "utf8", env: merged });
+    const result = spawnSync(TEST_BASH, [wrapper, ...args], {
+      cwd: root,
+      encoding: "utf8",
+      env: merged,
+    });
     return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
   }
 
