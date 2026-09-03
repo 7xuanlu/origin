@@ -1,3 +1,6 @@
+// @vitest-environment node
+// Nothing here touches the DOM: every case spawns bash or reads the script.
+// jsdom costs seconds of setup per run for a document nobody opens.
 import {
   chmodSync,
   existsSync,
@@ -322,7 +325,9 @@ describe("scoped dev runtime", () => {
 
   it("canonicalizes by asking the OS for the real on-disk path", () => {
     const script = readFileSync(resolve(root, "scripts/dev-runtime.sh"), "utf8");
-    const start = script.indexOf("canonicalize_path() {");
+    // `canonicalize_paths`, plural: the resolution is one `node` for a LIST of
+    // paths and `canonicalize_path` is a one-argument wrapper on it.
+    const start = script.indexOf("canonicalize_paths() {");
     expect(start).toBeGreaterThan(-1);
     const body = script.slice(start, script.indexOf("\n}\n", start));
 
