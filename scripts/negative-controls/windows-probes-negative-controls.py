@@ -866,6 +866,59 @@ function netstat.exe {
     "  TCP    0.0.0.0:445            0.0.0.0:0              LISTENING       4"
 }
 """,
+    # ROUND 7 (adversarial review), FINDING 1, and it is the reviewer's own
+    # fixture. The preamble rule was a BUDGET -- at most two non-blank lines
+    # before the first row -- and the budget exists because the banner and the
+    # column header are LOCALISED and can therefore only be counted. Two
+    # non-blank lines is also a warning sitting directly on top of the header,
+    # which is what this is, and 7878 is absent from the truncated remainder:
+    # before the shape rule this table reported the port MEASURED CLOSED.
+    "netstat-warning-as-banner": r"""
+function netstat.exe {
+    param([Parameter(ValueFromRemainingArguments = $true)]$Rest)
+    "WARNING: provider returned partial results",
+    "Proto Local_Address Foreign_Address State PID",
+    "TCP 0.0.0.0:135 0.0.0.0:0 LISTENING 1576",
+    "UDP 0.0.0.0:5353 *:* 2340"
+}
+""",
+    # The other side of the same rule, so "refuse every preamble that is not
+    # exactly blank/banner/blank/header" cannot pass the case above by refusing
+    # everything: at most ONE line may precede the header, so NO line may too.
+    # This one still has to measure.
+    "netstat-bare-header": r"""
+function netstat.exe {
+    param([Parameter(ValueFromRemainingArguments = $true)]$Rest)
+    "  Proto  Local Address          Foreign Address        State           PID",
+    "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1576",
+    "  UDP    0.0.0.0:5353           *:*                                    2340"
+}
+""",
+    # ROUND 7, FINDING 1's other half: a complete, well-formed table on stdout,
+    # exit 0, and a diagnostic on STDERR. `Invoke-Native` used to stringify the
+    # merged pipeline on the spot, which turned the ErrorRecord into a line that
+    # reads exactly like a line of output -- and the preamble rule cannot make
+    # up the difference, because its job is to tolerate two lines it may not
+    # match by text. The capture is unflattened now and any stderr at all is a
+    # refusal.
+    #
+    # The stdout half deliberately carries NO banner, so that once the stderr
+    # line is flattened in it lands in the banner's slot and the merged stream
+    # is the exact blank/banner/blank/header shape the parse admits. That is
+    # what makes this the DANGEROUS case rather than a reclassification: with
+    # the stderr rule off, this table reads as a measured closed port. `2>&1`
+    # inside one function is emitted in statement order, so the position is
+    # determined here rather than raced for.
+    "netstat-stderr-beside-rows": r"""
+function netstat.exe {
+    param([Parameter(ValueFromRemainingArguments = $true)]$Rest)
+    Write-Error "provider returned partial results"
+    "",
+    "  Proto  Local Address          Foreign Address        State           PID",
+    "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1576",
+    "  UDP    0.0.0.0:5353           *:*                                    2340"
+}
+""",
 
     # --- the user's data across the uninstall ------------------------------
     # THE FIXTURE THE ROW WAS BLIND TO: the data ROOT is still there -- this run
@@ -1718,6 +1771,21 @@ CASES = [
     ("port-witness-tcp-after-udp", "zip",
      ("tcp-table-without-7878", "netstat-tcp-after-udp"),
      "port-7878-closed", "FAIL", "the sections are interleaved"),
+    # ROUND 7. The reviewer's fixture: a warning standing exactly where the
+    # localised banner stands. Two non-blank pre-row lines, which is the budget
+    # exactly -- and no blank line between them, which netstat's own preamble
+    # always has.
+    ("port-witness-warning-as-banner", "zip",
+     ("tcp-table-without-7878", "netstat-warning-as-banner"),
+     "port-7878-closed", "FAIL", "not the shape netstat prints"),
+    # ...and the shape rule's other side, which must still MEASURE.
+    ("port-witness-bare-header-still-measures", "zip",
+     ("tcp-table-without-7878", "netstat-bare-header"),
+     "port-7878-closed", "PASS", "measured closed"),
+    # ROUND 7's second rule: a clean table and a complaint on stderr.
+    ("port-witness-stderr-beside-rows", "zip",
+     ("tcp-table-without-7878", "netstat-stderr-beside-rows"),
+     "port-7878-closed", "FAIL", "line(s) to stderr"),
 
     # --- finding 2: the health probe -----------------------------------
     ("health-off-refused", "zip", ("http-refused",),
@@ -2080,7 +2148,13 @@ CONTROLS = [
      ["port-table-hides-7878-netstat-finds-it", "port-witness-cannot-run",
       "port-witness-table-garbled", "port-witness-no-listeners",
       "port-witness-warning-beside-rows", "port-witness-truncated-before-udp",
-      "port-witness-tcp-after-udp"]),
+      "port-witness-tcp-after-udp",
+      # ROUND 7's two refusals: both are the witness declining, so dropping the
+      # witness altogether takes both of them to "measured closed". Declared,
+      # because a case a mutation legitimately reddens must be named.
+      # `port-witness-bare-header-still-measures` is NOT here: it is a PASS
+      # either way, which is what makes it a survivor rather than collateral.
+      "port-witness-warning-as-banner", "port-witness-stderr-beside-rows"]),
 
     ("nc-port-witness-row-shape-not-checked",
      "C4's parse: every line claiming to be a protocol row no longer has to BE "
@@ -2099,12 +2173,62 @@ CONTROLS = [
      "an incomplete table reading as a measured negative",
      "zip",
      """        if (-not $wellFormed) {
-            if ($rows -ne 0) { $notARow++ } else { $preamble++ }
+            if ($rows -ne 0) { $notARow++ }
+            else {
+                $preamble++
+                if ($preamble -eq 2) { $preambleSep = $blankSeen }
+                $blankSeen = 0
+            }
             continue
         }""",
-     """        if ($f[0] -ne "TCP" -and $f[0] -ne "UDP") { continue }
-        if (-not $wellFormed) { $notARow++; continue }""",
+     # The revert is SCOPED to lines after the first row, which is where this
+     # control's case lives. The shipped shape it restores skipped the preamble
+     # too -- there was no preamble floor then -- and restoring that half as
+     # well would leave $preamble at 0 for EVERY netstat fixture, so round 7's
+     # shape rule would refuse all of them and this control would be credited
+     # for reddening the whole table. A control whose blast radius is the parse
+     # measures nothing about one rule in it.
+     """        if ($rows -ne 0 -and $f[0] -ne "TCP" -and $f[0] -ne "UDP") { continue }
+        if (-not $wellFormed) {
+            if ($rows -ne 0) { $notARow++ }
+            else {
+                $preamble++
+                if ($preamble -eq 2) { $preambleSep = $blankSeen }
+                $blankSeen = 0
+            }
+            continue
+        }""",
      ["port-witness-warning-beside-rows"]),
+
+    # ROUND 7 (adversarial review), FINDING 1. The preamble rule was a BUDGET,
+    # and a budget is not a shape: the two lines it tolerates are tolerated
+    # BECAUSE they are localised and cannot be matched by text, which means a
+    # warning standing directly on top of the header fits it exactly. netstat's
+    # own preamble is blank, banner, blank, header -- the banner is always
+    # separated from the header by a blank line, and a blank line is not
+    # localised. This reverts only that separation requirement, so the line
+    # budget stays and every other preamble case stays green.
+    ("nc-port-witness-banner-shape-unchecked",
+     "round 7: a warning standing where the localised banner stands fits the "
+     "two-line preamble budget, so a truncated table reads as a closed port",
+     "zip",
+     """    if ($preamble -lt 1 -or ($preamble -eq 2 -and $preambleSep -eq 0)) {""",
+     """    if ($false) {""",
+     ["port-witness-warning-as-banner"]),
+
+    # ROUND 7's other half. Invoke-Native's capture is unflattened so that an
+    # ErrorRecord is still distinguishable from a line of output; this puts the
+    # refusal back to sleep. The fixture's stdout has no banner, so the
+    # flattened stderr line lands in the banner's slot and the merged stream is
+    # a shape the parse admits -- a measured closed port off a read netstat
+    # complained about.
+    ("nc-port-witness-stderr-is-just-another-line",
+     "round 7: netstat's stderr is read as part of the table again, so a "
+     "status-0 complaint alongside a well-shaped table certifies a free port",
+     "zip",
+     """    if ($r.ErrorCount -ne 0) {""",
+     """    if ($false) {""",
+     ["port-witness-stderr-beside-rows"]),
 
     ("nc-port-witness-end-witness-dropped",
      "round 5: nothing requires the UDP section, so a table truncated after a "
@@ -3327,8 +3451,13 @@ MUST_REFUSE_REACHABLE = [
 # A guard that fires on ordinary prose gets switched off within a week, so the
 # other half of the measurement is what must still pass.
 MUST_ACCEPT = [
-    ("the shipped Invoke-Native body",
-     '$out = @(& $File @Arguments 2>&1 | ForEach-Object { "$_" })'),
+    # ROUND 7: the capture is no longer stringified inside the same pipeline,
+    # so that an ErrorRecord stays distinguishable from a line of stdout. The
+    # `&` spelling the allow-list pins is unchanged, which is the whole of what
+    # this fixture measures.
+    ("the shipped Invoke-Native body", '$raw = @(& $File @Arguments 2>&1)'),
+    ("the shipped Invoke-Native stringify",
+     '$out = @($raw | ForEach-Object { "$_" })'),
     ("an allow-listed native call", '$r = Invoke-Native "netstat.exe" @("-ano")'),
     # The allow-list is case-folded for the same reason everything else here is:
     # `& "NETSTAT.EXE"` resolves to the `function netstat.exe` stub, so refusing
