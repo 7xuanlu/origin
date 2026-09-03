@@ -3265,6 +3265,31 @@ def _powershell() -> str | None:
 FixtureResult = tuple[str, str | None, str | None]
 
 
+def _authenticode_status(shell: str, path: str) -> str | None:
+    """What this host's Authenticode makes of a file, or None if it could not
+    be asked. The path travels in the environment rather than inside the
+    command string, so a temp directory containing a quote cannot rewrite it.
+    """
+    try:
+        result = subprocess.run(
+            [
+                shell,
+                "-NoProfile",
+                "-Command",
+                "(Get-AuthenticodeSignature -LiteralPath "
+                "$env:AUTHENTICODE_PROBE_PATH).Status.ToString()",
+            ],
+            env={**os.environ, "AUTHENTICODE_PROBE_PATH": path},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    lines = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+    return lines[0] if result.returncode == 0 and lines else None
+
+
 def _authenticode_hashed_byte(data: bytes) -> tuple[int | None, str]:
     """A file offset Authenticode covers, or why this fixture has none.
 
@@ -3311,7 +3336,22 @@ def _authenticode_hashed_byte(data: bytes) -> tuple[int | None, str]:
     # Everything ahead of the certificate table is hashed except the checksum
     # field and this directory entry, both of which live in the headers. The
     # last byte before the table is past both.
-    offset = min(table, len(data)) - 1
+    #
+    # A table that starts past the end of the file is one whose headers and
+    # contents disagree. The first cut clamped that case with
+    # `min(table, len(data)) - 1` and answered anyway -- and the last byte of
+    # an embedded-signed file is NOT hashed (measured: flipping it leaves the
+    # signature Valid), so the clamp hands back an offset that produces a
+    # still-valid fixture, and the row then reports the shipped step accepting
+    # a tampered installer. A parser error, wearing a product regression's
+    # clothes. A parser that cannot trust its input refuses instead.
+    if table > len(data):
+        return None, (
+            f"the certificate table claims to start at {table} in a "
+            f"{len(data)}-byte file, so its headers and its contents disagree "
+            "and no offset derived from them can be trusted"
+        )
+    offset = table - 1
     if offset <= entry + 8:
         return None, (
             f"the certificate table starts at {table}, which leaves no hashed "
@@ -3542,16 +3582,33 @@ def authenticode_behaviour_violations(release: str) -> AuthenticodeRun:
                     if offset is None:
                         unchecked.append(f"{description}: {why}")
                         continue
-                    was, before = data[offset], len(data)
                     data[offset] ^= 0xFF
-                    # Measured, not assumed. A fixture that did not actually
-                    # change is this branch's own version of the defect the
-                    # row exists to catch, and without this check it reaches
-                    # the runner looking like a signed file that stayed valid.
-                    if len(data) != before or data[offset] == was:
-                        violations.append(
-                            f"{description}: patching byte {offset} of the "
-                            f"{before}-byte fixture did not change it"
+                    # Ask Authenticode about the fixture BEFORE the step does.
+                    #
+                    # This check used to be `data[offset] != was` after
+                    # `data[offset] ^= 0xFF` -- true by arithmetic, and item
+                    # assignment cannot change a bytearray's length either. A
+                    # control that cannot fail, sitting inside the fixture
+                    # builder for the row whose whole purpose is to enforce
+                    # that controls can fail.
+                    #
+                    # What can actually go wrong is that the chosen byte turns
+                    # out not to be covered by the signature. Then the step
+                    # accepts the file, the row sees exit 0, and it reports a
+                    # shipped gate that waves through tampered installers --
+                    # when the truth is a fixture that could not pose the
+                    # question. Asking here attributes it correctly, and this
+                    # check CAN fail: it did, against a deliberately clamped
+                    # offset at the end of the file, which comes back 'Valid'.
+                    Path(staged).write_bytes(bytes(data))
+                    built = _authenticode_status(shell, staged)
+                    if built != "HashMismatch":
+                        unchecked.append(
+                            f"{description}: byte {offset} of this host's "
+                            f"fixture is not covered by its signature -- the "
+                            f"tampered copy reports {built!r} rather than "
+                            "'HashMismatch', so this row cannot ask its "
+                            "question here"
                         )
                         continue
                 elif kind in AUTHENTICODE_SUBSTITUTED_KINDS:
@@ -3820,6 +3877,23 @@ AUTHENTICODE_MUTATIONS: tuple[tuple[str, str, frozenset[str], str], ...] = (
         # exactly as the comment on the runner below says.
         frozenset({"signed"}),
         "the publisher check, which is what makes it SignPath's signature",
+    ),
+    (
+        # The one mutation `mismatch` alone can see, and the reason that row is
+        # worth the PE parsing it costs. Widening the status check to admit
+        # HashMismatch ships a gate that accepts an installer modified after
+        # signing, which is the whole threat this step exists for -- and every
+        # other row still passes: `notsigned` still throws (NotSigned is
+        # neither Valid nor HashMismatch), `missing` never reaches the check,
+        # and the three Valid rows are untouched. Without this entry the
+        # catcher sets only ever list `mismatch` alongside `notsigned`, so the
+        # mutation loop could never demand that the row catch anything by
+        # itself, and the row's unique claim was stated rather than enforced.
+        "          if ($signature.Status -ne 'Valid') {\n",
+        "          if ($signature.Status -ne 'Valid' -and "
+        "$signature.Status -ne 'HashMismatch') {\n",
+        frozenset({"mismatch"}),
+        "the status check's refusal of a file modified after signing",
     ),
     (
         # One operator, and the defect it hides is invisible to every other row
