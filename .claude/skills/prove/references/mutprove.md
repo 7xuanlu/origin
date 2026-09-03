@@ -17,7 +17,7 @@ Scripted, never conversational (the model round-trip is the cost; measured
 
 ```bash
 # mutations.json: [{"id","desc","file","old","new"}, ...]
-TMPDIR=/tmp/claude ~/.claude/bin/attest.sh \
+TMPDIR=/tmp/claude bash scripts/attest.sh \
   python3 ~/.claude/bin/mutprove.py mutations.json -- \
   cargo test -p wenlan-core --lib <module>::tests
 ```
