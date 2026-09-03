@@ -2180,16 +2180,15 @@ _FILTERING_SERVER = (
 #: a filtered read meaningless.
 _IGNORING_SERVER = (("SigningRequests", "200|[]"),)
 
-#: ROUND 7. A server that rejects the CONTROL for its SPELLING and applies no
-#: filter at all -- the shape the old fixed-prefix control could not tell apart
-#: from a real lookup. `wenlan-no-such-project-<epoch><pid>` differed from the
-#: configured slug in its length, its content and its number of separators as
-#: well as in the one property the probe is about, so a length cap, a charset
-#: rule or a reserved-word rule rejects it on sight: `real=1, control=0`,
-#: printed as `resolved`, for a project this server never looked up. The
-#: rotation control has the same length, the same separator positions and the
-#: same character class at every position, so no rule of that kind can separate
-#: the two, both probes come back 200, and the pair reads UNMEASURED.
+#: A server that rejects the CONTROL for its SPELLING and applies no filter at
+#: all. A fixed-prefix control such as `wenlan-no-such-project-<epoch><pid>`
+#: differs from the configured slug in its length, its content and its number of
+#: separators as well as in the one property the probe is about, so a length
+#: cap, a charset rule or a reserved-word rule rejects it on sight: `real=1,
+#: control=0`, printed as `resolved`, for a project this server never looked up.
+#: The rotation control has the same length, the same separator positions and
+#: the same character class at every position, so no rule of that kind can
+#: separate the two, both probes come back 200, and the pair reads UNMEASURED.
 #:
 #: `no-such-project` and not a length rule, because the stub matches on URL
 #: substrings: it is the same discrimination, expressed in the one vocabulary
@@ -2240,12 +2239,12 @@ def _filtering_server_but(project_reply: str) -> tuple[tuple[str, str], ...]:
 #:   1  something answered NEGATIVELY
 #:   2  something COULD NOT BE MEASURED
 #:
-#: Round 15 found the monitor recreating, at its own outermost boundary, the
-#: defect it was written to detect: with the credential good and both slugs
-#: coming back "NOT validated -- this run could not measure it", the script
-#: exited 0 -- the same result as both slugs resolving. This table said so too:
-#: the `_IGNORING_SERVER` row below USED to expect 0. A truth table that
-#: encodes the defect is worse than no truth table, because it certifies it.
+#: The monitor can recreate, at its own outermost boundary, the defect it was
+#: written to detect: with the credential good and both slugs coming back "NOT
+#: validated -- this run could not measure it", exiting 0 is the same result as
+#: both slugs resolving. The `_IGNORING_SERVER` row below is where that is
+#: pinned. A truth table that encodes the defect is worse than no truth table,
+#: because it certifies it.
 #:
 #: The last column exists for the same reason. Several of these rows are about
 #: what the run must NOT say -- a recommendation to switch signing on is a
@@ -2327,11 +2326,11 @@ SIGNPATH_STATUS_TRUTH_TABLE: tuple[
         ),
         (),
     ),
-    # ---- malformed but VALID JSON: the half the old control never tested ----
+    # ---- malformed but VALID JSON: the half an HTML control cannot reach ----
     #
-    # The expression that shipped was
+    # An expression such as
     #   if type == "object" then (.values // .items // []) else . end | length
-    # and it accepted anything countable. Measured on this host with jq 1.8.2:
+    # accepts anything countable. Measured on this host with jq 1.8.2:
     # `{}` yielded 0, `"proxy error"` yielded 11 (a string's length is its
     # characters), `42` yielded 42 (a number's length is its absolute value).
     # Each one set credential=ok and exited 0 while printing "the organization
@@ -2427,14 +2426,13 @@ SIGNPATH_STATUS_TRUTH_TABLE: tuple[
         ("COULD NOT MEASURE -- unexpected HTTP 500",),
         (),
     ),
-    # ROUND 5. THE ROW THE TABLE HAD NO SHAPE FOR: a request that received its
-    # status line and then did not complete. curl prints `200` through -w and
-    # exits 28 (timeout), 18 (body shorter than Content-Length) or 56 (reset),
-    # and the body that DID land here is a syntactically perfect `[]` -- so with
-    # curl's status discarded by `|| true`, jq accepted it, the credential read
-    # `ok`, both slug probes answered off the same swallowed failures, and with
-    # SIGNPATH_ACTIVE=true the workflow exited 0. Green, over a measurement that
-    # failed, from the monitor whose subject is that exact substitution.
+    # A request that received its status line and then did not complete. curl
+    # prints `200` through -w and exits 28 (timeout), 18 (body shorter than
+    # Content-Length) or 56 (reset), and the body that DID land here is a
+    # syntactically perfect `[]` -- so with curl's status discarded by
+    # `|| true`, jq accepts it, the credential reads `ok`, both slug probes
+    # answer off the same swallowed failures, and with SIGNPATH_ACTIVE=true the
+    # workflow exits 0 over a measurement that failed.
     #
     # The forbidden column is the half that matters: exiting 2 while still
     # printing "the organization id and the API token are both good" would be
@@ -2451,7 +2449,8 @@ SIGNPATH_STATUS_TRUTH_TABLE: tuple[
     # And the same failure on a SLUG probe, with the credential request whole.
     # The differential is only a measurement if both of its halves completed:
     # here the configured probe times out after printing 200 and the control is
-    # rejected for real, which is the exact pair that used to read `resolved`.
+    # rejected for real, which is the exact pair that reads `resolved` without
+    # the transfer status.
     (
         "a slug probe whose transfer never completed cannot resolve the slug",
         {**_ALL_FOUR, "SIGNPATH_ACTIVE": "true"},
@@ -2471,27 +2470,21 @@ SIGNPATH_STATUS_TRUTH_TABLE: tuple[
         ("COULD NOT MEASURE a configured slug",),
         ("SIGNPATH_PROJECT_SLUG: validated against the SignPath API",),
     ),
-    # ---- ROUND 7. THE THREE REMEDIES THAT NOTHING DEFENDED ----
-    #
-    # The step's slug arm was repaired in three places and every row above
-    # stayed green with any one of the three reverted. That is the exact state
-    # this file exists to make impossible: a suite that would not notice the bug
-    # is not evidence about the bug, and a green run over it certifies nothing.
+    # ---- one row per repair in the slug arm ----
     #
     # Each row below is refused by exactly ONE rule in the step, which is what
     # makes it a control for that rule rather than for the arm in general. The
     # mutation list at the bottom of main() names the revert each one catches.
     (
-        # 1. THE CONTROL'S SPELLING. The control used to be the fixed prefix
-        # `wenlan-no-such-project-` plus an epoch and a pid, and this server
-        # rejects exactly that spelling while ignoring the filters entirely --
-        # so with the rotation reverted it answers `real=1, control=0` and the
-        # step prints `resolved`, exit 0, for a project it never looked up. The
-        # differential would have measured SYNTAX and reported EXISTENCE. As
-        # shipped, the control is the configured slug with every alphanumeric
-        # rotated one place: same length, same separator positions, same
-        # character class throughout, nothing here can tell them apart, both
-        # probes answer 200, and the pair is UNMEASURED.
+        # 1. THE CONTROL'S SPELLING. A fixed-prefix control -- say
+        # `wenlan-no-such-project-` plus an epoch and a pid -- is rejected by
+        # this server for its spelling while the filters are ignored entirely,
+        # so the pair answers `real=1, control=0` and the step prints
+        # `resolved`, exit 0, for a project it never looked up: SYNTAX measured,
+        # EXISTENCE reported. As shipped the control is the configured slug with
+        # every alphanumeric rotated one place -- same length, same separator
+        # positions, same character class throughout -- so nothing here can tell
+        # them apart, both probes answer 200, and the pair is UNMEASURED.
         "a server that rejects the control for its spelling and ignores the filters",
         {**_ALL_FOUR, "SIGNPATH_ACTIVE": "true"},
         _SPELLING_RULE_SERVER,
@@ -2507,7 +2500,7 @@ SIGNPATH_STATUS_TRUTH_TABLE: tuple[
         ),
     ),
     (
-        # 1b. THE OTHER HALF OF THE SAME REMEDY, and it fails in the OTHER
+        # 1b. THE OTHER HALF OF THE SAME REMEDY, failing in the OTHER
         # direction. A slug with no alphanumeric in it rotates to itself, so
         # the two probes are the same URL and the "difference" between them is
         # zero by construction. Both are rejected here, and without
@@ -2538,11 +2531,11 @@ SIGNPATH_STATUS_TRUTH_TABLE: tuple[
     ),
     (
         # 2. A SLUG 200 THAT IS NOT A SIGNING-REQUEST LIST. The credential arm
-        # has refused this body since round 14; the slug probe reduced the
-        # reply to its status line and threw the payload away, so the very same
-        # proxy page that is COULD-NOT-MEASURE three screens above read as
-        # `resolved` down here. The policy pair still resolves and is REQUIRED
-        # to below, which is what keeps this row about the one reply rather
+        # refuses this body; a slug probe that reduces the reply to its status
+        # line and throws the payload away reads the very same proxy page that
+        # is COULD-NOT-MEASURE three screens above as `resolved` down here. The
+        # policy pair still resolves and is REQUIRED to below, which is what
+        # keeps this row about the one reply rather
         # than about the route: a row that went red because nothing resolved
         # would pass while measuring something else entirely.
         "a slug 200 that is a proxy page is not a signing-request list",
@@ -2560,7 +2553,7 @@ SIGNPATH_STATUS_TRUTH_TABLE: tuple[
         ),
     ),
     (
-        # 3. THE ITEMS, WHICH NOTHING HERE HAD EVER READ. A 200 that IS a list
+        # 3. THE ITEMS. A 200 that IS a list
         # -- of signing requests for `someone-else`, returned to a request that
         # filtered on projectSlug=wenlan. Every other rule in the step says
         # this resolved: the transfer completed, the status is 200, the
@@ -2960,15 +2953,15 @@ AUTHENTICODE_BODY_ENV = frozenset({"STAGED_SETUP"})
 def authenticode_body_env_violations(release: str) -> list[str]:
     """The body may read STAGED_SETUP and nothing else.
 
-    Round 13c, finding 1. The truth table runs the body in the harness's own
-    environment, so a body-level early-out keyed on a variable the harness does
-    not set is invisible to all five rows:
+    The truth table runs the body in the harness's own environment, so a
+    body-level early-out keyed on a variable the harness does not set is
+    invisible to all five rows:
 
         if ($env:SIGNPATH_CONFIGURED -eq 'true') { exit 0 }
 
     Green here, where SIGNPATH_CONFIGURED is unset; a no-op in the release,
-    where it is exactly 'true'. The harness now runs the body with the release
-    job's environment (see `AUTHENTICODE_STEP_ENV`), which catches that one
+    where it is exactly 'true'. Running the body with the release job's
+    environment (see `AUTHENTICODE_STEP_ENV`) catches that one
     variable -- but only that one, and the next such guard would key on CI,
     RUNNER_OS, GITHUB_REF or anything else the runner defines. Enumerating what
     the environment holds is unwinnable; enumerating what the body is allowed
@@ -2976,8 +2969,8 @@ def authenticode_body_env_violations(release: str) -> list[str]:
     to gate is not a gate.
     """
     script = authenticode_script(release)
-    # Round 13d, 13c finding 1 reopened. The rule used to be a case-sensitive
-    # regex for ONE spelling, `$env:NAME`. PowerShell has at least five:
+    # A case-sensitive regex for ONE spelling, `$env:NAME`, is not the rule:
+    # PowerShell has at least five more --
     # `$Env:NAME`, `${env:NAME}`, `Get-Item Env:NAME`, `dir env:`, and
     # `[System.Environment]::GetEnvironmentVariable(...)`. Enumerating spellings
     # is the same losing game as enumerating variables.
@@ -3026,8 +3019,8 @@ _ESCAPED_KEY = re.compile(r'^[ \t]*"[^"\n]*\\[^"\n]*"[ \t]*:', re.M)
 def continue_on_error_violations(release: str, job: str) -> list[str]:
     """`continue-on-error`, read as a DECODED property, not as a token.
 
-    Round 13e reopened finding 1. `re.finditer("continue-on-error", job)` is a
-    lexical net over the job's text. It is strictly conservative for what it can
+    `re.finditer("continue-on-error", job)` is a lexical net over the job's
+    text. It is strictly conservative for what it can
     see -- the token has no other business in this job -- but a property does
     not have to appear in a step's text to be on that step. A merge key pulls
     one in from an anchor defined anywhere else in the file:
@@ -3103,18 +3096,17 @@ def continue_on_error_violations(release: str, job: str) -> list[str]:
 def authenticode_step_metadata_violations(release: str) -> list[str]:
     """The step's YAML around the body, which no body-level test can see.
 
-    Round 13b: a five-row truth table over the extracted `run:` block proves
-    what the script does when it runs. `continue-on-error: true` on the step
-    leaves every row and every static marker passing while the release ignores
-    the failure and publishes anyway -- a gate that runs, fails, and is
-    discarded. The body is not the whole step.
+    A five-row truth table over the extracted `run:` block proves what the
+    script does when it runs. `continue-on-error: true` on the step leaves every
+    row and every static marker passing while the release ignores the failure
+    and publishes anyway -- a gate that runs, fails, and is discarded. The body
+    is not the whole step.
 
-    Round 13c reopened it twice over. `continue-on-error` was rejected on a
-    hand-listed four steps, and "Check SignPath configuration is
-    all-or-nothing" -- the guard that stops a half-configured repo from
-    publishing an unsigned installer under a configured-looking run -- was not
-    among them. A list of load-bearing steps is a list someone has to keep
-    right; the job has none that may swallow a failure, so the rule is the job.
+    The rule covers the JOB, not a hand-listed set of steps: a four-step list
+    omitted "Check SignPath configuration is all-or-nothing", the guard that
+    stops a half-configured repo from publishing an unsigned installer under a
+    configured-looking run. A list of load-bearing steps is a list someone has
+    to keep right; no step in this job may swallow a failure.
     """
     job = job_body(release, "app-bundle-windows")
     if not job:
@@ -3126,11 +3118,11 @@ def authenticode_step_metadata_violations(release: str) -> list[str]:
     # EVERY step, and the job itself. Attribution is by the nearest preceding
     # step name so the message still says which one, without the enumeration
     # being what decides whether the rule applies.
-    # Round 13d: the rule was `^\s*continue-on-error:`, which is one YAML
-    # spelling of the key. `"continue-on-error": true` and `{continue-on-error:
-    # true}` are the same key and were invisible. There is no other reason for
-    # that token to appear anywhere in this job, so the token IS the rule --
-    # no anchor, no quoting to enumerate, no place left to hide it.
+    # `^\s*continue-on-error:` is one YAML spelling of the key;
+    # `"continue-on-error": true` and `{continue-on-error: true}` are the same
+    # key and invisible to it. There is no other reason for that token to appear
+    # anywhere in this job, so the TOKEN is the rule -- no anchor, no quoting to
+    # enumerate, no place left to hide it.
     for match in re.finditer(r"continue-on-error", job):
         seen = re.findall(r"^      - name: (.+)$", job[: match.start()], re.MULTILINE)
         owner = repr(seen[-1]) if seen else "the app-bundle-windows job itself"
@@ -3155,19 +3147,18 @@ def authenticode_step_metadata_violations(release: str) -> list[str]:
 
 
 #: The environment the step runs in during a real release, as far as it can
-#: matter to the body. The harness used to supply STAGED_SETUP alone, so the
-#: body ran with SIGNPATH_CONFIGURED unset while the shipping job runs it with
-#: SIGNPATH_CONFIGURED == 'true' -- and a branch on that difference is a step
-#: that passes every row here and does nothing there (round 13c, finding 1).
+#: matter to the body. Supplying STAGED_SETUP alone runs the body with
+#: SIGNPATH_CONFIGURED unset while the shipping job runs it with
+#: SIGNPATH_CONFIGURED == 'true', and a branch on that difference is a step that
+#: passes every row here and does nothing there.
 #: `authenticode_body_env_violations` is the load-bearing half of that fix,
 #: since no list of variables can be complete; this one makes the variables the
 #: step is MOST likely to be branched on hold their release values anyway.
 #:
-#: Round 13e reopened this as new finding 3: the list was eleven names chosen
-#: by hand, and `GITHUB_WORKFLOW_REF` -- which GitHub documents as a default and
-#: which identifies the workflow file uniquely -- was not among them. A hand-
-#: picked list is exactly the shape this workstream keeps finding, so the list
-#: is now GitHub's own documented set of default environment variables, in full.
+#: The list is GitHub's own documented set of default environment variables, in
+#: full, rather than a hand-picked subset: an eleven-name selection omitted
+#: `GITHUB_WORKFLOW_REF`, which GitHub documents as a default and which
+#: identifies the workflow file uniquely.
 #: It still cannot be complete in principle: a step may branch on anything the
 #: job's `env:` supplies, or on a variable an action exported. That is why
 #: `authenticode_body_env_violations` -- which rejects ANY read of the
@@ -3194,8 +3185,8 @@ AUTHENTICODE_STEP_ENV = {
     "GITHUB_EVENT_PATH": "",
     "GITHUB_GRAPHQL_URL": "https://api.github.com/graphql",
     "GITHUB_HEAD_REF": "",
-    # Round 13d named this one: a branch that exits only when GITHUB_JOB is
-    # app-bundle-windows runs everywhere else and skips the gate where it counts.
+    # A branch that exits only when GITHUB_JOB is app-bundle-windows runs
+    # everywhere else and skips the gate where it counts.
     "GITHUB_JOB": "app-bundle-windows",
     "GITHUB_OUTPUT": "",
     "GITHUB_PATH": "",
@@ -3216,7 +3207,6 @@ AUTHENTICODE_STEP_ENV = {
     "GITHUB_STEP_SUMMARY": "",
     "GITHUB_TRIGGERING_ACTOR": "github-actions[bot]",
     "GITHUB_WORKFLOW": "release",
-    # Round 13e, new finding 3, by name.
     "GITHUB_WORKFLOW_REF": "7xuanlu/wenlan/.github/workflows/release.yml@refs/tags/v9.9.9",
     "GITHUB_WORKFLOW_SHA": "0" * 40,
     "GITHUB_WORKSPACE": "",
@@ -3249,16 +3239,12 @@ def _powershell() -> str | None:
 #: "probe-failed" the probe did not answer. PowerShell could not be started, or
 #:                it died on its own, or it printed something this cannot parse.
 #:
-#: Round 13e, new finding 4: the first three were read off the EXIT STATUS
-#: alone, so every way the probe could blow up with status 2 -- a PowerShell
-#: that refused the command line, a host policy that killed it, a syntax error
-#: introduced by an edit to the probe text below -- arrived here spelled
-#: "no-support", the one answer that is allowed to excuse an unmeasured row.
-#: A failed measurement wearing an incapacity's name is this workstream's
-#: signature defect, sitting in the predicate written to decide when a failed
-#: measurement may be excused. So the probe now PRINTS which arm it took, the
-#: status and the token have to agree, and anything else is `probe-failed`,
-#: which is a failure and never an excuse.
+#: Read off the EXIT STATUS alone, every way the probe can blow up with status
+#: 2 -- a PowerShell that refused the command line, a host policy that killed
+#: it, a syntax error in the probe text below -- arrives here spelled
+#: "no-support", the one answer allowed to excuse an unmeasured row. So the
+#: probe PRINTS which arm it took, the status and the token have to agree, and
+#: anything else is `probe-failed`, which is a failure and never an excuse.
 #:
 #: The third element is the publisher when the capability is "fixture", and the
 #: reason it could not answer when it is "probe-failed".
@@ -3363,13 +3349,12 @@ def _authenticode_hashed_byte(data: bytes) -> tuple[int | None, str]:
 def _signed_fixture(shell: str, work: str) -> FixtureResult:
     """A real Authenticode-signed binary on this host, its publisher, and why not.
 
-    Round 13c asked for a capability predicate and got `os.name == "nt"`, which
-    round 13d correctly called an OS proxy wearing a capability's name: it says
-    where the code is running, not what the host can do. It was propped up by a
-    probe that looked at three hard-coded paths, so "no signed binary on this
-    host" really meant "not one of these three files".
+    `os.name == "nt"` is an OS proxy wearing a capability's name: it says where
+    the code is running, not what the host can do. A probe that looks at three
+    hard-coded paths is the matching half, where "no signed binary on this host"
+    means "not one of these three files".
 
-    Both halves are replaced here. The probe SEARCHES the system binary
+    So the probe SEARCHES the system binary
     directories instead of naming files, and it distinguishes its two negative
     answers, which is the whole tri-state discipline applied to the capability
     question itself: a cmdlet that cannot run on this platform is an incapacity;
@@ -3512,7 +3497,7 @@ class AuthenticodeRun(NamedTuple):
     #: Why the unchecked rows went unchecked, as a HOST capability rather than
     #: an operating system: "fixture" (all rows buildable), "no-shell",
     #: "no-support" (a real incapacity), or "none-found" (a broken probe or
-    #: trust store, which is a failure anywhere). Round 13d.
+    #: trust store, which is a failure anywhere).
     capability: str = "fixture"
 
 
@@ -3532,7 +3517,7 @@ def authenticode_behaviour_violations(release: str) -> AuthenticodeRun:
     ships an unsigned installer -- the exact defect class this workstream exists
     to catch, in the gate that is supposed to catch it.
 
-    Coverage degrades by ROW, not all-or-nothing (round 13b, finding 1). The
+    Coverage degrades by ROW, not all-or-nothing. The
     `missing` row needs no Authenticode at all -- the step throws on Test-Path
     before it reaches the cmdlet -- so it runs anywhere pwsh exists, including
     the Ubuntu lane that actually runs this suite in CI, and it is the row that
@@ -3585,12 +3570,11 @@ def authenticode_behaviour_violations(release: str) -> AuthenticodeRun:
                     data[offset] ^= 0xFF
                     # Ask Authenticode about the fixture BEFORE the step does.
                     #
-                    # This check used to be `data[offset] != was` after
-                    # `data[offset] ^= 0xFF` -- true by arithmetic, and item
-                    # assignment cannot change a bytearray's length either. A
-                    # control that cannot fail, sitting inside the fixture
-                    # builder for the row whose whole purpose is to enforce
-                    # that controls can fail.
+                    # Not `data[offset] != was` after `data[offset] ^= 0xFF`:
+                    # that is true by arithmetic, and item assignment cannot
+                    # change a bytearray's length either. A control that cannot
+                    # fail, sitting inside the fixture builder for the row whose
+                    # whole purpose is to enforce that controls can fail.
                     #
                     # What can actually go wrong is that the chosen byte turns
                     # out not to be covered by the signature. Then the step
@@ -3742,9 +3726,9 @@ def _contrary_step_env() -> dict[str, str]:
 def authenticode_environment_invariance(release: str) -> InvarianceRun:
     """The step's outcome may not depend on the environment. A property, run.
 
-    Round 13e reopened finding 1 and new finding 3. Everything guarding this
-    until now was LEXICAL: `authenticode_body_env_violations` blanks the one
-    permitted read and rejects the surviving token `env`, case-insensitively,
+    Every other guard on this is LEXICAL: `authenticode_body_env_violations`
+    blanks the one permitted read and rejects the surviving token `env`,
+    case-insensitively,
     which is a good net and still only a net. PowerShell can assemble the drive
     name at runtime --
 
@@ -3826,12 +3810,12 @@ def authenticode_environment_invariance(release: str) -> InvarianceRun:
 # Columns: the shipped text, its replacement, the truth-table rows that can
 # catch the replacement, and why it matters.
 #
-# The catcher sets are the whole point of round 13b, finding 1. Coverage here is
-# host-dependent -- the four signature-state rows need an Authenticode-signed
-# file, which Ubuntu does not have -- and the previous shape skipped ALL of the
-# mutations whenever ANY row was unavailable, then printed PASS. Naming the
-# catchers per mutation means the rows that DID run still have to earn their
-# keep, and the rest are reported UNCHECKED by name rather than passed over.
+# The catcher sets exist because coverage here is host-dependent: the four
+# signature-state rows need an Authenticode-signed file, which Ubuntu does not
+# have, and skipping ALL of the mutations whenever ANY row is unavailable prints
+# PASS over nothing. Naming the catchers per mutation means the rows that DID
+# run still have to earn their keep, and the rest are reported UNCHECKED by name
+# rather than passed over.
 #
 # The first mutation is the one that matters on a fixture-free host: `exit 0`
 # above `$ErrorActionPreference` reaches nothing at all, so even the `missing`
@@ -4792,11 +4776,10 @@ def main() -> None:
             "                credential=ok\n",
             "a 200 that does not parse being its own state, not a success",
         ),
-        # THE SHAPE ASSERTION. Reverting it to the expression that shipped
-        # is the mutation the old control could not catch: that control fed
-        # HTML, which fails at the parser either way. The rows added beside
-        # it feed valid JSON that is not a list -- {} , a string, a number --
-        # which is exactly what the old expression waved through.
+        # THE SHAPE ASSERTION. A control that feeds HTML cannot catch this
+        # revert -- HTML fails at the parser either way. The rows beside it feed
+        # valid JSON that is not a list -- {}, a string, a number -- which is
+        # exactly what the reverted expression waves through.
         (
             '                    if type == "array" then length\n'
             '                    elif type == "object" then\n'
@@ -4813,10 +4796,10 @@ def main() -> None:
             '              if [[ "$real" == "1" ]]; then',
             "the control probe that makes a filtered read a measurement",
         ),
-        # ROUND 5. The two halves of the transfer status, mutated back to the
-        # `|| true` that stood here: a curl whose status nobody reads makes an
-        # incomplete response indistinguishable from a complete one, at the
-        # credential and at each slug probe.
+        # The two halves of the transfer status, mutated back to `|| true`: a
+        # curl whose status nobody reads makes an incomplete response
+        # indistinguishable from a complete one, at the credential and at each
+        # slug probe.
         (
             "          if (( curl_rc != 0 )); then\n",
             "          if false; then\n",
@@ -4850,13 +4833,11 @@ def main() -> None:
             '          echo "  SIGNPATH_PROJECT_SLUG: validated against the SignPath API"',
             "the summary being derived from what the run measured",
         ),
-        # ---- ROUND 7. The three slug-arm remedies, each reverted on its own.
+        # ---- the three slug-arm remedies, each reverted on its own ----
         #
-        # Every one of these left the whole table above green, which is why the
-        # four rows at the bottom of it exist. Reverted SEPARATELY and not as a
-        # block: a single mutation that undoes all three would be caught by the
-        # first rule it happens to trip and would say nothing about the other
-        # two.
+        # SEPARATELY and not as a block: a single mutation that undoes all three
+        # is caught by the first rule it happens to trip and says nothing about
+        # the other two.
         #
         # The rotation, back to the fixed impossible prefix. The control then
         # differs from the configured slug in length, in content and in
@@ -5087,12 +5068,11 @@ def main() -> None:
         # the line says so in the log the reviewer reads.
         for line in auth_unchecked:
             print(f"UNCHECKED: Authenticode step: {line}")
-        # Round 13c asked for a capability predicate; round 13c shipped
-        # `os.name == "nt"`, and round 13d called that what it was -- an OS
-        # proxy. The question is not which OS this is. It is whether the host
-        # COULD have measured what it did not measure, and the probe now answers
-        # that directly: "no-support" means Get-AuthenticodeSignature does not
-        # work here at all, which is a real incapacity on Linux and macOS;
+        # `os.name == "nt"` is an OS proxy, not a capability predicate. The
+        # question is not which OS this is; it is whether the host COULD have
+        # measured what it did not measure, which the probe answers directly:
+        # "no-support" means Get-AuthenticodeSignature does not work here at
+        # all, which is a real incapacity on Linux and macOS;
         # "none-found" means it works and a search of the system binary
         # directories still produced nothing signed, which is a broken probe or
         # a broken trust store on ANY operating system, and never a reason to
