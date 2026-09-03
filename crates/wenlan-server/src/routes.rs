@@ -617,7 +617,7 @@ pub async fn handle_distill(
                         "force": true,
                         "page_id": page_id,
                         "updated": false,
-                        "hint": "force rebuild needs an LLM in the daemon — install an on-device model or set an Anthropic key via `wenlan setup` / `/origin:doctor`",
+                        "hint": "force rebuild needs an LLM in the daemon — install an on-device model or set an Anthropic key via `wenlan setup` / `/wenlan:setup`",
                     })));
                 }
                 db.clear_user_edited(page_id)
@@ -870,12 +870,21 @@ pub async fn handle_distill(
     });
     if no_clusters_and_no_pages {
         if let serde_json::Value::Object(ref mut map) = response {
-            map.insert(
-                "hint".into(),
-                serde_json::json!(
-                    "No page-sized cluster formed in this scope: nothing grouped into 3 or more related memories that fit one page. Capture more related memories, or check the daemon log for dropped clusters."
-                ),
-            );
+            // Distinguish "nothing to synthesize" from "nothing CAN
+            // synthesize" -- on a fresh install with no on-device model or
+            // API key configured, telling the user to capture more memories
+            // sends them the wrong way.
+            let prefer_llm = api_llm.as_ref().or(llm.as_ref());
+            let model_available = prefer_llm
+                .as_ref()
+                .map(|provider| provider.is_available())
+                .unwrap_or(false);
+            let hint = if model_available {
+                "No page-sized cluster formed in this scope: nothing grouped into 3 or more related memories that fit one page. Capture more related memories, or check the daemon log for dropped clusters."
+            } else {
+                "No synthesis model is configured or reachable: install an on-device model or set an Anthropic key via `wenlan setup` / `/wenlan:setup` before distilling."
+            };
+            map.insert("hint".into(), serde_json::json!(hint));
         }
     }
     Ok(Json(response))
@@ -944,7 +953,7 @@ pub async fn handle_redistill(
         Ok(Json(serde_json::json!({
             "status": "skipped",
             "updated": false,
-            "hint": "page re-distill needs an LLM in the daemon — install an on-device model or set an Anthropic key via `wenlan setup` / `/origin:doctor`",
+            "hint": "page re-distill needs an LLM in the daemon — install an on-device model or set an Anthropic key via `wenlan setup` / `/wenlan:setup`",
         })))
     }
 }
@@ -1788,6 +1797,48 @@ mod distill_sweep_route_tests {
             db.count().await.unwrap(),
         );
         assert_eq!(after, before, "sweep route must not write rows");
+    }
+
+    #[tokio::test]
+    async fn distill_with_no_model_and_no_clusters_hints_at_model_setup_not_more_memories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let emitter: Arc<dyn wenlan_core::events::EventEmitter> =
+            Arc::new(wenlan_core::events::NoopEmitter);
+        let db = Arc::new(
+            wenlan_core::db::MemoryDB::new(tmp.path(), emitter)
+                .await
+                .expect("MemoryDB::new"),
+        );
+        // Fresh DB, no memories, and (via `..Default::default()`) no llm/api_llm
+        // configured -- the fresh-install case the hint must diagnose correctly.
+        let state = Arc::new(RwLock::new(ServerState {
+            db: Some(db),
+            ..Default::default()
+        }));
+        let app = crate::router::build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/distill")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let hint = payload["hint"].as_str().expect("hint present");
+        assert!(
+            hint.contains("wenlan setup"),
+            "with no model configured, the hint should point at setup, not more memories: {hint}"
+        );
+        assert!(!hint.contains("Capture more related memories"));
     }
 
     #[tokio::test]

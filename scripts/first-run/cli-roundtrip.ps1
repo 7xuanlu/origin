@@ -25,8 +25,8 @@ $bin = $env:WENLAN_BIN
 $sentinel = "kumquat-lighthouse-8231"
 
 Write-Host "==> wenlan status"
-# `status --format json` prints {"status":"unreachable"} with exit 0 when the
-# daemon is down, so require the health payload's version field, not just rc=0.
+# `status --format json` now exits non-zero when the daemon is unreachable,
+# but check the health payload's version field too, not just rc=0.
 Check -Name "cli-status" -Expect '"version"' -Script { & $bin --format json status }
 
 Write-Host "==> wenlan capture (sentinel)"

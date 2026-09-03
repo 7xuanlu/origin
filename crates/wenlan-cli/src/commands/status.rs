@@ -10,6 +10,9 @@ use crate::output::{print_json, ResolvedFormat};
 /// `format` is the resolved output format (Auto already collapsed in main).
 /// `quiet` suppresses success output; errors still propagate via `?` to stderr.
 /// We still hit the daemon under `quiet` to surface connection failures via exit code.
+/// The JSON branch prints the same `"status": "unreachable"` body either way,
+/// then returns the connect error so the process exits non-zero like every
+/// other command does on a connect failure.
 pub async fn run(client: &WenlanClient, format: ResolvedFormat, quiet: bool) -> Result<()> {
     if quiet {
         let _health = client.health().await?;
@@ -26,6 +29,9 @@ pub async fn run(client: &WenlanClient, format: ResolvedFormat, quiet: bool) -> 
                     "error": format!("{err:#}"),
                 });
                 print_json(&status)?;
+                // Print the JSON scripts parse, but still exit non-zero like
+                // every other command does on a connect failure.
+                return Err(err);
             }
         },
         ResolvedFormat::Table => {
