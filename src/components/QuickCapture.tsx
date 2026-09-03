@@ -3,6 +3,7 @@ import { useState, useRef, useEffect } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { quickCapture } from "../lib/tauri";
+import { cssWindowShadowInset, needsCssWindowShadow } from "../lib/windowChrome";
 
 interface QuickCaptureProps {
   isOpen: boolean;
@@ -95,6 +96,12 @@ export default function QuickCapture({ isOpen, onClose, standalone }: QuickCaptu
         ? "var(--mem-accent-indigo)"
         : "var(--mem-border)";
 
+  // The modal is unconditional; only the standalone window asks the platform.
+  // `needsCssWindowShadow` reads the three-valued `hostPlatform()` and applies
+  // the documented visual default for `unknown` at its own named site, so the
+  // answer here is always a decided one.
+  const paintsOwnShadow = !standalone || needsCssWindowShadow();
+
   const card = (
     <div
       className="flex-1 flex flex-col overflow-hidden rounded-xl"
@@ -102,9 +109,20 @@ export default function QuickCapture({ isOpen, onClose, standalone }: QuickCaptu
         backgroundColor: "var(--mem-surface)",
         border: "1px solid var(--mem-border)",
         borderColor: borderAccent,
-        boxShadow: !isEmpty && !saved
-          ? "0 0 20px var(--mem-shimmer-color), 0 8px 32px rgba(0,0,0,0.25)"
-          : "0 8px 32px rgba(0,0,0,0.25)",
+        // The modal always keeps its shadow: it floats over the app, on an
+        // opaque backdrop with room around it. The standalone window IS the
+        // card, so whether the shadow can be drawn at all is a platform
+        // question -- see `needsCssWindowShadow`. On macOS the NSWindow has
+        // `setHasShadow: NO`, so this shadow is the only thing lifting the card
+        // off the desktop and it must stay. On a Windows/Linux layered window
+        // the same shadow composites as a flat grey band, so it goes; state is
+        // still carried by `borderAccent`, the header dot and label, and the
+        // Save button, all of which paint inside the card's opaque surface.
+        boxShadow: !paintsOwnShadow
+          ? "none"
+          : !isEmpty && !saved
+            ? "0 0 20px var(--mem-shimmer-color), 0 8px 32px rgba(0,0,0,0.25)"
+            : "0 8px 32px rgba(0,0,0,0.25)",
         transition: "border-color 0.3s ease, box-shadow 0.3s ease",
       }}
     >
@@ -237,8 +255,16 @@ export default function QuickCapture({ isOpen, onClose, standalone }: QuickCaptu
   );
 
   if (standalone) {
+    // The inset exists only to give the shadow somewhere to render. Where no
+    // shadow is drawn it is a transparent margin the compositor fills with a
+    // halo instead, so it collapses to 0 on exactly the platforms that skip the
+    // shadow. Corners stay rounded either way -- the few pixels outside the
+    // radius are the only transparency left when the inset is gone.
     return (
-      <div className="w-full h-screen p-[12px] flex flex-col" style={{ background: "transparent" }}>
+      <div
+        className="w-full h-screen flex flex-col"
+        style={{ background: "transparent", padding: cssWindowShadowInset() }}
+      >
         {card}
       </div>
     );
