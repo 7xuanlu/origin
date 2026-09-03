@@ -97,25 +97,16 @@ fn missing_profile_root_message(root: ProfileRoot) -> String {
 /// Turn a *measurement* of an OS profile root into a path, or fail loudly.
 ///
 /// `None` here does not mean "there is no such directory". It means the OS
-/// could not tell us where the profile is — a failed measurement. It used to be
-/// spent as `PathBuf::from(".")`, a perfectly writable relative path, which is
-/// the same failed-measurement-as-a-value defect this module exists to remove:
-/// the app would go on to create `./wenlan/` — or fail to — in whatever
-/// directory it was launched from, and nothing anywhere would say why.
-///
-/// `dirs` returning `None` on a real desktop OS is close to impossible, and
-/// that is the argument *for* stopping rather than relocating: if it ever does
-/// happen, something is wrong that the user has to be told about, and a
-/// wrong-but-writable path is exactly what hides it.
+/// could not tell us where the profile is — a failed measurement. Spending it
+/// as a relative path (`.`) is writable, so the app would create `./wenlan/`
+/// in whatever directory it was launched from with nothing naming the cause.
 ///
 /// This aborts rather than returning an error because there is nothing to
-/// return it to. `app_data_dir() -> PathBuf` and `home_base() -> PathBuf` are
-/// consumed by `config`, `activity`, `presence`, `search`, `sources::uploads`,
-/// `remote_access`, `lifecycle` and `daemon_start`, none of which has a
-/// recovery for "no profile exists"; every one of them is on its way to open or
-/// create a file under the root it is asking for. Threading a `Result` through
-/// all of them would move the same unanswerable question further out, not
-/// answer it.
+/// return it to: `app_data_dir()` and `home_base()` return `PathBuf`, and every
+/// caller (`config`, `activity`, `presence`, `search`, `sources::uploads`,
+/// `remote_access`, `lifecycle`, `daemon_start`) is on its way to open or
+/// create a file under the root it is asking for, with no recovery for "no
+/// profile exists".
 fn resolve_profile_root(measured: Option<PathBuf>, root: ProfileRoot) -> PathBuf {
     match measured {
         Some(path) => path,
@@ -250,44 +241,15 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
-    struct EnvGuard {
-        home: Option<std::ffi::OsString>,
-        wenlan: Option<std::ffi::OsString>,
-        origin: Option<std::ffi::OsString>,
-    }
+    use crate::test_env::EnvGuard;
 
-    impl EnvGuard {
-        fn capture() -> Self {
-            Self {
-                home: std::env::var_os("HOME"),
-                wenlan: std::env::var_os("WENLAN_DATA_DIR"),
-                origin: std::env::var_os("ORIGIN_DATA_DIR"),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match &self.wenlan {
-                Some(value) => std::env::set_var("WENLAN_DATA_DIR", value),
-                None => std::env::remove_var("WENLAN_DATA_DIR"),
-            }
-            match &self.origin {
-                Some(value) => std::env::set_var("ORIGIN_DATA_DIR", value),
-                None => std::env::remove_var("ORIGIN_DATA_DIR"),
-            }
-        }
-    }
+    const IDENTITY_ENV_KEYS: &[&str] = &["HOME", "WENLAN_DATA_DIR", "ORIGIN_DATA_DIR"];
 
     #[test]
     #[serial_test::serial]
     fn app_data_dir_prefers_wenlan_env() {
         let _guard = env_lock();
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(IDENTITY_ENV_KEYS);
         std::env::set_var("WENLAN_DATA_DIR", "/tmp/wenlan-app-test");
         std::env::set_var("ORIGIN_DATA_DIR", "/tmp/origin-app-test");
         assert_eq!(app_data_dir(), PathBuf::from("/tmp/wenlan-app-test"));
@@ -297,7 +259,7 @@ mod tests {
     #[serial_test::serial]
     fn app_data_dir_falls_back_to_origin_env() {
         let _guard = env_lock();
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(IDENTITY_ENV_KEYS);
         std::env::remove_var("WENLAN_DATA_DIR");
         std::env::set_var("ORIGIN_DATA_DIR", "/tmp/origin-app-test");
         assert_eq!(app_data_dir(), PathBuf::from("/tmp/origin-app-test"));
@@ -307,7 +269,7 @@ mod tests {
     #[serial_test::serial]
     fn sidecar_env_exports_selected_app_data_dir_as_wenlan_data_dir() {
         let _guard = env_lock();
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(IDENTITY_ENV_KEYS);
         std::env::remove_var("WENLAN_DATA_DIR");
         std::env::set_var("ORIGIN_DATA_DIR", "/tmp/origin-app-test");
 
@@ -317,64 +279,67 @@ mod tests {
         assert_eq!(value, PathBuf::from("/tmp/origin-app-test"));
     }
 
-    #[test]
-    fn app_data_dir_uses_legacy_default_when_current_absent_and_legacy_has_config() {
-        let tmp = tempfile::tempdir().unwrap();
-        let legacy = tmp.path().join("origin");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("config.json"), "{}").unwrap();
-        assert_eq!(app_data_dir_for_base(tmp.path()), legacy);
+    /// Stage a root: `None` leaves the directory absent, `Some(entries)`
+    /// creates it and then each entry — a trailing `/` makes it a directory,
+    /// anything else an empty-ish file.
+    fn stage_root(root: &std::path::Path, entries: Option<&[&str]>) {
+        let Some(entries) = entries else { return };
+        std::fs::create_dir_all(root).unwrap();
+        for entry in entries {
+            match entry.strip_suffix('/') {
+                Some(dir) => std::fs::create_dir_all(root.join(dir)).unwrap(),
+                None => std::fs::write(root.join(entry), "{}").unwrap(),
+            }
+        }
     }
 
     #[test]
-    fn app_data_dir_uses_legacy_default_when_current_empty_and_legacy_has_config() {
-        let tmp = tempfile::tempdir().unwrap();
-        let current = tmp.path().join("wenlan");
-        let legacy = tmp.path().join("origin");
-        std::fs::create_dir_all(&current).unwrap();
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("config.json"), "{}").unwrap();
-        assert_eq!(app_data_dir_for_base(tmp.path()), legacy);
-    }
+    fn app_data_dir_picks_the_root_that_holds_app_state() {
+        // (case, `wenlan` root, `origin` root, the root that must win)
+        let cases: [(&str, Option<&[&str]>, Option<&[&str]>, &str); 6] = [
+            (
+                "current absent, legacy config",
+                None,
+                Some(&["config.json"]),
+                "origin",
+            ),
+            (
+                "current empty, legacy config",
+                Some(&[]),
+                Some(&["config.json"]),
+                "origin",
+            ),
+            (
+                "current empty, legacy activities",
+                Some(&[]),
+                Some(&["activities.json"]),
+                "origin",
+            ),
+            (
+                "current empty, legacy avatars dir",
+                Some(&[]),
+                Some(&["avatars/"]),
+                "origin",
+            ),
+            (
+                "both carry state — current wins",
+                Some(&["config.json"]),
+                Some(&["config.json"]),
+                "wenlan",
+            ),
+            ("neither exists", None, None, "wenlan"),
+        ];
 
-    #[test]
-    fn app_data_dir_uses_legacy_default_when_current_empty_and_legacy_has_activities() {
-        let tmp = tempfile::tempdir().unwrap();
-        let current = tmp.path().join("wenlan");
-        let legacy = tmp.path().join("origin");
-        std::fs::create_dir_all(&current).unwrap();
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("activities.json"), "[]").unwrap();
-        assert_eq!(app_data_dir_for_base(tmp.path()), legacy);
-    }
-
-    #[test]
-    fn app_data_dir_uses_legacy_default_when_current_empty_and_legacy_has_avatars() {
-        let tmp = tempfile::tempdir().unwrap();
-        let current = tmp.path().join("wenlan");
-        let legacy = tmp.path().join("origin");
-        std::fs::create_dir_all(&current).unwrap();
-        std::fs::create_dir_all(legacy.join("avatars")).unwrap();
-
-        assert_eq!(app_data_dir_for_base(tmp.path()), legacy);
-    }
-
-    #[test]
-    fn app_data_dir_uses_wenlan_default_when_current_has_app_state() {
-        let tmp = tempfile::tempdir().unwrap();
-        let current = tmp.path().join("wenlan");
-        let legacy = tmp.path().join("origin");
-        std::fs::create_dir_all(&current).unwrap();
-        std::fs::write(current.join("config.json"), "{}").unwrap();
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("config.json"), "{}").unwrap();
-        assert_eq!(app_data_dir_for_base(tmp.path()), current);
-    }
-
-    #[test]
-    fn app_data_dir_uses_wenlan_default_when_neither_exists() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(app_data_dir_for_base(tmp.path()), tmp.path().join("wenlan"));
+        for (case, current, legacy, expected) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            stage_root(&tmp.path().join("wenlan"), current);
+            stage_root(&tmp.path().join("origin"), legacy);
+            assert_eq!(
+                app_data_dir_for_base(tmp.path()),
+                tmp.path().join(expected),
+                "{case}"
+            );
+        }
     }
 
     // ── An unresolvable profile root ────────────────────────────────────

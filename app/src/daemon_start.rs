@@ -317,12 +317,8 @@ pub fn sidecar_job_binding() -> Option<JobBinding> {
 /// a job object: an error must land on `Unbound` carrying its reason, never
 /// on a silent success.
 ///
-/// Compiled on every platform rather than put behind `cfg(windows)` with its
-/// caller, because the unit tests below are the only thing holding this
-/// mapping to that rule and they should run in every lane -- not just the one
-/// lane that happens to be Windows. Only the call site in
-/// `spawn_daemon_sidecar` is Windows-only, which is what makes this dead code
-/// on the Linux clippy lane and nowhere else.
+/// Compiled on every platform, not behind `cfg(windows)` with its Windows-only
+/// call site, so the unit tests that hold this mapping run in every lane.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn job_binding_for(bind_result: Result<(), String>) -> JobBinding {
     match bind_result {
@@ -524,13 +520,11 @@ fn forget_sidecar(generation: u64) {
 /// pid safe: a pid whose occupant started at a different time is a different
 /// process and is left alone.
 ///
-/// Round 3: this used to return `()`. Every step inside it could fail —
-/// an identity that was never captured, a `kill_if_still_running` whose bool
-/// nobody read, a `child.kill()` that errored — and the function returned the
-/// same nothing in all of them, which is what made
-/// `docs/cross-platform.md`'s "every exit path that runs app code still ends
-/// the daemon" unfalsifiable. It now returns a [`SidecarStopOutcome`] its
-/// callers branch on, and the last one is readable on the diagnostics wire.
+/// Returns a [`SidecarStopOutcome`] rather than `()`, because every step
+/// inside can fail — an identity that was never captured, a
+/// `kill_if_still_running` whose bool nobody read, a `child.kill()` that
+/// errored — and a `()` makes them indistinguishable. Callers branch on it,
+/// and the last one is readable on the diagnostics wire.
 pub async fn stop_sidecar() -> SidecarStopOutcome {
     let outcome = stop_sidecar_inner().await;
     let mut last = LAST_SIDECAR_STOP
@@ -573,12 +567,11 @@ fn next_recorded_stop(
 }
 
 async fn stop_sidecar_inner() -> SidecarStopOutcome {
-    // Read the slot, do not empty it. Round 3 (defect 1): this used to `take()`
-    // before anything was known, so a stop that failed dropped the identity a
-    // retry needs, made `sidecar_job_binding()` answer `None` while a daemon
-    // was still holding the port, and turned the next `stop_sidecar()` into
-    // `NoSidecar`. The record leaves the slot in exactly one place — after
-    // `Ended` — and nowhere else.
+    // Read the slot, do not empty it. A `take()` before anything is known
+    // drops the identity a retry needs, makes `sidecar_job_binding()` answer
+    // `None` while a daemon still holds the port, and turns the next
+    // `stop_sidecar()` into `NoSidecar`. The record leaves the slot in exactly
+    // one place — after `Ended` — and nowhere else.
     //
     // The guard is dropped before the awaits below (repo invariant: never hold
     // a lock across `.await`); `identity` and `job_binding` are cheap copies
@@ -711,15 +704,12 @@ async fn stop_outcome_after_reap(
 /// presence read says `Unknown` for the same underlying reason: they are the
 /// same failure seen twice, and the reason string names it.
 ///
-/// Round 3 re-examined whether [`KillAttempt`]'s `Failed` and
-/// `RefusedUnidentified` lose anything a caller would act on, and they do not.
-/// `Failed` and `RefusedUnidentified` differ only in the reason string on the
-/// same `StillRunning`; `Unknown` beside `Failed` is unreachable, because
-/// `kill_if_still_running` can only answer `Failed` from a `Running` reading,
-/// which requires the start time `Unknown` says was never captured; and every
-/// caller — quit, SIGTERM, the launchd handover — branches on the
-/// [`SidecarStopOutcome`] arm, never on why the kill did not land. No state was
-/// added for a distinction nobody consumes.
+/// [`KillAttempt`]'s `Failed` and `RefusedUnidentified` differ only in the
+/// reason string on the same `StillRunning`, and `Unknown` beside `Failed` is
+/// unreachable (`kill_if_still_running` can only answer `Failed` from a
+/// `Running` reading, which requires the start time `Unknown` says was never
+/// captured). Every caller — quit, SIGTERM, the launchd handover — branches on
+/// the [`SidecarStopOutcome`] arm, never on why the kill did not land.
 fn stop_outcome_for(
     presence: ProcessPresence,
     kill_attempt: Option<KillAttempt>,
