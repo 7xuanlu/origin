@@ -461,6 +461,68 @@ describe("host-process.sh: listener_pid_for_port is tri-state", () => {
   // THE case. A probe that cannot run must never be indistinguishable from
   // "port free" — that is what the old `command -v lsof || fail` gate existed
   // to prevent, and collapsing it is how a port-conflict bug ships.
+  // An argument that is not a port reached the ledger as a measured negative:
+  // `port-precheck.sh notaport` wrote `PASS ... measured free` and exited 0
+  // about a port nothing looked at. The probe's three states were all intact;
+  // the input was never checked to be a question it could answer.
+  it.each([
+    ["a word", "notaport"],
+    ["empty", ""],
+    ["zero", "0"],
+    ["above the 16-bit range", "65536"],
+    ["negative", "-1"],
+    ["a port with trailing text", "17931x"],
+    ["a float", "17931.0"],
+    // The first cut of the guard accepted these two and then looked the port
+    // up with the raw argument, so a BUSY port came back "measured free":
+    //     135 -> rc=0 found pid 1576, 0000000135 -> rc=1 measured free.
+    // A normalisation applied to the range check and not to the lookup.
+    ["a zero-padded port", "0000000135"],
+    ["a single leading zero", "017931"],
+    // Long enough to overflow 64-bit arithmetic, which is what the `10#`
+    // normalisation this replaced would have had to survive.
+    ["a 23-digit number", "99999999999999999999999"],
+    ["hex", "0x50"],
+    ["scientific notation", "1e3"],
+    ["a leading space", " 17931"],
+    ["a trailing space", "17931 "],
+  ])("reports COULD NOT MEASURE for %s, never a free port", (_label, arg) => {
+    const result = runDriver(["listener", arg], {
+      // A table in which the port genuinely IS free, so "rc=1" would be the
+      // answer if the argument were merely absent from it. The point is that
+      // the probe must refuse the question rather than answer it.
+      shims: [shim("netstat", netstatTable([listeningRow(17999, "4242")]))],
+    });
+    expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
+  });
+
+  // Not "it returns 2" but "it does not answer FREE about a port that is
+  // held". Run against a table where 135 has a listener, the old guard
+  // answered rc=1 for the padded spelling of that same port.
+  it("never reports a HELD port as free, however the port is spelled", () => {
+    for (const arg of ["0000000135", "000135", "0135"]) {
+      const result = runDriver(["listener", arg], {
+        shims: [shim("netstat", netstatTable([listeningRow(135, "1576")]))],
+      });
+      expect(result.stdout.trim(), `${arg}: ${result.stderr}`).not.toBe("rc=1 out=");
+      expect(result.stdout.trim(), `${arg}: ${result.stderr}`).toBe("rc=2 out=");
+    }
+    // The control: the same table, the plain spelling, genuinely found.
+    const plain = runDriver(["listener", "135"], {
+      shims: [shim("netstat", netstatTable([listeningRow(135, "1576")]))],
+    });
+    expect(plain.stdout.trim(), plain.stderr).toBe("rc=0 out=1576");
+  });
+
+  it("still measures a well-formed port at both ends of the range", () => {
+    for (const port of ["1", "65535"]) {
+      const result = runDriver(["listener", port], {
+        shims: [shim("netstat", netstatTable([listeningRow(Number(port), "4242")]))],
+      });
+      expect(result.stdout.trim(), result.stderr).toBe("rc=0 out=4242");
+    }
+  });
+
   it("reports COULD NOT MEASURE when the listener table command fails", () => {
     const result = runDriver(["listener", "17931"], {
       shims: [shim("netstat", "exit 1")],
