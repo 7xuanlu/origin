@@ -15,7 +15,7 @@ vi.mock("../../../../lib/tauri", () => ({
   updateAgent: vi.fn().mockResolvedValue(null),
   deleteAgent: vi.fn().mockResolvedValue(null),
   detectMcpClients: vi.fn().mockResolvedValue([]),
-  writeMcpConfig: vi.fn().mockResolvedValue(undefined),
+  writeMcpConfig: vi.fn().mockResolvedValue([]),
   installClientPlugin: vi.fn().mockResolvedValue(undefined),
   clipboardWrite: vi.fn().mockResolvedValue(undefined),
   getRemoteAccessStatus: vi.fn().mockResolvedValue({
@@ -25,7 +25,7 @@ vi.mock("../../../../lib/tauri", () => ({
   } satisfies RemoteAccessStatus),
   getWireState: vi.fn().mockResolvedValue({
     daemon: { base_url: "", reachable: true, version: null, error: null },
-    mcp_binary: { command: "", args: [], candidates: [] },
+    mcp_binary: { command: "", args: [], undetermined: [], candidates: [] },
     clients: [],
   }),
   testRemoteMcpConnection: vi.fn().mockResolvedValue({ ok: true }),

@@ -84,44 +84,15 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
-    struct EnvGuard {
-        home: Option<std::ffi::OsString>,
-        wenlan: Option<std::ffi::OsString>,
-        origin: Option<std::ffi::OsString>,
-    }
+    use crate::test_env::EnvGuard;
 
-    impl EnvGuard {
-        fn capture() -> Self {
-            Self {
-                home: std::env::var_os("HOME"),
-                wenlan: std::env::var_os("WENLAN_DATA_DIR"),
-                origin: std::env::var_os("ORIGIN_DATA_DIR"),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match &self.wenlan {
-                Some(value) => std::env::set_var("WENLAN_DATA_DIR", value),
-                None => std::env::remove_var("WENLAN_DATA_DIR"),
-            }
-            match &self.origin {
-                Some(value) => std::env::set_var("ORIGIN_DATA_DIR", value),
-                None => std::env::remove_var("ORIGIN_DATA_DIR"),
-            }
-        }
-    }
+    const ACTIVITY_ENV_KEYS: &[&str] = &["HOME", "WENLAN_DATA_DIR", "ORIGIN_DATA_DIR"];
 
     #[test]
     #[serial_test::serial]
     fn activities_path_prefers_wenlan_data_dir() {
         let _guard = env_lock();
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(ACTIVITY_ENV_KEYS);
         let current = tempfile::tempdir().unwrap();
         let legacy = tempfile::tempdir().unwrap();
         std::env::set_var("WENLAN_DATA_DIR", current.path());

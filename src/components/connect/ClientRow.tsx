@@ -2,6 +2,7 @@
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import type { McpClient } from "../../lib/tauri";
+import type { Reading } from "../../lib/reading";
 import { StatusChip } from "../memory/settings/primitives";
 
 interface ClientRowProps {
@@ -21,9 +22,22 @@ interface ClientRowProps {
    *  reason. */
   children?: ReactNode;
   error?: string | null;
-  /** Renders a StatusChip (`state: {kind: "up"}`, honest because
-   *  `already_configured` came from actually parsing the config file). */
-  configured: boolean;
+  /** Non-fatal, and rendered in the BODY the row's `descId` covers, so a
+   *  caller can point its button's `aria-describedby` at it.
+   *
+   *  This is where a stated unknown goes: "the plugin state could not be read,
+   *  so setting up now may register Wenlan twice" (round 6, D6a), and "the
+   *  entry was written, but one resolver input could not be determined"
+   *  (D3's boundary). Neither is an error — nothing failed — and neither may
+   *  be silent, which is the only other thing this row used to be able to do
+   *  with them. */
+  warning?: string | null;
+  /** Three-valued — see [`Reading`]. A measured `yes` renders the "up"
+   *  StatusChip (honest: it came from actually parsing the config file), a
+   *  failed read renders an "unknown" chip, and a measured `no` renders
+   *  nothing. It used to be a boolean, so "we could not read the config" and
+   *  "the config has no Wenlan entry" rendered identically — as nothing. */
+  configured: Reading;
   /** Highlights the card border — wizard rows use this when their checkbox
    *  is checked. */
   selected?: boolean;
@@ -47,6 +61,7 @@ export default function ClientRow({
   trailing,
   children,
   error,
+  warning,
   configured,
   selected,
 }: ClientRowProps) {
@@ -55,7 +70,12 @@ export default function ClientRow({
   // built independently, before this component ever renders it — can wire
   // aria-describedby to the same id without a prop round-trip.
   const descId = clientRowDescId(client.client_type);
-  const hasBody = Boolean(showConfigPath || children || error);
+  // A detection that FAILED earns a line of its own. The two things this
+  // replaces both turned it into a confident negative: the wizard DROPPED
+  // any row whose `detected` was falsy, and the Settings list labelled it
+  // "Not installed".
+  const detectionFailed = client.detected.kind === "unreadable" ? client.detected.error : null;
+  const hasBody = Boolean(showConfigPath || children || error || warning || detectionFailed);
 
   const nameBadges = (
     <div className="flex items-center gap-2 flex-wrap min-w-0">
@@ -70,8 +90,17 @@ export default function ClientRow({
       >
         {client.name}
       </span>
-      {configured && (
+      {configured.kind === "yes" && (
         <StatusChip state={{ kind: "up" }} label={t("connectMatrix.configured")} />
+      )}
+      {configured.kind === "unreadable" && (
+        // A read that FAILED. Not the "up" chip (we did not see a Wenlan
+        // entry) and not silence (silence is what a measured `no` renders,
+        // and reading them the same is the whole defect).
+        <StatusChip
+          state={{ kind: "unknown", detail: configured.error }}
+          label={t("connectMatrix.configuredUnknown")}
+        />
       )}
     </div>
   );
@@ -106,7 +135,7 @@ export default function ClientRow({
             paddingLeft: leading ? "28px" : 0,
           }}
         >
-          {showConfigPath && (
+          {showConfigPath && client.config_path && (
             <p
               className="truncate"
               style={{
@@ -117,6 +146,30 @@ export default function ClientRow({
               }}
             >
               {client.config_path}
+            </p>
+          )}
+          {detectionFailed && (
+            <p
+              style={{
+                fontFamily: "var(--mem-font-body)",
+                fontSize: "var(--mem-text-xs)",
+                color: "var(--mem-status-warning-text)",
+                margin: 0,
+              }}
+            >
+              {t("connectMatrix.detectionUnknown", { error: detectionFailed })}
+            </p>
+          )}
+          {warning && (
+            <p
+              style={{
+                fontFamily: "var(--mem-font-body)",
+                fontSize: "var(--mem-text-xs)",
+                color: "var(--mem-status-warning-text)",
+                margin: 0,
+              }}
+            >
+              {warning}
             </p>
           )}
           {children}

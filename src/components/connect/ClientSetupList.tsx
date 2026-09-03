@@ -8,9 +8,11 @@ import {
   installClientPlugin,
   type McpClient,
 } from "../../lib/tauri";
+import { readingIsYes } from "../../lib/reading";
 import { isPluginClient } from "./pluginClients";
+import { unreadPluginWriteRisk } from "./setupRisk";
 import { clientTypeFamily } from "../../lib/agents";
-import ClientRow from "./ClientRow";
+import ClientRow, { clientRowDescId } from "./ClientRow";
 import { Button } from "../memory/settings/primitives";
 
 /** Apps & CLIs group. Every detected client has the same one-click "Set up" —
@@ -34,24 +36,46 @@ export default function ClientSetupList({
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState<string | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  // Non-fatal notes from a write that SUCCEEDED. Round 6, D3's boundary
+  // defect: `writeMcpConfig` now resolves with the resolver inputs it could not
+  // determine, and a success that skipped candidates it never built must not
+  // render as a plain success.
+  const [warnings, setWarnings] = useState<Record<string, string>>({});
 
   const { data: clients } = useQuery({ queryKey: ["mcp-clients"], queryFn: detectMcpClients });
   // Hide a client that is already configured (nothing left to do) OR whose
   // tool family is already connected in the roster above.
+  // `!readingIsYes`, not `!configured`: a client whose config could not be
+  // READ is still actionable — hiding it would be "nothing left to do here"
+  // stated from a look that failed. Its row carries the unknown chip.
   const actionable = (clients ?? []).filter(
     (client) =>
-      !client.already_configured &&
+      !readingIsYes(client.already_configured) &&
       !(connectedFamilies?.has(clientTypeFamily(client.client_type)) ?? false),
   );
 
   const setUp = async (clientType: string) => {
     setBusy(clientType);
     setErrors((prev) => ({ ...prev, [clientType]: "" }));
+    setWarnings((prev) => ({ ...prev, [clientType]: "" }));
     try {
       if (isPluginClient(clientType)) {
         await installClientPlugin(clientType);
       } else {
-        await writeMcpConfig(clientType);
+        const undetermined = await writeMcpConfig(clientType);
+        // An empty array is a measurement: every resolver input was read.
+        // A non-empty one is the round-5 D4 fact arriving at the pixel — the
+        // entry was written by a search that never built some of its
+        // candidates, and saying nothing would make that identical to a search
+        // that read them all.
+        if (undetermined.length > 0) {
+          setWarnings((prev) => ({
+            ...prev,
+            [clientType]: undetermined
+              .map((u) => t("connectMatrix.wroteWithUndeterminedInput", { ...u }))
+              .join(" "),
+          }));
+        }
       }
       queryClient.invalidateQueries({ queryKey: ["mcp-clients"] });
     } catch (err) {
@@ -67,20 +91,50 @@ export default function ClientSetupList({
     </span>
   );
 
-  const trailing = (client: McpClient) =>
-    client.detected ? (
+  const notChecked = (
+    <span style={{ fontFamily: "var(--mem-font-body)", fontSize: "var(--mem-text-xs)", color: "var(--mem-status-warning-text)" }}>
+      {t("connectMatrix.notChecked")}
+    </span>
+  );
+
+  // Three branches, because there are three readings. Only a MEASURED `no`
+  // says "Not installed"; a failed look says so, and still offers the button —
+  // withholding the action would be the same false negative wearing a
+  // different coat.
+  const trailing = (client: McpClient) => {
+    if (client.detected.kind === "no") return notInstalled;
+    // Round 6, D6a. A write that could produce a duplicate registration must
+    // not be offered as the SAME unqualified action a measured `no` gets. The
+    // label changes to "Set up anyway", and the button points at the body line
+    // that says what could not be read — so a screen reader hears the risk as
+    // part of the button, not several nodes away from it.
+    const duplicateRisk = unreadPluginWriteRisk(client) !== null;
+    const button = (
       <Button
         type="button"
         variant="secondary"
         size="sm"
         onClick={() => setUp(client.client_type)}
         disabled={busy === client.client_type}
+        aria-describedby={duplicateRisk ? clientRowDescId(client.client_type) : undefined}
       >
-        {busy === client.client_type ? t("connectMatrix.settingUp") : t("connectMatrix.setUp")}
+        {busy === client.client_type
+          ? t("connectMatrix.settingUp")
+          : duplicateRisk
+            ? t("connectMatrix.setUpAnyway")
+            : t("connectMatrix.setUp")}
       </Button>
-    ) : (
-      notInstalled
     );
+    if (client.detected.kind === "unreadable") {
+      return (
+        <div className="flex items-center gap-2">
+          {notChecked}
+          {button}
+        </div>
+      );
+    }
+    return button;
+  };
 
   if (clients && actionable.length === 0) {
     return (
@@ -92,15 +146,31 @@ export default function ClientSetupList({
 
   return (
     <div className="flex flex-col" style={{ gap: "8px" }}>
-      {actionable.map((client) => (
-        <ClientRow
-          key={client.client_type}
-          client={client}
-          configured={client.already_configured}
-          error={errors[client.client_type]}
-          trailing={trailing(client)}
-        />
-      ))}
+      {actionable.map((client) => {
+        const duplicateRiskError = unreadPluginWriteRisk(client);
+        return (
+          <ClientRow
+            key={client.client_type}
+            client={client}
+            configured={client.already_configured}
+            error={errors[client.client_type]}
+            warning={
+              // Two independent non-fatal notes, and they can both be live:
+              // the plugin state could not be read BEFORE the write, and the
+              // binary search skipped an input DURING it. Joined, not ranked.
+              [
+                duplicateRiskError
+                  ? t("connectMatrix.pluginStateUnknownBeforeWrite", { error: duplicateRiskError })
+                  : null,
+                warnings[client.client_type] || null,
+              ]
+                .filter(Boolean)
+                .join(" ") || null
+            }
+            trailing={trailing(client)}
+          />
+        );
+      })}
     </div>
   );
 }
