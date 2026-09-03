@@ -112,12 +112,47 @@ python scripts\ci_test_plan.test.py
 ```
 
 The Windows CI and release jobs run the same pinned Vulkan SDK setup before any
-Cargo build. The Vulkan SDK is a build-time prerequisite; end users do not need
-the SDK. Vulkan-enabled Windows executables have a process-start dependency on
-`vulkan-1.dll`, so the Windows release archive ships the verified official
-loader beside `wenlan-server.exe` and includes `VulkanRT-License.txt`. A
-driverless machine can therefore start and select CPU; actual GPU execution
-still requires a working vendor ICD from the GPU driver.
+Cargo build. **The Vulkan SDK is a build-time prerequisite, and that much is
+established:** `llama-cpp-sys-2`'s build script panics without `VULKAN_SDK`, so
+no daemon crate compiles without it, and nothing from the SDK is redistributed
+except the loader. Vulkan-enabled Windows executables have a process-start
+dependency on `vulkan-1.dll`, so the Windows release archive ships the verified
+official loader beside `wenlan-server.exe` and includes `VulkanRT-License.txt`.
+
+### What is and is not established about end-user impact
+
+**Measured.** `first-run-gauntlet.yml` downloads the published
+`wenlan-windows-x64.zip` and the published NSIS installer, runs them on a
+`windows-2025` hosted runner with no vendor GPU driver, and gets
+`/api/health` (with a version assertion), `wenlan.exe status`, and
+`wenlan.exe doctor`. Process start and the HTTP surface therefore work without
+an ICD. That is the whole of the measurement.
+
+**Unmeasured.** Whether a machine that has the loader but no vendor ICD can
+load a GGUF and complete an inference at all. The CPU plan in
+`crates/wenlan-core/src/engine.rs` is built from a live llama.cpp device list,
+and that list is only reached *after* `shared_backend()` calls
+`LlamaBackend::init()` (`engine.rs:33`). If backend init itself fails for want
+of an ICD, `shared_backend()` returns `WenlanError::Llm("backend init: …")` and
+neither the device enumeration nor the zero-GPU-layer reload is ever reached.
+No CI job loads a real GGUF on a driverless Windows runner, and `/api/health`
+answers before any model is loaded, so it cannot stand in for one. The CPU
+fallback on a driverless machine is supported by code reading, not by an
+executed gate.
+
+Do not write that users are unaffected, and do not write that they are
+affected — neither has been measured.
+
+**The gate that would settle it.** On a clean Windows VM or Windows Sandbox
+with no vendor ICD installed: install from the real signed installer or the
+release ZIP, load `Qwen3-4B-Instruct-2507-Q4_K_M.gguf`, complete one
+inference, and assert `/api/status` reports `backend` = `cpu` and
+`gpu_layers` = `0`. Until that run exists and its result is recorded in this
+section, the driverless end-user path stays unproven. GPU execution separately
+requires a working vendor ICD from the GPU driver; that part is not in
+dispute.
+
+### CI and release loader staging
 
 GitHub's hosted Windows runner has no vendor GPU driver and therefore cannot be
 assumed to have the loader. CI downloads LunarG's pinned
@@ -131,8 +166,11 @@ also stage the verified loader beside `target\debug\wenlan-server.exe` for the
 Task Scheduler round-trip; a scheduled process must not depend on the workflow
 shell's SDK path. Release jobs stage the loader beside the executables and
 include both files in the zip. Nothing writes `System32` or the registry. This
-lets CPU-only tests and released binaries start on a vendorless machine; it is
-not GPU evidence. The physical smoke below remains the Vulkan execution proof.
+lets CPU-only tests and released binaries **start** on a vendorless machine —
+process start is what was measured, not model load — and it is not GPU
+evidence. The physical smoke below remains the Vulkan execution proof, and it
+ran on a machine with working drivers; the driverless CPU-inference gate named
+above is still unrun.
 
 The implementation and CI contract were checked against these primary sources:
 
@@ -165,6 +203,14 @@ The implementation and CI contract were checked against these primary sources:
 An invalid index, GPU model-load failure, or GPU context-allocation failure
 falls back to CPU. A model/context failure performs a real second model load
 with zero GPU layers; it does not merely relabel the failed GPU instance.
+
+All three recoveries were measured on 2026-07-25 on a machine with a working
+vendor ICD (see the verified physical result below). They live **downstream of
+`LlamaBackend::init()`** and downstream of device enumeration, so they say
+nothing about a machine with no ICD at all: if backend init fails, this policy
+never runs and there is no `fallback_reason` to report. That case is unproven —
+see the driverless gate under "What is and is not established about end-user
+impact".
 
 `GET /api/status` exposes the effective result:
 

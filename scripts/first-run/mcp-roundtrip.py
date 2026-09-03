@@ -52,6 +52,14 @@ def record(status, name, rc, detail=""):
     print(f"[{status}] {name} (rc={rc})" + (f" — {short}" if short else ""), flush=True)
 
 
+def expect(names):
+    """Declare the PASS/FAIL rows this run owes. Derived from MCP_TOOLS, never
+    pasted by the calling channel: `brief` is only stepped when it is required."""
+    with (OUT / "expected.tsv").open("a", encoding="utf-8") as fh:
+        for name in names:
+            fh.write(f"{CHANNEL}\t{name}\n")
+
+
 def log(name, text):
     (CHECKS / f"{name}.log").write_text(text, encoding="utf-8")
 
@@ -66,6 +74,12 @@ class Transport(StepFailed):
 
 # ---------------------------------------------------------------------------
 
+required_tools = [t.strip() for t in (os.environ.get("MCP_TOOLS") or "capture,recall").split(",") if t.strip()]
+# Declared before the first guard below, so a run that dies at MCP_BIN still owes
+# the rows it never recorded rather than quietly owing nothing.
+expect(["mcp-initialize", "mcp-tools-list", "mcp-capture", "mcp-recall"]
+       + (["mcp-brief"] if "brief" in required_tools else []))
+
 if not os.environ.get("MCP_BIN"):
     record("FAIL", "mcp-initialize", 2, "MCP_BIN (path to wenlan-mcp) is required")
     sys.exit(0)
@@ -78,7 +92,6 @@ except ValueError as exc:
     record("FAIL", "mcp-initialize", 2, f"bad MCP_ARGS: {exc}")
     sys.exit(0)
 
-required_tools = [t.strip() for t in (os.environ.get("MCP_TOOLS") or "capture,recall").split(",") if t.strip()]
 expect_count = os.environ.get("EXPECT_TOOL_COUNT")
 
 stderr_log = (CHECKS / "mcp-server-stderr.log").open("wb")
