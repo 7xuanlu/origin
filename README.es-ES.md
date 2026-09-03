@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=a0461fc92a4c4fb5027d1f063f425f25438c5181ff3cb478c2705385e779b4ab -->
+<!-- README_SYNC: source=README.md sha256=5c37ed76d5c530ace9aa15f851cb4c06d9b0107d8e495c717eefabcee201c123 -->
 
 <p align="center">
   <picture>
@@ -28,9 +28,7 @@ El trabajo útil con IA no debería desaparecer cuando termina una conversación
   <a href="#learn-more">Leer&nbsp;más</a>
 </p>
 
-<p align="center">
-  <img src="./docs/assets/desktop-wiki-preview.png" alt="Aplicación de escritorio de Wenlan mostrando una página de wiki respaldada por fuentes con citas inspeccionables." width="100%">
-</p>
+https://github.com/user-attachments/assets/77272089-84ea-4eb0-a074-c9cc8b7b28fd
 
 <p align="center">
   <sub>Una Página mantenida en la aplicación de escritorio: abre cualquier cita para inspeccionar la Fuente o Memoria detrás de la afirmación.</sub>
@@ -122,8 +120,6 @@ Wenlan convierte documentos, notas y conversaciones pasadas con IA en una base d
 - **[LLM-wiki v2](https://gist.github.com/rohitg00/2067ab416f7bbe447c1977edaaa681e2):** Rohitg00 añadió un ciclo de vida de memoria. Wenlan concreta esa dirección con Fuentes rastreables, Memorias atómicas estilo Zettelkasten capturadas por agentes (una idea completa por cada una) y Páginas mantenidas construidas a partir de ambas.
 
 **El elemento distintivo de Wenlan:** Las Fuentes y las Memorias atómicas sustentan independientemente las Páginas mantenidas. El historial de Memoria preserva cómo cambió el conocimiento; el historial de la Página muestra qué evidencia actual sustenta la síntesis. Las Páginas mantenidas por máquina pueden reconstruirse a partir del sustento actual, mientras que los cambios en la escritura humana esperan como revisiones revisables.
-
-https://github.com/user-attachments/assets/ee4c3a7f-3609-46e5-8538-be26c4963caa
 
 <a id="knowledge-graph"></a>
 
