@@ -451,6 +451,10 @@ fn fastembed_ci_cache_violations(workflow: &str) -> Vec<String> {
 
 fn coverage_fastembed_cache_violations(workflow: &str) -> Vec<String> {
     const CACHE_STEP: &str = "Restore portable FastEmbed model";
+    const PREPARE_STEP: &str = "Prepare portable FastEmbed model";
+    const PREPARE_RUN: &str =
+        "python3 scripts/prepare-fastembed-cache.py --cache-dir .fastembed_cache";
+    const CONSUMER_STEP: &str = "Run Rust coverage (wenlan-core + wenlan-server)";
     const CACHE_DIR: &str = "${{ github.workspace }}/.fastembed_cache";
     const CACHE_PATH: &str = ".fastembed_cache";
     const CACHE_KEY: &str = "fastembed-bge-base-en-v1.5-q-v3-portable";
@@ -468,18 +472,20 @@ fn coverage_fastembed_cache_violations(workflow: &str) -> Vec<String> {
         violations.push("coverage job has no steps".into());
         return violations;
     };
-    let cache_steps: Vec<&serde_yaml::Value> = steps
+    let cache_indexes: Vec<usize> = steps
         .iter()
-        .filter(|step| step["name"].as_str() == Some(CACHE_STEP))
+        .enumerate()
+        .filter_map(|(index, step)| (step["name"].as_str() == Some(CACHE_STEP)).then_some(index))
         .collect();
-    if cache_steps.len() != 1 {
+    if cache_indexes.len() != 1 {
         violations.push(format!(
             "coverage has {} {CACHE_STEP:?} steps, expected 1",
-            cache_steps.len()
+            cache_indexes.len()
         ));
         return violations;
     }
-    let cache_step = cache_steps[0];
+    let cache_index = cache_indexes[0];
+    let cache_step = &steps[cache_index];
     let actual_path = cache_step["with"]["path"].as_str();
     if actual_path != Some(CACHE_PATH) {
         violations.push(format!(
@@ -500,9 +506,43 @@ fn coverage_fastembed_cache_violations(workflow: &str) -> Vec<String> {
         violations
             .push("coverage does not restore the cross-OS portable FastEmbed v3 cache".into());
     }
-    if cache_step["with"]["fail-on-cache-miss"].as_str() != Some("true") {
+    // Cache-service availability is an optimization, not a correctness input.
+    // A restore failure must not fail the job; the pinned preparer verifies a
+    // hit or fills a miss with byte-identical, SHA-256-checked files.
+    if cache_step["with"].get("fail-on-cache-miss").is_some()
+        || cache_step["continue-on-error"].as_bool() != Some(true)
+    {
+        violations.push(
+            "coverage FastEmbed cache restore does not treat cache-service availability as \
+             optional"
+                .into(),
+        );
+    }
+    let prepare_indexes: Vec<usize> = steps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| (step["name"].as_str() == Some(PREPARE_STEP)).then_some(index))
+        .collect();
+    if prepare_indexes.len() != 1 || steps[prepare_indexes[0]]["run"].as_str() != Some(PREPARE_RUN)
+    {
         violations
-            .push("coverage FastEmbed cache restore is not fail-closed on a cache miss".into());
+            .push("coverage does not fill a FastEmbed cache miss with the pinned preparer".into());
+    }
+    let consumer_index = steps
+        .iter()
+        .position(|step| step["name"].as_str() == Some(CONSUMER_STEP));
+    if prepare_indexes
+        .first()
+        .zip(consumer_index)
+        .is_none_or(|(&prepare_index, consumer_index)| {
+            prepare_index <= cache_index || prepare_index >= consumer_index
+        })
+    {
+        violations.push(
+            "coverage does not prepare the FastEmbed model between the restore and the coverage \
+             run"
+            .into(),
+        );
     }
     if steps.iter().any(|step| {
         step["uses"].as_str().is_some_and(|uses| {
@@ -745,7 +785,9 @@ jobs:
         "coverage caches",
         "cache key",
         "cross-OS portable FastEmbed v3",
-        "fail-closed",
+        "cache-service availability as optional",
+        "pinned preparer",
+        "between the restore and the coverage run",
         "FastEmbed cache writer",
     ] {
         assert!(
@@ -780,6 +822,53 @@ fn coverage_fastembed_cache_contract_rejects_absolute_action_path() {
         violations[0].contains("coverage caches"),
         "absolute cache action path must fail the shared-version contract: {violations:?}"
     );
+}
+
+#[test]
+fn coverage_fastembed_cache_contract_rejects_fail_closed_restore_or_missing_preparer() {
+    const PREPARE_BLOCK: &str = "      - name: Prepare portable FastEmbed model\n        run: \
+                                 python3 scripts/prepare-fastembed-cache.py --cache-dir \
+                                 .fastembed_cache\n";
+    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/coverage.yml"))
+        .expect("read coverage.yml");
+
+    let fail_closed = workflow.replacen(
+        "          enableCrossOsArchive: \"true\"\n",
+        "          enableCrossOsArchive: \"true\"\n          fail-on-cache-miss: \"true\"\n",
+        1,
+    );
+    assert_ne!(
+        fail_closed, workflow,
+        "fixture must re-add the fail-closed cache restore"
+    );
+    let violations = coverage_fastembed_cache_violations(&fail_closed);
+    assert_eq!(
+        violations.len(),
+        1,
+        "a re-added fail-on-cache-miss must be the only mutation: {violations:?}"
+    );
+    assert!(
+        violations[0].contains("cache-service availability as optional"),
+        "a cache-service outage must not be a correctness failure: {violations:?}"
+    );
+
+    let unprepared = workflow.replacen(PREPARE_BLOCK, "", 1);
+    assert_ne!(
+        unprepared, workflow,
+        "fixture must remove the pinned preparer step"
+    );
+    let violations = coverage_fastembed_cache_violations(&unprepared);
+    for expected in [
+        "pinned preparer",
+        "between the restore and the coverage run",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "dropping the preparer must exercise {expected:?}: {violations:?}"
+        );
+    }
 }
 
 #[test]
@@ -7512,11 +7601,41 @@ fn main_canary_contract_violations(ci_workflow: &str, canary_workflow: &str) -> 
             "main canary FastEmbed cache is not the restore-only cross-OS portable v3 cache".into(),
         );
     }
-    if fastembed_restore.and_then(|step| step["with"]["fail-on-cache-miss"].as_str())
-        != Some("true")
+    // Cache-service availability is an optimization, not a correctness input.
+    // A restore failure must not turn main red; the pinned preparer verifies a
+    // hit or fills a miss with byte-identical, SHA-256-checked files.
+    if fastembed_restore.is_some_and(|step| step["with"].get("fail-on-cache-miss").is_some())
+        || fastembed_restore.and_then(|step| step["continue-on-error"].as_bool()) != Some(true)
     {
-        violations
-            .push("main canary FastEmbed cache restore is not fail-closed on a cache miss".into());
+        violations.push(
+            "main canary FastEmbed cache restore does not treat cache-service availability as \
+             optional"
+                .into(),
+        );
+    }
+    let canary_step_index = |name: &str| {
+        canary_steps
+            .clone()
+            .position(|step| step["name"].as_str() == Some(name))
+    };
+    let fastembed_prepare = job_step(&canary, "main-canary", "Prepare portable FastEmbed model");
+    if fastembed_prepare.and_then(|step| step["run"].as_str())
+        != Some("python3 scripts/prepare-fastembed-cache.py --cache-dir .fastembed_cache")
+    {
+        violations.push(
+            "main canary does not fill a FastEmbed cache miss with the pinned preparer".into(),
+        );
+    }
+    if canary_step_index("Restore portable FastEmbed model")
+        .zip(canary_step_index("Prepare portable FastEmbed model"))
+        .zip(canary_step_index("Run embedding-only eval"))
+        .is_none_or(|((restore, prepare), eval)| restore >= prepare || prepare >= eval)
+    {
+        violations.push(
+            "main canary does not prepare the FastEmbed model between the restore and the eval \
+             run"
+            .into(),
+        );
     }
     if canary_steps
         .clone()
@@ -7668,7 +7787,9 @@ jobs:
         "FastEmbed cache directory",
         "rust-cache is not restore-only",
         "portable v3 cache",
-        "fail-closed",
+        "cache-service availability as optional",
+        "pinned preparer",
+        "between the restore and the eval run",
         "FastEmbed cache writer",
         "exact two-test ignored inventory",
         "exact two-test eval contract",
@@ -7705,6 +7826,52 @@ fn main_canary_contract_rejects_absolute_cache_action_path() {
         violations[0].contains("portable v3 cache"),
         "absolute cache action path must fail the shared-version contract: {violations:?}"
     );
+}
+
+#[test]
+fn main_canary_contract_rejects_fail_closed_restore_or_missing_preparer() {
+    const PREPARE_BLOCK: &str = "      - name: Prepare portable FastEmbed model\n        run: \
+                                 python3 scripts/prepare-fastembed-cache.py --cache-dir \
+                                 .fastembed_cache\n";
+    let root = repo_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let canary = std::fs::read_to_string(root.join(".github/workflows/main-canary.yml"))
+        .expect("read main-canary.yml");
+
+    let fail_closed = canary.replacen(
+        "          enableCrossOsArchive: \"true\"\n",
+        "          enableCrossOsArchive: \"true\"\n          fail-on-cache-miss: \"true\"\n",
+        1,
+    );
+    assert_ne!(
+        fail_closed, canary,
+        "fixture must re-add the fail-closed cache restore"
+    );
+    let violations = main_canary_contract_violations(&ci, &fail_closed);
+    assert_eq!(
+        violations.len(),
+        1,
+        "a re-added fail-on-cache-miss must be the only mutation: {violations:?}"
+    );
+    assert!(
+        violations[0].contains("cache-service availability as optional"),
+        "a cache-service outage must not turn main red: {violations:?}"
+    );
+
+    let unprepared = canary.replacen(PREPARE_BLOCK, "", 1);
+    assert_ne!(
+        unprepared, canary,
+        "fixture must remove the pinned preparer step"
+    );
+    let violations = main_canary_contract_violations(&ci, &unprepared);
+    for expected in ["pinned preparer", "between the restore and the eval run"] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "dropping the preparer must exercise {expected:?}: {violations:?}"
+        );
+    }
 }
 
 #[test]
