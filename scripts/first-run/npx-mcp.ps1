@@ -32,13 +32,23 @@ function Get-Asset([string]$AssetName, [string]$Dest) {
     }
     return $false
 }
-function Remove-Retry([string]$Target) {
-    for ($attempt = 0; $attempt -lt 10; $attempt++) {
-        Remove-Item -Recurse -Force $Target -ErrorAction SilentlyContinue
-        if (-not (Test-Path $Target)) { return }
-        Start-Sleep -Milliseconds 500
-    }
-}
+
+# The rows this channel owes. $Spec is fixed above, so the npx row names are
+# known before the run; the MCP helper declares its own mcp-* rows.
+Expect-Rows -Names @(
+    # The workflow's precheck step records `port-7878-precheck` before this
+    # script starts, so that row is carried in; Record-CarriedRow below restates
+    # its verdict as a row of this run's.
+    "port-7878-precheck-carried",
+    "download-zip",
+    "extract-zip",
+    "smoke-windows",
+    "health-version",
+    "npx-postinstall (npx -y $Spec --version)",
+    "npx-version-matches",
+    "mcp-roundtrip-driver"
+)
+Record-CarriedRow -Name "port-7878-precheck"
 
 try {
     New-Item -ItemType Directory -Force -Path $Bin, $DaemonData | Out-Null
@@ -75,14 +85,19 @@ try {
     $env:EXPECT_TOOL_COUNT = "29"
     $env:MCP_TOOLS = "capture,recall,brief"
     Info "mcp-command" "npx.cmd $($env:MCP_ARGS)"
-    & python (Join-Path $Helpers "mcp-roundtrip.py")
-    $global:LASTEXITCODE = 0
+    Check-Helper -Name "mcp-roundtrip-driver" -Interpreter "python" -Path (Join-Path $Helpers "mcp-roundtrip.py") -MustDeclare "^mcp-"
 } finally {
     if ($Daemon) { Stop-Process -Id $Daemon.Id -Force -ErrorAction SilentlyContinue }
     Get-Process -Name wenlan-server -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$Work*" } | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
     Collect $OutLog $ErrLog
-    Remove-Retry $Work
+    # Reported rather than dropped: this channel's Remove-Retry used to swallow
+    # every error and return nothing, so ten failed deletes read exactly like a
+    # success. It has no ledger row here -- this channel makes no claim about
+    # leftover trees -- but the console must not be silent about a work
+    # directory that is still on disk.
+    $removedWork = Remove-Retry $Work
+    Write-Host "cleanup: $Work delete -- $($removedWork.State): $($removedWork.Detail)"
     $global:LASTEXITCODE = 0
     if (-not (Evaluate)) { exit 1 }
 }

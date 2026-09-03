@@ -440,6 +440,7 @@ jobs:
               - 'scripts/smoke-windows-llm.ps1'
               - 'scripts/smoke-windows-llm.test.ps1'
               - 'scripts/first-run/lib.ps1'
+              - 'scripts/first-run/lib.test.ps1'
               - 'scripts/first-run/cli-roundtrip.ps1'
               - 'scripts/first-run/npx-mcp.ps1'
               - 'scripts/first-run/windows-zip.ps1'
