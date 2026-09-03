@@ -83,7 +83,13 @@ impl Config {
     /// Returns the configured knowledge path, or the product default.
     /// Existing `~/Origin/knowledge` directories remain readable during rename.
     pub fn knowledge_path_or_default(&self) -> PathBuf {
-        self.knowledge_path_or_default_for_home(&home_dir())
+        // Resolved lazily: a configured path answers the question without ever
+        // asking the OS where home is, so the only callers that can be stopped
+        // by an unmeasurable profile are the ones that actually need it.
+        if let Some(path) = self.knowledge_path.clone() {
+            return path;
+        }
+        self.knowledge_path_or_default_for_home(&crate::identity_paths::home_base())
     }
 
     fn knowledge_path_or_default_for_home(&self, home: &std::path::Path) -> PathBuf {
@@ -113,9 +119,15 @@ fn config_path() -> PathBuf {
     crate::identity_paths::app_data_dir().join("config.json")
 }
 
-fn home_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
-}
+// `home_dir()` used to live here as
+// `dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))`. It was the same
+// failed-measurement-as-a-value defect `identity_paths` exists to remove, and
+// in the worst place for it: this root is where the user's *pages* are written,
+// so a `dirs` that could not answer would have silently created `./Wenlan/
+// knowledge` in whatever directory the app was launched from. It also bypassed
+// `identity_paths` entirely, which meant the `cfg(test)` guard did not cover
+// it and a unit test reaching this path wrote into the real home directory.
+// Both are closed by going through `identity_paths::home_base()`.
 
 pub fn load_config() -> Config {
     let path = config_path();
@@ -417,6 +429,11 @@ mod tests {
         );
     }
 
+    // No `isolate_app_roots` here, deliberately: under `cfg(test)`
+    // `identity_paths::home_base()` panics the moment it is reached without
+    // one, so this test still passing is itself the assertion that a
+    // configured path short-circuits before anything asks the OS where home
+    // is. Make the resolution eager again and this test panics.
     #[test]
     fn config_knowledge_path_custom() {
         let json = r#"{"knowledge_path": "/my/custom/path"}"#;
@@ -424,6 +441,23 @@ mod tests {
         assert_eq!(
             config.knowledge_path_or_default(),
             PathBuf::from("/my/custom/path")
+        );
+    }
+
+    /// The default pages root must come from the isolated home, not from
+    /// `dirs::home_dir()` and not from a `"."` fallback. Before this went
+    /// through `identity_paths`, a unit test reaching it wrote into the
+    /// developer's real home directory and a `dirs` that could not answer
+    /// silently relocated the user's pages to the process's cwd.
+    #[test]
+    #[serial_test::serial]
+    fn knowledge_path_default_resolves_under_the_isolated_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _roots = crate::test_env::isolate_app_roots(tmp.path());
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            config.knowledge_path_or_default(),
+            tmp.path().join("Wenlan").join("knowledge")
         );
     }
 

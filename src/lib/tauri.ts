@@ -2306,12 +2306,28 @@ export async function removeAvatar(): Promise<void> {
 
 // ===== Setup Wizard =====
 
+// `Reading` and its predicates live in ./reading, NOT here: component
+// tests mock this whole module, and a rule about failed measurements must
+// not vanish with the mock. The type is re-exported so wire consumers can
+// keep importing it from one place (types are erased, so the re-export
+// survives `vi.mock`).
+export type { Reading } from "./reading";
+import type { Reading } from "./reading";
+
 export interface McpClient {
   name: string;
   client_type: string;
-  config_path: string;
-  detected: boolean;
-  already_configured: boolean;
+  /** Null when the directory this client's config hangs off could not be
+   *  determined — there is no path to show, and no honest placeholder. */
+  config_path: string | null;
+  detected: Reading;
+  already_configured: Reading;
+  /** The file half of `already_configured`: a raw `wenlan`/`origin` entry. */
+  has_raw_entry: Reading;
+  /** Both a `wenlan` AND a legacy `origin` raw entry. */
+  has_raw_duplicate: Reading;
+  /** The plugin half of `already_configured`. */
+  has_plugin: Reading;
 }
 
 export async function shouldShowWizard(): Promise<boolean> {
@@ -2330,7 +2346,15 @@ export async function detectMcpClients(): Promise<McpClient[]> {
   return invoke("detect_mcp_clients_cmd");
 }
 
-export async function writeMcpConfig(clientType: string): Promise<void> {
+/** Writes the raw `wenlan` MCP entry into `clientType`'s config file.
+ *
+ *  RESOLVES WITH the resolver inputs that could NOT be determined while the
+ *  command it wrote was chosen. An empty array is itself a measurement — every
+ *  input was read. A non-empty one means the write went through off a search
+ *  that never built some of its candidates, and the caller must say so rather
+ *  than render a plain success. This used to resolve with `void`, so the two
+ *  were the same event to every caller (round 6, D3's boundary defect). */
+export async function writeMcpConfig(clientType: string): Promise<UndeterminedInput[]> {
   return invoke("write_mcp_config", { clientType });
 }
 
@@ -2356,9 +2380,22 @@ export interface WenlanMcpEntry {
   args: string[];
 }
 
+/** The entry, plus the resolver inputs that could not be determined while
+ *  choosing it. Kept as a wrapper rather than extra fields on
+ *  `WenlanMcpEntry`, because that shape is written verbatim into the user's
+ *  client config file and must stay exactly `{command, args}`. */
+export interface WenlanMcpEntryReport {
+  entry: WenlanMcpEntry;
+  /** Empty means every input was read. Non-empty means this command was
+   *  chosen by a search that did not cover the paths it looks like it
+   *  covered — indistinguishable from a complete search before round 6. */
+  undetermined: UndeterminedInput[];
+}
+
 /** Returns the `wenlan` MCP server entry (command + args) with real values —
- *  either a resolved local binary path (dev) or `npx -y wenlan-mcp` (prod). */
-export async function getWenlanMcpEntry(): Promise<WenlanMcpEntry> {
+ *  either a resolved local binary path (dev) or `npx -y wenlan-mcp` (prod) —
+ *  together with anything the search could not determine. */
+export async function getWenlanMcpEntry(): Promise<WenlanMcpEntryReport> {
   return invoke("get_wenlan_mcp_entry");
 }
 
@@ -2378,38 +2415,127 @@ export async function installClientPlugin(clientType: PluginInstallClientType): 
 
 // ===== Wire State (real, resolved wiring — wizard progress + Diagnostics) =====
 
+/** Whether the daemon this app spawned sits in the app's kill-on-close job
+ *  object — i.e. whether a hard kill of the app really ends it. `unbound`
+ *  carries why the binding failed; `not_supported` is a platform without job
+ *  objects. */
+export type JobBinding =
+  | { state: "bound" }
+  | { state: "unbound"; reason: string }
+  | { state: "not_supported" };
+
+/** What `stop_sidecar` established about the daemon it was asked to stop.
+ *  `ended` is the only outcome that means the guarantee held; an identity that
+ *  could not be captured lands on `could_not_measure`, never on `ended`. */
+export type SidecarStopOutcome =
+  | { outcome: "no_sidecar" }
+  | { outcome: "ended" }
+  | { outcome: "still_running"; reason: string }
+  | { outcome: "could_not_measure"; reason: string };
+
 export interface DaemonWire {
   base_url: string;
   reachable: boolean;
   version: string | null;
   error: string | null;
+  /** `null`/absent means this app owns no sidecar (a service holds the daemon,
+   *  or it exited). It is never a stand-in for `{ state: "bound" }`. */
+  sidecar_job_binding?: JobBinding | null;
+  /** True when this app started a sidecar without being able to measure
+   *  whether launchd already owned the daemon — two daemons are then possible
+   *  for a reason nothing else on this surface would show. */
+  sidecar_spawned_on_unknown_owner: boolean;
+  /** Outcome of the most recent sidecar stop, or `null` if the app has not
+   *  tried to stop one in this process. `null` is not `ended`. */
+  last_sidecar_stop?: SidecarStopOutcome | null;
 }
+
+/** What a `wenlan-mcp` candidate path turned out to be. `absent` is the only
+ *  measured absence; `unreadable` is a failed look and must never be read as
+ *  one. `not_a_file` is a directory (or similar) squatting on the name, and
+ *  `not_executable` is a real file that cannot be a program — empty, or (on
+ *  Unix) with no execute bit. Both of those are MEASURED negatives, same
+ *  standing as `absent`. */
+export type CandidateProbe =
+  | { kind: "file" }
+  | { kind: "not_a_file" }
+  | { kind: "not_executable"; reason: string }
+  | { kind: "absent" }
+  | { kind: "unreadable"; error: string };
 
 export interface BinaryCandidate {
   path: string;
-  exists: boolean;
+  /** The measurement. There is deliberately no `exists: boolean` beside it:
+   *  that boolean answered `false` for "absent", for "a directory squats on
+   *  the name" and for "the OS refused to look", and every reader that took it
+   *  inherited the conflation this trail exists to remove. Match on `kind`. */
+  state: CandidateProbe;
   source: "WENLAN_MCP_DEV_BIN" | "installed" | "bundled" | "cargo";
 }
 
+/** A candidate the OS would not answer about, with its error. */
+export interface UnreadableCandidate {
+  path: string;
+  error: string;
+}
+
 export interface BinaryWire {
-  command: string;
+  /** The command setup would write — or `null` when the binary search could
+   *  not be completed, in which case setup writes NOTHING and leaves the
+   *  user's existing config alone. Render the null; there is no honest
+   *  placeholder, because no command was chosen. */
+  command: string | null;
   args: string[];
+  /** Set exactly when `command` is null: why nothing could be resolved.
+   *  `unreadable` is candidate PATHS the OS refused to answer about. */
+  unresolved?: {
+    message: string;
+    unreadable: UnreadableCandidate[];
+  };
+  /** Inputs the candidate paths hang off that could not be determined at all,
+   *  so those candidates were never built and have NO entry in `candidates`.
+   *  A short `candidates` list is therefore not evidence the search was short —
+   *  read this for that.
+   *
+   *  Sits beside `command`, NOT inside `unresolved`, and that placement is the
+   *  point: it used to be reachable only when `command` was null, which made an
+   *  undetermined input impossible to report on a search that FOUND something —
+   *  exactly when it is invisible, because the command reads as a complete
+   *  answer. Non-empty beside a command means "this command was chosen, and
+   *  these inputs were never read". */
+  undetermined: UndeterminedInput[];
   candidates: BinaryCandidate[];
+}
+
+/** An input the candidate paths hang off that could not be determined — the
+ *  home directory, the app's own directory, `WENLAN_MCP_DEV_BIN`. `blocked`
+ *  names the candidate sources that were never probed because of it. */
+export interface UndeterminedInput {
+  input: string;
+  blocked: string;
+  error: string;
 }
 
 export interface ClientWire {
   client_type: string;
   name: string;
-  detected: boolean;
-  config_path: string;
-  has_raw_entry: boolean;
+  /** Three-valued — see [`Reading`]. A client the app could not look at is
+   *  NOT a client that is absent, and this card is the one surface whose
+   *  whole job is telling a user which of the two they are looking at. */
+  detected: Reading;
+  /** Null when the config directory could not be determined. */
+  config_path: string | null;
+  has_raw_entry: Reading;
   /** Config holds BOTH a `wenlan` and a legacy `origin` raw entry — the
    *  raw+raw duplicate. For a no-plugin client (Cursor, Gemini CLI) this is
    *  the only signal of a duplicate, and it routes to `removeLegacyMcpEntry`,
    *  which removes only `origin`. */
-  has_raw_duplicate: boolean;
-  has_plugin: boolean;
-  route: "plugin" | "config" | "skip";
+  has_raw_duplicate: Reading;
+  has_plugin: Reading;
+  /** `unknown` is the route for a client whose detection or plugin state could
+   *  not be read: there is no instruction to give, and naming one would be an
+   *  instruction derived from a failed measurement. */
+  route: "plugin" | "config" | "skip" | "unknown";
 }
 
 export interface WireState {

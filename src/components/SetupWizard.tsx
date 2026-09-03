@@ -21,11 +21,14 @@ import {
   type ImportResult,
   type SyncStats,
   type ResolvedRouting,
+  type UndeterminedInput,
 } from "../lib/tauri";
+import { readingIsYes } from "../lib/reading";
 import { dragStripHeight } from "../lib/windowChrome";
 import { ImportView } from "./memory/ImportView";
 import VaultConnectCard, { type VaultPick } from "./memory/sources/VaultConnectCard";
 import { isPluginClient } from "./connect/pluginClients";
+import { unreadPluginWriteRisk } from "./connect/setupRisk";
 import ClientRow, { clientRowDescId } from "./connect/ClientRow";
 import { OnDeviceModelCard } from "./intelligence/IntelligenceSetup";
 import type { PresetGroup } from "./intelligence/providerPresets";
@@ -548,7 +551,19 @@ function ConnectStep({
       const next = { ...prev };
       for (const client of clients) {
         if (next[client.client_type] === undefined) {
-          next[client.client_type] = client.detected;
+          // Preselect only a MEASURED yes. A client we could not look at is
+          // offered, unchecked — the user decides, from a row that says the
+          // check failed.
+          //
+          // ROUND 6, D6a. And never preselect a client whose "set up" would be
+          // a raw config write taken while its PLUGIN state could not be read:
+          // Continue on the next step would then produce a plugin+raw double
+          // registration with no user action beyond pressing the default
+          // button. The row still offers the checkbox, beside a line saying
+          // what could not be read and what ticking it will do — the write
+          // stays available, it just stops being the default.
+          next[client.client_type] =
+            readingIsYes(client.detected) && unreadPluginWriteRisk(client) === null;
         }
       }
       return next;
@@ -558,15 +573,22 @@ function ConnectStep({
   useEffect(() => {
     if (!clients) return;
     const configuredNames = clients
-      .filter((client) => client.already_configured)
+      // Only a measured yes may be REPORTED as connected upstream.
+      .filter((client) => readingIsYes(client.already_configured))
       .map((client) => client.client_type);
     if (configuredNames.length > 0) {
       onConnected(configuredNames);
     }
   }, [clients, onConnected]);
 
+  // ROUND 5, DEFECT 4. This was `.filter((client) => client.detected)` over a
+  // boolean, so a client whose detection FAILED was dropped from the list
+  // entirely — and a list this step titles "detected on your machine", with an
+  // "we found nothing" empty state under it, turns a dropped row into the
+  // claim that the tool is not installed. Only a MEASURED `no` is excluded
+  // now; a failed look stays, and `ClientRow` renders why.
   const detectedClients = useMemo(
-    () => (clients ?? []).filter((client) => client.detected),
+    () => (clients ?? []).filter((client) => client.detected.kind !== "no"),
     [clients],
   );
 
@@ -670,20 +692,39 @@ function ConnectStep({
           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
             {detectedClients.map((client) => {
               const isSelected = !!selectedClients[client.client_type];
-              const isConfigured = client.already_configured;
+              const isConfigured = readingIsYes(client.already_configured);
+              // Round 6, D6a: the reason this row is not preselected, and the
+              // reason ticking it is a decision rather than a default.
+              const duplicateRiskError = unreadPluginWriteRisk(client);
 
               return (
                 <ClientRow
                   key={client.client_type}
                   client={client}
-                  configured={isConfigured}
+                  configured={client.already_configured}
                   selected={isSelected}
+                  warning={
+                    duplicateRiskError
+                      ? t("connectMatrix.pluginStateUnknownBeforeWrite", {
+                          error: duplicateRiskError,
+                        })
+                      : null
+                  }
                   leading={
                     <input
                       type="checkbox"
                       aria-label={client.name}
                       aria-describedby={
-                        isConfigured ? clientRowDescId(client.client_type) : undefined
+                        // The body also carries the "could not check whether
+                        // this is installed" line, which a screen reader user
+                        // needs at least as much as the sighted one — and the
+                        // duplicate-registration line, which is the whole
+                        // reason this box starts unticked.
+                        isConfigured ||
+                        client.detected.kind === "unreadable" ||
+                        duplicateRiskError
+                          ? clientRowDescId(client.client_type)
+                          : undefined
                       }
                       checked={isSelected}
                       onChange={(e) =>
@@ -943,12 +984,26 @@ function SettingUpStep({
         // also writing `~/.claude.json` / `[mcp_servers.wenlan]` would register
         // the Wenlan server twice. `isPluginClient` is the single home for that
         // rule (src/components/connect/pluginClients.ts) — Settings obeys it too.
-        const task = isPluginClient(clientType)
-          ? installClientPlugin(clientType)
+        const task: Promise<UndeterminedInput[]> = isPluginClient(clientType)
+          ? installClientPlugin(clientType).then(() => [])
           : writeMcpConfig(clientType);
         task.then(
-          () => {
+          (undetermined) => {
             setStatuses((prev) => ({ ...prev, [row.id]: "done" }));
+            // Round 6, D3's boundary defect, arriving at the pixel. The write
+            // succeeded — the row is "done" and nothing is retried — but it
+            // was decided by a search that never built some of its candidates.
+            // A done row that says nothing is indistinguishable from one where
+            // every input was read, which is the whole class of defect this
+            // wizard has been rebuilt around.
+            if (undetermined.length > 0) {
+              setWarnings((prev) => ({
+                ...prev,
+                [row.id]: undetermined
+                  .map((u) => t("connectMatrix.wroteWithUndeterminedInput", { ...u }))
+                  .join(" "),
+              }));
+            }
             onConnectedRef.current([clientType]);
             queryClient.invalidateQueries({ queryKey: ["mcp-clients"] });
           },

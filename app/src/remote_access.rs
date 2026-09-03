@@ -1756,10 +1756,22 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    /// Points every root these tests write at a tempdir.
+    ///
+    /// `HOME` alone did not do that. `mcp_config_dir()` goes through
+    /// `dirs::home_dir()`, which on Windows resolves `FOLDERID_Profile` and
+    /// ignores `HOME` — so every test here operated on the developer's real
+    /// `%USERPROFILE%\.config\wenlan-mcp\relay_id`.
+    /// `relay_id_generation_errors_when_relay_id_path_is_directory` then
+    /// created that path as a DIRECTORY, which is why the three relay-id tests
+    /// were failing on this host: not an environment quirk, this suite's own
+    /// leftovers. `isolate_app_roots` is kept alive by the guard so the
+    /// relocation lasts exactly as long as `HOME` does.
     struct HomeGuard {
         home: Option<OsString>,
         dev_state: Option<OsString>,
         dev_remote_port_start: Option<OsString>,
+        _roots: crate::test_env::EnvGuard,
     }
 
     impl HomeGuard {
@@ -1770,10 +1782,12 @@ mod tests {
             std::env::set_var("HOME", path);
             std::env::remove_var("WENLAN_DEV_STATE_DIR");
             std::env::remove_var("WENLAN_DEV_REMOTE_PORT_START");
+            let _roots = crate::test_env::isolate_app_roots(path);
             Self {
                 home,
                 dev_state,
                 dev_remote_port_start,
+                _roots,
             }
         }
     }

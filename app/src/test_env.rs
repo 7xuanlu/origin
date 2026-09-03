@@ -36,3 +36,29 @@ impl Drop for EnvGuard {
         }
     }
 }
+
+/// Point every root the app *writes* to inside `dir`, and restore on drop.
+///
+/// Setting `HOME` does not do this. On Windows `dirs` resolves
+/// `FOLDERID_LocalAppData` and `FOLDERID_Profile` and ignores `HOME`, so a
+/// test that sets `HOME` to a tempdir still writes into the developer's real
+/// `%LOCALAPPDATA%\wenlan` and `%USERPROFILE%\.config\wenlan-mcp`. Set `HOME`
+/// as well when the test needs `~/Library/LaunchAgents` — the two answer
+/// different questions and neither substitutes for the other.
+///
+/// `identity_paths` panics under `cfg(test)` when these are unset, so a test
+/// that forgets this fails loudly instead of quietly editing the machine.
+pub(crate) fn isolate_app_roots(dir: &std::path::Path) -> EnvGuard {
+    let guard = EnvGuard::capture(&[
+        crate::identity_paths::TEST_DATA_LOCAL_DIR_ENV,
+        crate::identity_paths::TEST_HOME_DIR_ENV,
+    ]);
+    // Both are *bases*, mirroring `dirs::data_local_dir()` and
+    // `dirs::home_dir()`: the `wenlan` / `origin` root selection and the
+    // `.config/wenlan-mcp` join still run against them, so a test can stage a
+    // legacy root exactly as it would on disk and the tests that pin those
+    // layouts still test the layout rather than this override.
+    std::env::set_var(crate::identity_paths::TEST_DATA_LOCAL_DIR_ENV, dir);
+    std::env::set_var(crate::identity_paths::TEST_HOME_DIR_ENV, dir);
+    guard
+}
