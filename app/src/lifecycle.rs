@@ -180,14 +180,14 @@ fn home_dir() -> Result<PathBuf> {
         // same failure that `identity_paths::refuse_real_profile` catches for
         // the data roots. `~/Library/LaunchAgents` on the Windows dev host is
         // the residue of exactly this.
-        return match std::env::var_os("HOME") {
+        match std::env::var_os("HOME") {
             Some(home) => Ok(PathBuf::from(home)),
             None => panic!(
                 "lifecycle::home_dir() reached the developer's real profile from a unit test. \
                  Set HOME to a tempdir (and keep the guard alive for the whole test) before \
                  touching a plist path."
             ),
-        };
+        }
     }
     #[cfg(not(test))]
     {

@@ -2209,8 +2209,7 @@ mod tests {
              file's problem: {error}"
         );
         // The same body, through the layer the UI actually reads.
-        let reading =
-            ConfigRead::Contents("not json".to_string()).asks(|s| has_configured_entry(s));
+        let reading = ConfigRead::Contents("not json".to_string()).asks(has_configured_entry);
         assert!(
             matches!(reading, Reading::Unreadable { .. }),
             "a present-but-unparseable config is a failed measurement, not `no entry`: \
