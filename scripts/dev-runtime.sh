@@ -1479,198 +1479,359 @@ lock_owner_file_appeared() {
 acquire_runtime_lock() {
   local owner owner_pid owner_again recheck read_rc list_rc name_rc listing
   local appeared_rc token other other_rc retook=0
+  local attempt acquired=0 breaking stray mv_rc back_rc out_rc broke broke_rc
   if ! mkdir -p "$STATE_DIR"; then
     echo "error: could not create the dev runtime state directory: $STATE_DIR" >&2
     echo "       nothing below can be isolated without it" >&2
     return 1
   fi
-  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    # `owner="$(sed … 2>/dev/null || true)"` used to stand here, and it is this
-    # file's defect pointed at the one piece of state that exists to keep two
-    # runs apart: an owner file that could not be READ produced the same empty
-    # string as an owner file that is not THERE, and the recovery below then
-    # deleted a live lock and took it. So the lock directory is listed first --
-    # tri-state, the same listing `read_owned_pid` stands on -- and a pid file
-    # that is present but unreadable is a refusal instead of a stale lock.
-    list_rc=0
-    listing="$(list_dir_tristate "$LOCK_DIR")" || list_rc=$?
-    if (( list_rc == 2 )); then
-      echo "error: the dev runtime lock exists and could not be read: $LOCK_DIR" >&2
-      echo "       not taking a lock whose owner is unknown: another command" >&2
-      echo "       may be running against this worktree right now" >&2
-      return 1
-    fi
-    name_rc=1
-    if (( list_rc == 0 )); then
-      name_rc=0
-      listing_has_name "$listing" "${LOCK_OWNER_FILE##*/}" || name_rc=$?
-    fi
-    if (( name_rc == 2 )); then
-      echo "error: could not tell whether the dev runtime lock names an owner" >&2
-      echo "       $LOCK_DIR" >&2
-      return 1
-    fi
-    if (( name_rc != 0 )); then
-      # A lock with no owner file in it. That USED to be recovered on the spot,
-      # which is the race described above: the holder may simply not have
-      # written the record yet. Wait for it, and only then decide.
-      appeared_rc=0
-      lock_owner_file_appeared || appeared_rc=$?
-      case "$appeared_rc" in
-        0) name_rc=0 ;;
-        # The lock itself went away while this was looking, so there is nothing
-        # to recover and nothing to refuse. `mkdir` is the arbiter here, exactly
-        # as it is at the top of this function -- and ROUND 4 is that this arm
-        # used to fall through to the refusal below instead, which is the
-        # comment describing behaviour the code did not have. One attempt, not
-        # a loop: two runs releasing and retaking in turn must not be able to
-        # spin this.
-        1)
-          if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-            echo "error: the dev runtime lock was released and immediately" >&2
-            echo "       retaken by another command: $LOCK_DIR" >&2
+  # TWO PASSES, AND THE SECOND ONE EXISTS FOR EXACTLY ONE OUTCOME: the atomic
+  # break below was LOST. Two runs that both measured this lock stale race one
+  # `mv`; exactly one of them wins, and the loser destroyed nothing, so it has
+  # no verdict to report -- it simply has not looked at the lock that is there
+  # NOW. Going round is what looking again means: it either finds no lock and
+  # `mkdir`s, or finds the winner's fresh lock and takes the ordinary contended
+  # path (wait for an owner, read it, refuse a live one).
+  #
+  # BOUNDED AT TWO, and not because two is enough to be sure -- it is not. A
+  # third run can lose the second race as well. It is bounded because the
+  # alternative is a spin: two runs releasing and retaking in turn can feed this
+  # loop forever, and a dev command that never returns is worse than one that
+  # refuses. Falling out of the loop without the lock is therefore a refusal
+  # with its own message, never a fall-through into the owner write below.
+  for (( attempt = 1; attempt <= 2; attempt++ )); do
+    # Per PASS, not per call: the second pass starts from `mkdir` again and
+    # must not inherit the first pass's conclusion about how the lock was got.
+    retook=0
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+      # `owner="$(sed … 2>/dev/null || true)"` used to stand here, and it is this
+      # file's defect pointed at the one piece of state that exists to keep two
+      # runs apart: an owner file that could not be READ produced the same empty
+      # string as an owner file that is not THERE, and the recovery below then
+      # deleted a live lock and took it. So the lock directory is listed first --
+      # tri-state, the same listing `read_owned_pid` stands on -- and a pid file
+      # that is present but unreadable is a refusal instead of a stale lock.
+      list_rc=0
+      listing="$(list_dir_tristate "$LOCK_DIR")" || list_rc=$?
+      if (( list_rc == 2 )); then
+        echo "error: the dev runtime lock exists and could not be read: $LOCK_DIR" >&2
+        echo "       not taking a lock whose owner is unknown: another command" >&2
+        echo "       may be running against this worktree right now" >&2
+        return 1
+      fi
+      name_rc=1
+      if (( list_rc == 0 )); then
+        name_rc=0
+        listing_has_name "$listing" "${LOCK_OWNER_FILE##*/}" || name_rc=$?
+      fi
+      if (( name_rc == 2 )); then
+        echo "error: could not tell whether the dev runtime lock names an owner" >&2
+        echo "       $LOCK_DIR" >&2
+        return 1
+      fi
+      if (( name_rc != 0 )); then
+        # A lock with no owner file in it. That USED to be recovered on the spot,
+        # which is the race described above: the holder may simply not have
+        # written the record yet. Wait for it, and only then decide.
+        appeared_rc=0
+        lock_owner_file_appeared || appeared_rc=$?
+        case "$appeared_rc" in
+          0) name_rc=0 ;;
+          # The lock itself went away while this was looking, so there is nothing
+          # to recover and nothing to refuse. `mkdir` is the arbiter here, exactly
+          # as it is at the top of this function -- and ROUND 4 is that this arm
+          # used to fall through to the refusal below instead, which is the
+          # comment describing behaviour the code did not have. One attempt, not
+          # a loop: two runs releasing and retaking in turn must not be able to
+          # spin this.
+          1)
+            if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+              echo "error: the dev runtime lock was released and immediately" >&2
+              echo "       retaken by another command: $LOCK_DIR" >&2
+              return 1
+            fi
+            retook=1
+            ;;
+          # Waited out, and still nobody. An owner that cannot be established is a
+          # MEASUREMENT THAT DID NOT HAPPEN, not a measurement that said "nobody".
+          # Recovering it is how two runs come to share a lock directory; refusing
+          # costs a manual `rm -rf` after the one thing that produces this state,
+          # which is a process killed between `mkdir` and its very next line.
+          3)
+            echo "error: the dev runtime lock names no owner: $LOCK_DIR" >&2
+            echo "       waited for one and none appeared. An owner that could not be" >&2
+            echo "       established is not an absent owner, and a lock recovered on" >&2
+            echo "       that basis can be held by two commands at once" >&2
+            echo "       remove it by hand once nothing is running: rm -rf $LOCK_DIR" >&2
             return 1
-          fi
-          retook=1
-          ;;
-        # Waited out, and still nobody. An owner that cannot be established is a
-        # MEASUREMENT THAT DID NOT HAPPEN, not a measurement that said "nobody".
-        # Recovering it is how two runs come to share a lock directory; refusing
-        # costs a manual `rm -rf` after the one thing that produces this state,
-        # which is a process killed between `mkdir` and its very next line.
-        3)
-          echo "error: the dev runtime lock names no owner: $LOCK_DIR" >&2
-          echo "       waited for one and none appeared. An owner that could not be" >&2
-          echo "       established is not an absent owner, and a lock recovered on" >&2
-          echo "       that basis can be held by two commands at once" >&2
+            ;;
+          *)
+            echo "error: could not read the dev runtime lock while waiting for an" >&2
+            echo "       owner to appear in it: $LOCK_DIR" >&2
+            echo "       not recovering a lock nobody could look at" >&2
+            return 1
+            ;;
+        esac
+      fi
+      if (( name_rc == 0 )); then
+        read_rc=0
+        owner="$(sed -n '1p' "$LOCK_OWNER_FILE")" || read_rc=$?
+        if (( read_rc != 0 )); then
+          echo "error: the dev runtime lock owner file could not be read" >&2
+          echo "       $LOCK_OWNER_FILE" >&2
+          echo "       an unreadable owner is not an absent owner; refusing to" >&2
+          echo "       recover a lock that may belong to a running command" >&2
+          return 1
+        fi
+        # AN OWNER THAT IS NOT A PID IS NOT AN ABSENT OWNER EITHER. The liveness
+        # test below is guarded by `[[ "$owner" =~ ^[0-9]+$ ]]`, so an EMPTY or
+        # MALFORMED owner file used to skip it entirely and fall straight into the
+        # recovery -- unconditionally, for the one file whose whole purpose is to
+        # say who holds this. That contradicted the paragraph above it, which
+        # claims an unparsable pid keeps the lock. The claim is right and the code
+        # was wrong; this is the code.
+        #
+        # A torn owner file is exactly what a run killed mid-write leaves, and it
+        # is also what a run that is very much alive looks like for the instant
+        # between `open` and `write`.
+        # The pid is the token's first field, and an owner file written before the
+        # token existed is one bare pid, which parses the same way.
+        owner_pid="${owner%% *}"
+        if [[ ! "$owner_pid" =~ ^[0-9]+$ ]]; then
+          echo "error: the dev runtime lock owner is not a pid: [$owner]" >&2
+          echo "       $LOCK_OWNER_FILE" >&2
+          echo "       an owner that cannot be parsed cannot be shown to be dead," >&2
+          echo "       so this lock is not being recovered" >&2
           echo "       remove it by hand once nothing is running: rm -rf $LOCK_DIR" >&2
           return 1
-          ;;
-        *)
-          echo "error: could not read the dev runtime lock while waiting for an" >&2
-          echo "       owner to appear in it: $LOCK_DIR" >&2
-          echo "       not recovering a lock nobody could look at" >&2
+        fi
+        # `kill -0 "$owner" 2>/dev/null` stood here, and it is this file's defect
+        # in the one test that decides whether a lock may be TAKEN. `kill -0`
+        # exits 1 for ESRCH and for EPERM alike, and with stderr discarded there
+        # is nothing left to tell them apart -- so a lock held by a live process
+        # this user may not signal read as "stale", and the recovery below
+        # deleted it and took the lock out from under a running command.
+        #
+        # The library already draws that line, from the errno text, for exactly
+        # this reason; it is `kill -0` underneath, so it still answers about the
+        # MSYS pid `$$` records rather than about a Windows pid. It returns 0 only
+        # when the kernel said "No such process", so anything else -- alive,
+        # EPERM, a pid bash refused to parse -- keeps the lock where it is. Which
+        # of those it was cannot be recovered from a builtin that reports one
+        # status for all three, so the message names both rather than picking.
+        if ! errno_says_no_such_process "$owner_pid"; then
+          echo "error: another dev runtime command is active (PID $owner_pid)" >&2
+          echo "       or its liveness could not be measured; either way this" >&2
+          echo "       lock is not being recovered" >&2
           return 1
-          ;;
-      esac
-    fi
-    if (( name_rc == 0 )); then
-      read_rc=0
-      owner="$(sed -n '1p' "$LOCK_OWNER_FILE")" || read_rc=$?
-      if (( read_rc != 0 )); then
-        echo "error: the dev runtime lock owner file could not be read" >&2
-        echo "       $LOCK_OWNER_FILE" >&2
-        echo "       an unreadable owner is not an absent owner; refusing to" >&2
-        echo "       recover a lock that may belong to a running command" >&2
-        return 1
+        fi
+        # TEST HOOK 1 OF 2, 0 in every real run. It widens the window between
+        # the measurement above and the RE-READ below so that
+        # `negative-controls/dev-runtime-lock-race-controls.sh` can drive the race
+        # deterministically instead of sampling it. A widening that could not be
+        # performed is not a widening, so its status is read like every other.
+        if [[ "${DEV_RUNTIME_RACE_SLEEP:-0}" != "0" ]]; then
+          if ! sleep "${DEV_RUNTIME_RACE_SLEEP}"; then
+            echo "error: DEV_RUNTIME_RACE_SLEEP is set and the delay could not be" >&2
+            echo "       performed; not proceeding into the window it widens" >&2
+            return 1
+          fi
+        fi
+        # THE OWNER IS READ AGAIN, IMMEDIATELY BEFORE ANYTHING IS TOUCHED, and it
+        # must still be the exact value whose liveness was measured. Between that
+        # measurement and the break the dead holder's lock can be released
+        # and a LIVE run can take it -- `mkdir` succeeds the moment the directory
+        # is gone -- and a break made on the old measurement would then destroy
+        # that run's lock while this one's `mkdir` succeeds, leaving two runs on
+        # one isolated port and data directory. Measured 6/6 before this re-read,
+        # 0/6 after; see negative-controls/dev-runtime-lock-race-controls.sh.
+        #
+        # This comparison is NOT what makes the break safe -- it cannot be, since
+        # a read is not a removal and the lock can change hands again in the
+        # instant after it. It is the cheap first filter; the rename below is the
+        # part that decides, because it is the only step here that no two
+        # processes can both perform. What the comparison buys is that the common
+        # case never gets as far as moving a live peer's directory.
+        recheck=0
+        owner_again="$(sed -n '1p' "$LOCK_OWNER_FILE")" || recheck=$?
+        if (( recheck != 0 )) || [[ "$owner_again" != "$owner" ]]; then
+          echo "error: the dev runtime lock changed hands while this run was" >&2
+          echo "       measuring it stale: $LOCK_DIR" >&2
+          echo "       it named [$owner] and now names [$owner_again], so it is" >&2
+          echo "       no longer the lock that was shown to be abandoned and is" >&2
+          echo "       not this run's to break" >&2
+          return 1
+        fi
+        # TEST HOOK 2 OF 2, 0 in every real run, and it widens the window the
+        # re-read above cannot close: between that comparison and the rename
+        # below the lock can still change hands. Hook 1 widens the interval
+        # BEFORE the re-read and this one the interval AFTER it, and
+        # `dev-runtime-lock-race-controls.sh` drives an arm through each. A
+        # widening that could not be performed is not a widening, so its status
+        # is read like every other.
+        if [[ "${DEV_RUNTIME_RACE_SLEEP_BREAK:-0}" != "0" ]]; then
+          if ! sleep "${DEV_RUNTIME_RACE_SLEEP_BREAK}"; then
+            echo "error: DEV_RUNTIME_RACE_SLEEP_BREAK is set and the delay could" >&2
+            echo "       not be performed; not proceeding into the window it" >&2
+            echo "       widens" >&2
+            return 1
+          fi
+        fi
+        # THE BREAK IS ONE ATOMIC RENAME, and that is the whole of the fix.
+        # `rm -f owner` followed by `rmdir` was TWO destructive steps against a
+        # directory that could already have been replaced between them: breaker
+        # A re-reads the stale token, breaker B removes the same lock, `mkdir`s
+        # a fresh one, writes token B and starts work -- and A's `rm`/`rmdir`
+        # then delete B's generation, A's `mkdir` succeeds, and both hold. A's
+        # own release compares its own token, finds it, and prints
+        # `DEV_RUNTIME_RESULT: ok`; only B ever notices. A re-read cannot fix
+        # that, because a read is not a removal.
+        #
+        # `rename` is the removal AND the test in one step: at most one process
+        # can move a given directory away, so at most one process can ever
+        # destroy a given GENERATION of this lock, and every other one gets
+        # ENOENT having destroyed nothing.
+        #
+        # So: move the lock aside under a name only this run can have produced,
+        # then read the owner file INSIDE what was moved. Equal to the token
+        # measured stale, and it is this run's to delete. Different -- the holder
+        # released and a new generation was created between the re-read and the
+        # rename -- and a LIVE run has just been left lockless by this one, so
+        # the directory goes straight back and this run goes round. Never
+        # proceed on a generation that was not the one measured.
+        #
+        # TWO RESIDUALS, STATED, and neither is a double-hold.
+        #
+        #   1. A FALSE ALARM, and it is the price of the rename. For the
+        #      microseconds a live generation is moved aside and put back, its
+        #      own holder can reach `release_runtime_lock` and find the lock
+        #      directory or its owner file missing. That release reports the
+        #      lock STOLEN and the run is downgraded, over a lock this file gave
+        #      straight back. It errs in the loud direction: the holder's
+        #      isolation was never actually shared, and a spurious refusal is
+        #      the failure this whole path exists to prefer.
+        #   2. The rename-back is not atomic against a THIRD run's `mkdir`. In
+        #      the instant the directory is aside, a run that knows nothing about
+        #      any of this can create the lock and hold it beside the live
+        #      holder. That window is microseconds and it is not reachable from
+        #      the hooks below, so nothing here measures it; it is narrower than,
+        #      but the same shape as, the `rm`+`rmdir` window this replaces, and
+        #      `mkdir` offers no primitive that would close it. It is detected
+        #      after the fact (the stray path below) and reported, never papered
+        #      over.
+        breaking="$LOCK_DIR.breaking.$$.$RANDOM$RANDOM"
+        # `mv dir existing-dir` moves INTO it rather than over it, so a target
+        # that somehow already exists would swallow the lock instead of renaming
+        # it. Refused rather than overwritten: this run does not know what is
+        # there.
+        if [[ -e "$breaking" ]]; then
+          echo "error: the stale dev runtime lock could not be broken: the name" >&2
+          echo "       it would be moved aside under already exists" >&2
+          echo "       $breaking" >&2
+          return 1
+        fi
+        mv_rc=0
+        mv "$LOCK_DIR" "$breaking" 2>/dev/null || mv_rc=$?
+        if (( mv_rc != 0 )); then
+          # LOST, and losing is the good case. ENOENT means another breaker
+          # renamed this exact generation away first; any other failure means
+          # the rename did not happen either. Both say the same thing about THIS
+          # run: it destroyed nothing, and it has no verdict to report about a
+          # lock it has not looked at since. Go round and look again.
+          continue
+        fi
+        broke_rc=0
+        broke="$(sed -n '1p' "$breaking/${LOCK_OWNER_FILE##*/}")" || broke_rc=$?
+        if (( broke_rc != 0 )) || [[ "$broke" != "$owner" ]]; then
+          # NOT THE GENERATION THAT WAS MEASURED -- a different token, or no
+          # readable owner file at all, which is what a brand-new holder looks
+          # like between its `mkdir` and its owner write. Either way a live run's
+          # lock is in this run's hands and that run does not know it, so it goes
+          # back FIRST, before anything is diagnosed or logged.
+          back_rc=0
+          mv "$breaking" "$LOCK_DIR" 2>/dev/null || back_rc=$?
+          stray="$LOCK_DIR/${breaking##*/}"
+          if (( back_rc == 0 )) && [[ -e "$stray" ]]; then
+            # It did not land AS the lock: a third run `mkdir`ed one in the
+            # instant this one was free and `mv` put the live generation INSIDE
+            # it. `mv -T` would have refused that and is GNU-only, so the
+            # outcome is VERIFIED rather than assumed. Lift it back out so the
+            # third run's lock is not left polluted, then refuse either way.
+            out_rc=0
+            mv "$stray" "$breaking" 2>/dev/null || out_rc=$?
+            if (( out_rc != 0 )); then
+              echo "error: a live dev runtime lock is stranded inside another" >&2
+              echo "       command's lock and could not be moved back out" >&2
+              echo "       $stray" >&2
+            fi
+            back_rc=1
+          fi
+          if (( back_rc != 0 )); then
+            # The worst outcome this function has. A run that believes it holds
+            # the lock now has none, and nothing here can give it one back. It
+            # is stated with both paths because putting it right is a manual act
+            # -- and this run takes nothing, since taking the lock now would put
+            # two commands on one port and data directory, which is the exact
+            # thing being reported.
+            echo "error: the dev runtime lock was moved aside by this run and" >&2
+            echo "       could not be put back; a live command is holding a" >&2
+            echo "       lock that is no longer where it left it" >&2
+            echo "       it named [$broke] and this run measured [$owner]" >&2
+            echo "       lock:  $LOCK_DIR" >&2
+            echo "       moved: $breaking" >&2
+            echo "       nothing was taken; restore it by hand once that command" >&2
+            echo "       has stopped: mv $breaking $LOCK_DIR" >&2
+            return 1
+          fi
+          # Put back, intact. This run destroyed nothing and has no verdict
+          # about the lock that is there now; go round and read it properly.
+          continue
+        fi
+        # PROVABLY THE GENERATION MEASURED STALE, and provably nobody else's to
+        # destroy, because nobody else could have renamed it. `scripts/AGENTS.md`
+        # wants free-before and measured-present-after for a destructive act;
+        # here the rename is both halves at once.
+        if ! rm -rf "$breaking"; then
+          # Not a refusal: the stale generation is already out of the lock's way
+          # and cannot be mistaken for a holder from `$breaking`. What is left is
+          # litter, and litter that is named is not litter that is hidden.
+          echo "note: the broken-out stale dev runtime lock was not removed" >&2
+          echo "      $breaking" >&2
+        fi
       fi
-      # AN OWNER THAT IS NOT A PID IS NOT AN ABSENT OWNER EITHER. The liveness
-      # test below is guarded by `[[ "$owner" =~ ^[0-9]+$ ]]`, so an EMPTY or
-      # MALFORMED owner file used to skip it entirely and fall straight into the
-      # recovery -- unconditionally, for the one file whose whole purpose is to
-      # say who holds this. That contradicted the paragraph above it, which
-      # claims an unparsable pid keeps the lock. The claim is right and the code
-      # was wrong; this is the code.
-      #
-      # A torn owner file is exactly what a run killed mid-write leaves, and it
-      # is also what a run that is very much alive looks like for the instant
-      # between `open` and `write`.
-      # The pid is the token's first field, and an owner file written before the
-      # token existed is one bare pid, which parses the same way.
-      owner_pid="${owner%% *}"
-      if [[ ! "$owner_pid" =~ ^[0-9]+$ ]]; then
-        echo "error: the dev runtime lock owner is not a pid: [$owner]" >&2
-        echo "       $LOCK_OWNER_FILE" >&2
-        echo "       an owner that cannot be parsed cannot be shown to be dead," >&2
-        echo "       so this lock is not being recovered" >&2
-        echo "       remove it by hand once nothing is running: rm -rf $LOCK_DIR" >&2
-        return 1
-      fi
-      # `kill -0 "$owner" 2>/dev/null` stood here, and it is this file's defect
-      # in the one test that decides whether a lock may be TAKEN. `kill -0`
-      # exits 1 for ESRCH and for EPERM alike, and with stderr discarded there
-      # is nothing left to tell them apart -- so a lock held by a live process
-      # this user may not signal read as "stale", and the recovery below
-      # deleted it and took the lock out from under a running command.
-      #
-      # The library already draws that line, from the errno text, for exactly
-      # this reason; it is `kill -0` underneath, so it still answers about the
-      # MSYS pid `$$` records rather than about a Windows pid. It returns 0 only
-      # when the kernel said "No such process", so anything else -- alive,
-      # EPERM, a pid bash refused to parse -- keeps the lock where it is. Which
-      # of those it was cannot be recovered from a builtin that reports one
-      # status for all three, so the message names both rather than picking.
-      if ! errno_says_no_such_process "$owner_pid"; then
-        echo "error: another dev runtime command is active (PID $owner_pid)" >&2
-        echo "       or its liveness could not be measured; either way this" >&2
-        echo "       lock is not being recovered" >&2
-        return 1
-      fi
-      # TEST HOOK, 0 in every real run. It widens the window between the
-      # measurement above and the removals below so that
-      # `negative-controls/dev-runtime-lock-race-controls.sh` can drive the race
-      # deterministically instead of sampling it. A widening that could not be
-      # performed is not a widening, so its status is read like every other.
-      if [[ "${DEV_RUNTIME_RACE_SLEEP:-0}" != "0" ]]; then
-        if ! sleep "${DEV_RUNTIME_RACE_SLEEP}"; then
-          echo "error: DEV_RUNTIME_RACE_SLEEP is set and the delay could not be" >&2
-          echo "       performed; not proceeding into the window it widens" >&2
+      # ROUND 4, and the other half of the retry the comment above promised. When
+      # the wait ended because the lock DIRECTORY was gone, this run has already
+      # created it new, a few lines up, and holds it. There is nothing stale left
+      # to recover: the mkdir below would race every other command on the
+      # worktree to take back what it had just given away.
+      if (( retook == 0 )); then
+        # CHECKED, and this is the second half of the same finding as the owner
+        # write below. A recovery `mkdir` that FAILS means another process won the
+        # race to recreate the lock in the instant after the rename above -- and
+        # under a suspended errexit this carried straight on, wrote its own pid over
+        # the winner's owner file and returned success.
+        if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+          echo "error: the dev runtime lock was retaken while it was being" >&2
+          echo "       recovered: $LOCK_DIR" >&2
+          echo "       another command against this worktree got there first" >&2
           return 1
         fi
       fi
-      # THE OWNER IS READ AGAIN, IMMEDIATELY BEFORE ANYTHING IS REMOVED, and it
-      # must still be the exact value whose liveness was measured. Between that
-      # measurement and these removals the dead holder's lock can be released
-      # and a LIVE run can take it -- `mkdir` succeeds the moment the directory
-      # is gone -- and the removals below would then destroy that run's lock
-      # while this one's `mkdir` succeeds, leaving two runs on one isolated port
-      # and data directory. Measured 6/6 before this re-read, 0/6 after; see
-      # negative-controls/dev-runtime-lock-race-controls.sh.
-      #
-      # RESIDUAL, stated: the window between this comparison and the two
-      # removals is NOT closed -- `mkdir` offers nothing that tests and removes
-      # in one step. `release_runtime_lock` is the other half, from the victim's
-      # side: a run whose lock was broken there reports it instead of finishing
-      # green.
-      recheck=0
-      owner_again="$(sed -n '1p' "$LOCK_OWNER_FILE")" || recheck=$?
-      if (( recheck != 0 )) || [[ "$owner_again" != "$owner" ]]; then
-        echo "error: the dev runtime lock changed hands while this run was" >&2
-        echo "       measuring it stale: $LOCK_DIR" >&2
-        echo "       it named [$owner] and now names [$owner_again], so it is" >&2
-        echo "       no longer the lock that was shown to be abandoned and is" >&2
-        echo "       not this run's to break" >&2
-        return 1
-      fi
-      if ! rm -f "$LOCK_OWNER_FILE"; then
-        echo "error: the stale dev runtime lock owner file could not be removed" >&2
-        echo "       $LOCK_OWNER_FILE" >&2
-        return 1
-      fi
     fi
-    # ROUND 4, and the other half of the retry the comment above promised. When
-    # the wait ended because the lock DIRECTORY was gone, this run has already
-    # created it new, a few lines up, and holds it. There is nothing stale left
-    # to recover: the rmdir below would hand back the directory this run is
-    # holding, and the mkdir after it would race every other command on the
-    # worktree to take back what it had just given away.
-    if (( retook == 0 )); then
-      if ! rmdir "$LOCK_DIR" 2>/dev/null; then
-        echo "error: stale dev runtime lock could not be recovered: $LOCK_DIR" >&2
-        return 1
-      fi
-      # CHECKED, and this is the second half of the same finding as the owner
-      # write below. A recovery `mkdir` that FAILS means another process won the
-      # race to recreate the lock in the instant after the `rmdir` above -- and
-      # under a suspended errexit this carried straight on, wrote its own pid over
-      # the winner's owner file and returned success.
-      if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-        echo "error: the dev runtime lock was retaken while it was being" >&2
-        echo "       recovered: $LOCK_DIR" >&2
-        echo "       another command against this worktree got there first" >&2
-        return 1
-      fi
-    fi
+    acquired=1
+    break
+  done
+  # Every other way out of that loop is a `return 1` with its own diagnosis.
+  # This one is the lost race, twice: nothing here was destroyed and nothing
+  # here is held, so the one thing that must not happen is falling through to
+  # the owner write and recording this run as the owner of somebody else's
+  # directory.
+  if (( acquired == 0 )); then
+    echo "error: the dev runtime lock was broken by another command while this" >&2
+    echo "       one was breaking it, twice over: $LOCK_DIR" >&2
+    echo "       two passes both lost the race to remove the same stale lock," >&2
+    echo "       so this run never held it; re-run once the worktree is quiet" >&2
+    return 1
   fi
   # THE WRITE THIS FUNCTION EXISTS FOR, and the status that used to be dropped.
   # Everything downstream -- `release_runtime_lock`, and the next command's

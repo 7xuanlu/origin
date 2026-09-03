@@ -201,10 +201,10 @@ pnpm vitest run scripts/prepare-sidecars.test.ts scripts/release-version-sync.te
 # first-run/lib.ps1, first-run/port-precheck.sh, first-run/windows-zip.ps1 or
 # first-run/windows-nsis.ps1 (their port, health and process-liveness probes),
 # the Authenticode step in release.yml, or a drift_guard tooth, run the control
-# that defends it -- no PR lane on this repo runs on Windows, so these are a
-# pre-merge step by hand.
-# Run the sweep, not the individual harnesses. Ten separate command lines
-# produce ten separate results and no aggregate: run eight of them, read eight
+# that defends it -- no PR lane runs these negative-control harnesses,
+# lib.test.ps1 or the first-run channels, so these are a pre-merge step by hand.
+# Run the sweep, not the individual harnesses. Eleven separate command lines
+# produce eleven separate results and no aggregate: run eight of them, read eight
 # greens, and conclude the suite swept -- a partial run that looks exactly like
 # a complete one. run-all.sh holds a registry, refuses a harness that exited 0
 # without reaching its completion marker, refuses a marker that contradicts the
@@ -222,6 +222,7 @@ bash    scripts/negative-controls/port-precheck-controls.sh
 bash    scripts/negative-controls/dev-runtime-scan-controls.sh
 bash    scripts/negative-controls/dev-runtime-record-controls.sh
 bash    scripts/negative-controls/dev-runtime-stage-controls.sh
+bash    scripts/negative-controls/dev-runtime-lock-race-controls.sh
 python3 scripts/negative-controls/windows-probes-negative-controls.py
 ```
 
