@@ -32,22 +32,18 @@ $PreexistingServerPids = $null
 # reason the others are: `finally` reads it and `try` may never reach it.
 $SnapshotDoubt = "not recorded"
 # What this run may DELETE at teardown, on the same two-fact licence the
-# process sweep above uses. `Remove-Retry $DataDir` ran unconditionally, and
-# $DataDir is %LOCALAPPDATA%\wenlan -- the developer's real memorydb, config
-# and logs. Sixteen lines above that call this file records
-# `user-data-survives-uninstall`, so the invariant was already written down
-# here; the teardown simply broke it afterwards, where nobody was reading.
+# process sweep above uses. An unconditional `Remove-Retry $DataDir` deletes
+# %LOCALAPPDATA%\wenlan -- the developer's real memorydb, config and logs --
+# sixteen lines below the Check that records `user-data-survives-uninstall`.
 #
 # Absent before AND present after this run installed. Absent-before alone
 # licenses creating and nothing else; a pre-existing tree is never this
 # run's to remove, and unlike the install dir it cannot be reinstalled.
 #
-# ROUND 6 CHANGED WHAT THE SECOND HALF IS. It used to be a second READ, taken
-# a statement after the first, with a marker written a statement after that;
-# it is now a single atomic act that IS the claim. The `$DataDirOwned` and
-# `$installOwned` booleans that carried the old verdict are gone -- a boolean
-# arrives at the teardown saying "yes" and unable to say what it was a yes
-# ABOUT. See WHAT BINDS A TREE TO THIS RUN.
+# The second half is an ACT rather than a second read, so there is no
+# `$DataDirOwned` / `$installOwned` boolean: a boolean arrives at the teardown
+# saying "yes" and unable to say what it was a yes ABOUT. See WHAT BINDS A TREE
+# TO THIS RUN in lib.ps1.
 $preDataDir = $null
 $preInstall = $null
 # The user's files under $DataDir as they were on the statement before the
@@ -162,97 +158,17 @@ function Get-UninstallEntry {
 # MEASURED ON THIS HOST: `Get-Process` returns 288 entries; Id 4 is `System` and
 # Id 0 is `Idle`, both present.
 #
-# AND A FOURTH CHECK, WHICH IS THE ONLY ONE THAT IS INDEPENDENT.
-#
-# Round-3 review adjudicated the three above precisely, and the adjudication is
-# correct: they CAN fail -- Ok=$false when the whole-table call throws, when
-# pid 4 is absent, when fewer than ten rows appear, or when the table
-# contradicts the targeted read -- so they are not tautologically true. But all
-# three read ONE provider, the Win32 process snapshot behind
-# System.Diagnostics.Process, twice. A provider that is filtered, per-session,
-# access-limited or simply incomplete omits the target from the targeted call
-# AND from the whole-table call, both reads agree, and the absence is ratified
-# by its own cause. What those three establish, exactly, is "two Get-Process
-# reads do not contradict each other" -- not "this absence was independently
-# witnessed".
-#
-# So a second PROVIDER is asked: WMI's Win32_Process, served by the winmgmt
-# service, which shares no code with Get-Process below the kernel. A stopped or
-# corrupted WMI repository breaks that read and not this one; a filtered process
-# snapshot breaks this one and not that one. See Get-CimProcessWitness.
-#
-# WHAT IS STILL NOT WITNESSED, said plainly rather than left to be discovered:
-# both providers enumerate the SAME kernel process list, so an omission made by
-# the kernel or by something below it hides the target from both. This witnesses
-# against PROVIDER failure. Nothing available from user mode witnesses against
-# the kernel.
-#
-# A witness with nothing to cover cannot cover anything, so being called with
-# neither an Id nor a Name is itself a refusal rather than a pass.
-function Get-CimProcessWitness {
-    param([int]$ProcessId = 0, [string]$Name = "")
-    $what = if ($Name) { "name '$Name'" } else { "pid $ProcessId" }
-    if (-not $Name -and $ProcessId -le 0) {
-        return [pscustomobject]@{ Ok = $false
-            Detail = "the independent witness was given no process to cover" }
-    }
-    try {
-        $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
-    } catch {
-        return [pscustomobject]@{ Ok = $false
-            Detail = "the independent Win32_Process table could not be read ($($_.Exception.GetType().FullName): $($_.Exception.Message))" }
-    }
-    if (-not @($all | Where-Object { $_.ProcessId -eq 4 }).Count) {
-        return [pscustomobject]@{ Ok = $false
-            Detail = "the Win32_Process table has $($all.Count) rows but no ProcessId 4 (System); it is not the whole table" }
-    }
-    if ($all.Count -lt 10) {
-        return [pscustomobject]@{ Ok = $false
-            Detail = "the Win32_Process table has only $($all.Count) rows; a running Windows session has far more" }
-    }
-    # Win32_Process spells the name with its extension; Get-Process does not.
-    $present = if ($Name) { @($all | Where-Object { $_.Name -ieq $Name -or $_.Name -ieq ($Name + ".exe") }) }
-               else { @($all | Where-Object { $_.ProcessId -eq $ProcessId }) }
-    if ($present.Count -ne 0) {
-        return [pscustomobject]@{ Ok = $false
-            Detail = ("Get-Process reported no $what, but WMI's Win32_Process table of $($all.Count) rows CONTAINS it (pid " +
-                      (($present | ForEach-Object { $_.ProcessId }) -join ", ") + "); two INDEPENDENT providers contradict each other, so neither is a measurement") }
-    }
-    return [pscustomobject]@{ Ok = $true
-        Detail = "WMI's Win32_Process table ($($all.Count) rows, ProcessId 4 present) independently has no $what either" }
-}
-# The witness above only ever answers "and it is absent there too", so it can
-# only corroborate a TOTAL absence. Round-4 review found the gap that leaves:
-# if `Get-Process -Name wenlan-server` SUCCEEDS but returns an incomplete
-# non-empty set, the pre-run snapshot silently omits a pid -- and a
-# pre-existing, same-image daemon that is missing from that snapshot is later
-# classified as one this run created, and killed. A partial success was not
-# corroborated at all, which is this file's whole defect class arriving through
-# the one door still open to it.
-#
-# So the positive path gets its own independent read: the SET of pids, from
-# WMI, to compare against. Same provider independence as above, same stated
-# limit -- both enumerate the same kernel table.
-function Get-CimProcessSet([string]$Name) {
-    try {
-        $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
-    } catch {
-        return [pscustomobject]@{ Ok = $false; Pids = @()
-            Detail = "the independent Win32_Process table could not be read ($($_.Exception.GetType().FullName): $($_.Exception.Message))" }
-    }
-    if (-not @($all | Where-Object { $_.ProcessId -eq 4 }).Count) {
-        return [pscustomobject]@{ Ok = $false; Pids = @()
-            Detail = "the Win32_Process table has $($all.Count) rows but no ProcessId 4 (System); it is not the whole table" }
-    }
-    if ($all.Count -lt 10) {
-        return [pscustomobject]@{ Ok = $false; Pids = @()
-            Detail = "the Win32_Process table has only $($all.Count) rows; a running Windows session has far more" }
-    }
-    $hit = @($all | Where-Object { $_.Name -ieq $Name -or $_.Name -ieq ($Name + ".exe") })
-    return [pscustomobject]@{ Ok = $true
-        Pids = @(@($hit | ForEach-Object { [int]$_.ProcessId }) | Sort-Object)
-        Detail = "WMI's Win32_Process table ($($all.Count) rows, ProcessId 4 present) independently reports $($hit.Count) '$Name' process(es)" }
-}
+# AND A FOURTH CHECK, WHICH IS THE ONLY ONE THAT IS INDEPENDENT. The three
+# above CAN fail, so they are not tautologically true -- but all three read ONE
+# provider, the Win32 process snapshot behind System.Diagnostics.Process,
+# twice. A provider that is filtered, per-session, access-limited or simply
+# incomplete omits the target from the targeted call AND from the whole-table
+# call, both reads agree, and the absence is ratified by its own cause. What
+# those three establish, exactly, is "two Get-Process reads do not contradict
+# each other" -- not "this absence was independently witnessed". So a second
+# PROVIDER is asked: `Get-CimProcessWitness` in lib.ps1, WMI's Win32_Process,
+# which shares no code with Get-Process below the kernel. `Get-CimProcessSet`
+# beside it is the same independence for a NON-EMPTY read.
 
 function Get-ProcessTableWitness {
     param([int]$Id = 0, [string]$Name = "")
@@ -543,28 +459,6 @@ function Stop-ProcessByImage {
     return [pscustomobject]@{ State = "killed"; Detail = "pid $ProcessId ('$got') was killed" }
 }
 
-# Tri-state: `Test-Path` answers $false for BOTH "not there" and "there, but
-# I was not allowed to look", and a delete licensed by the second reading is
-# a delete of a tree this run never made.
-#
-# The Path travels WITH the answer. This channel reads the documented install
-# path before the installer runs and then DISCOVERS the real one by searching,
-# so a pre-read and the tree it is later spent on are two different variables
-# of the same shape; carrying the path lets New-OwnerMark refuse a pre-read
-# that is about somewhere else instead of silently honouring it.
-function Get-DirPresence([string]$Path) {
-    try {
-        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-        return [pscustomobject]@{ State = "present"; CreatedUtc = $item.CreationTimeUtc; Path = $Path
-            Detail = "$Path exists, created $($item.CreationTimeUtc.ToString('o'))" }
-    } catch [System.Management.Automation.ItemNotFoundException] {
-        return [pscustomobject]@{ State = "absent"; CreatedUtc = $null; Path = $Path; Detail = "$Path does not exist" }
-    } catch {
-        return [pscustomobject]@{ State = "unmeasurable"; CreatedUtc = $null; Path = $Path
-            Detail = "could not read $Path -- $($_.Exception.Message)" }
-    }
-}
-
 # Every file under a tree, by relative path and SHA-256. Two states: taken, or
 # unmeasurable. A PARTIAL snapshot is unmeasurable rather than short, because
 # the files it failed to read are exactly the ones a later comparison would
@@ -599,366 +493,22 @@ function Get-TreeFileDigests([string]$Root) {
         Detail = "$($files.Count) files under $Root, SHA-256 each, the ownership marker excluded" }
 }
 
-# --- WHAT BINDS A TREE TO THIS RUN -----------------------------------------
+# WHAT BINDS A TREE TO THIS RUN is `New-OwnerMark` / `Test-OwnerMark` /
+# `Close-OwnerMark` in lib.ps1, where the mechanism and its residuals are
+# written down. Two facts belong to this channel and are here:
 #
-# "Absent before AND present after" is a SEQUENCE OF STATES, and round-5 review
-# named exactly what it is not: causation. Two different races fit inside it.
-#
-#   REPLACEMENT -- this run creates the tree; something removes and recreates
-#       it before the teardown; the teardown deletes the replacement. Both
-#       reads were true and both were about a different directory.
-#   CREATION -- another process, most plausibly the developer launching Wenlan
-#       while the gauntlet runs, creates %LOCALAPPDATA%\wenlan between the
-#       pre-read and the post-read, and the post-read sees a tree this run did
-#       not make.
-#
-# ROUND 6 CHANGED WHAT THE SECOND HALF IS, in both channels. It used to be a
-# second READ -- `$pre.State -eq "absent" -and (Get-DirPresence $X).State -eq
-# "present"` -- and then, on the NEXT statement, a marker was written into
-# whatever was there. Two operations, and review found the schedule that fits
-# between them: the post-read sees this run's tree, the tree is replaced, the
-# marker is written into the REPLACEMENT, and the teardown verifies its own
-# marker and deletes a stranger's directory. The marker was supposed to close
-# the replacement race and it was written on the far side of it.
-#
-# THE CLAIM IS NOW ONE ACT. `New-OwnerMark` opens the marker file with
-# FileMode.CreateNew, which is the filesystem's own atomic
-# create-if-and-only-if-absent -- there is no window between deciding the file
-# is not there and making it. That single call is BOTH halves of the licence:
-#
-#   It is the post-read. CreateNew under a path that does not exist raises
-#       DirectoryNotFoundException, so a statement that was supposed to create
-#       the tree and did not is reported as "there is nothing here to own"
-#       rather than being papered over by a separate Get-DirPresence.
-#   It is the mark. A marker that already exists raises IOException with
-#       ERROR_FILE_EXISTS, which means another run -- concurrent, or one that
-#       died holding the tree -- claimed this path first. This run does not
-#       claim it as well.
-#
-# AND THE HANDLE IS HELD FOR THE LIFE OF THE RUN. The stream stays open, with
-# FileOptions.DeleteOnClose and with FileShare.Delete deliberately WITHHELD.
-# MEASURED ON THIS HOST (Windows PowerShell 5.1.26100.9278), against a scratch
-# tree, with the marker held exactly as this code holds it:
-#
-#   Remove-Item -Recurse -Force <tree>  -> System.IO.IOException, the tree
-#                                          survived, the marker survived
-#   Rename-Item <tree>                  -> System.IO.IOException, refused
-#   a second CreateNew on the marker    -> IOException 0x80070050 (exists)
-#   reading the marker THROUGH ITS PATH -> the GUID, byte for byte
-#   Dispose()                           -> the marker was gone afterwards
-#
-# and, run again with FileShare.Delete GRANTED on the writer, the same
-# `Remove-Item -Recurse -Force` DELETED THE WHOLE TREE while the handle was
-# open. That is the control on the choice: the withheld Delete is what makes
-# the replacement impossible rather than merely detectable.
-#
-# DeleteOnClose is also what closes the marker LEAK. The previous version wrote
-# an ordinary file and, on any failure after the write, returned `Ok = $false`
-# without removing it -- so a tree this run declined to own kept a marker for
-# ever, and every later run refused to claim a directory it had created itself.
-# Here the kernel removes the file when the handle goes, including when this
-# process is killed. `Close-OwnerMark` still CHECKS that it went, because
-# "the kernel does this" is a claim about a mechanism.
-#
-# THE INSTALL DIR IS MARKED TOO, AND RELEASED ON PURPOSE. Round 5 gave it a
-# creation-timestamp check instead, on the reasoning that a marker file left
-# inside %LOCALAPPDATA%\Programs\Wenlan would make the uninstaller fail and
-# `uninstall-removes-dir` -- the row this whole channel exists to produce --
-# would grade this script rather than the product. The reasoning about the
-# uninstaller was right and the remedy was not: NTFS FILE-SYSTEM TUNNELING
-# gives a directory recreated under the same name within about fifteen seconds
-# the creation timestamp of the one it replaced, so the check answered
-# "verified" for exactly the replacement it existed to catch. It is gone. The
-# install dir carries a real marker, and the marker is RELEASED immediately
-# before `uninstall-silent`, which removes the file before the uninstaller ever
-# sees it. After that release the mark can establish one thing about the path,
-# and it is the one the teardown backstop needs: whether anything is still
-# standing there.
-#
-# WHAT IS STILL NOT CLOSED, stated here rather than left to be discovered:
-#
-#   CREATION IS NARROWED TO THE CREATING STATEMENT, NOT CLOSED. The claim is
-#       taken on the statement after the one that creates the tree, so the
-#       window is that statement alone. For the data dir that is the silent
-#       installer's own run; for the install dir it is the same. If something
-#       else creates %LOCALAPPDATA%\wenlan inside the installer's runtime and
-#       the installer then finds it already there, this run marks and later
-#       deletes a tree it did not make. The filesystem does not record which
-#       process created a directory, so nothing available here makes that
-#       window zero. It is a real residual and it is smaller than the whole-run
-#       window it replaced.
-#
-#   THE RELEASE-TO-DELETE WINDOW. The handle has to be closed before the tree
-#       can be removed, so between `Close-OwnerMark` and `Remove-Retry` the
-#       tree is unprotected. It is a few statements wide and it is not zero.
-#
-#   THE INSTALL DIR AFTER THE RELEASE. From `uninstall-silent` onward nothing
-#       binds that path to this run at all -- deliberately, so the uninstaller
-#       is graded on its own. The teardown backstop therefore deletes NOTHING
-#       there once the release has happened; it can only report the tree gone
-#       or refuse.
-#
-#   IDENTITY, NOT CONTENTS. A verified marker says the tree at this path is the
-#       one this run created. It says nothing about what else is inside it.
-$OwnerMarkerName = ".wenlan-first-run-owner"
-# ERROR_FILE_EXISTS as .NET reports it. MEASURED on this host: a CreateNew over
-# an existing file raises System.IO.IOException with HResult -2147024816
-# (0x80070050). The HResult is the only usable key -- the same exception TYPE
-# also carries the sharing violation (0x80070020) and the access denial
-# (0x80070005), and the MESSAGE that separates them is localised.
-$OwnerMarkExistsHResult = -2147024816
-
-# Read the marker THROUGH ITS PATH. That is the whole point of this function:
-# this run holds a handle to the marker, and reading through that handle would
-# only establish that the handle is still open. What has to be established is
-# that the file AT THAT PATH is still the one this run created.
-#
-# The share flags are a measurement, not a guess. DeleteOnClose makes .NET open
-# the marker with DELETE access on top of ReadWrite, so a reader that does not
-# itself grant FileShare.Delete is refused by the sharing check -- MEASURED
-# here, both `[System.IO.File]::ReadAllText` and a FileStream opened with
-# FileShare.ReadWrite failed with 0x80070020 against this run's OWN marker.
-# Granting Delete in the READER changes nothing about who may delete the file;
-# only the writer's share flags decide that, and those withhold it.
-#
-# Tri-state: read / gone / unmeasurable. `gone` is the marker or its tree not
-# being there, which is a fact about the tree; anything else is a failure to
-# look, which is a fact about this probe.
-function Get-OwnerMarkText([string]$File) {
-    $share = ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
-    $stream = $null
-    $reader = $null
-    try {
-        $stream = New-Object System.IO.FileStream ($File, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
-        $reader = New-Object System.IO.StreamReader ($stream, [System.Text.Encoding]::UTF8)
-        return [pscustomobject]@{ State = "read"; Text = "$($reader.ReadToEnd())".Trim()
-            Detail = "$File was read back through its own path" }
-    } catch {
-        # MEASURED ON THIS HOST: PowerShell wraps a .NET constructor's exception
-        # in System.Management.Automation.MethodInvocationException exactly as it
-        # wraps a method's, so the type that says WHICH failure this is sits one
-        # level in -- MethodInvocationException -> System.IO.FileNotFoundException
-        # for a missing marker, -> System.IO.DirectoryNotFoundException for a
-        # missing tree. Reading only the outer type puts both in the unmeasurable
-        # arm, which is safe but mute, and the teardown log is where anyone finds
-        # out which one happened.
-        $ex = $_.Exception
-        if ($ex.GetType().FullName -eq "System.Management.Automation.MethodInvocationException" -and
-            $null -ne $ex.InnerException) { $ex = $ex.InnerException }
-        $t = $ex.GetType().FullName
-        if ($t -eq "System.IO.FileNotFoundException") {
-            return [pscustomobject]@{ State = "gone"; Text = ""
-                Detail = "$File is not there ($t): $($ex.Message)" }
-        }
-        if ($t -eq "System.IO.DirectoryNotFoundException") {
-            return [pscustomobject]@{ State = "gone"; Text = ""
-                Detail = "the tree holding $File is not there ($t): $($ex.Message)" }
-        }
-        return [pscustomobject]@{ State = "unmeasurable"; Text = ""
-            Detail = "$File could not be read ($t, hresult $($ex.HResult)): $($ex.Message)" }
-    } finally {
-        # Disposing the reader disposes the stream under it; if the reader was
-        # never built, the stream still has to go.
-        if ($null -ne $reader) { try { $reader.Dispose() } catch { Write-Host "teardown: the marker read handle on $File would not close: $($_.Exception.Message)" } }
-        elseif ($null -ne $stream) { try { $stream.Dispose() } catch { Write-Host "teardown: the marker read handle on $File would not close: $($_.Exception.Message)" } }
-    }
-}
-
-# CLAIM a tree for this run, in one act. Tri-state -- owned / not-owned /
-# unmeasurable -- and every caller branches on all three.
-#
-# $Pre is the pre-read of THIS path, and it is a parameter rather than a
-# file-scope lookup so that the pair cannot drift apart. THIS CHANNEL IS WHERE
-# THAT MATTERS: it reads the DOCUMENTED install path before the installer runs
-# and then DISCOVERS the real one afterwards by searching, so "the pre-read"
-# and "the tree being claimed" are two different variables that look
-# interchangeable. The mark refuses a pre-read taken against a different path.
-function New-OwnerMark([string]$Path, $Pre) {
-    $file = Join-Path $Path $script:OwnerMarkerName
-    if ($null -eq $Pre) {
-        return [pscustomobject]@{ State = "not-owned"; Guid = ""; File = $file; Path = $Path; Stream = $null
-            Detail = "$Path was never read before this run created anything, so nothing can show the tree there now is this run's" }
-    }
-    if (-not [string]::Equals("$($Pre.Path)".TrimEnd('\'), "$Path".TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
-        return [pscustomobject]@{ State = "not-owned"; Guid = ""; File = $file; Path = $Path; Stream = $null
-            Detail = "the pre-read offered for $Path is about '$($Pre.Path)'; a licence taken out on one path is not a licence over another" }
-    }
-    if ($Pre.State -ne "absent") {
-        return [pscustomobject]@{ State = "not-owned"; Guid = ""; File = $file; Path = $Path; Stream = $null
-            Detail = "$Path was '$($Pre.State)' before this run ($($Pre.Detail)), so this run did not create it and may not delete it" }
-    }
-    $guid = [guid]::NewGuid().ToString()
-    $stream = $null
-    try {
-        $stream = New-Object System.IO.FileStream ($file,
-            [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite,
-            [System.IO.FileShare]::ReadWrite, 4096, [System.IO.FileOptions]::DeleteOnClose)
-    } catch {
-        $ex = $_.Exception
-        if ($ex.GetType().FullName -eq "System.Management.Automation.MethodInvocationException" -and
-            $null -ne $ex.InnerException) { $ex = $ex.InnerException }
-        $t = $ex.GetType().FullName
-        if ($t -eq "System.IO.DirectoryNotFoundException") {
-            return [pscustomobject]@{ State = "not-owned"; Guid = ""; File = $file; Path = $Path; Stream = $null
-                Detail = "$Path is not there, so the step that was supposed to create it did not; there is nothing here for this run to own" }
-        }
-        if ($t -eq "System.IO.IOException" -and $ex.HResult -eq $script:OwnerMarkExistsHResult) {
-            return [pscustomobject]@{ State = "not-owned"; Guid = ""; File = $file; Path = $Path; Stream = $null
-                Detail = "$file already exists, so the tree at $Path is already claimed -- by a concurrent run, or by one that died holding it; this run will not claim it as well" }
-        }
-        return [pscustomobject]@{ State = "unmeasurable"; Guid = ""; File = $file; Path = $Path; Stream = $null
-            Detail = "the ownership marker $file could not be created ($t, hresult $($ex.HResult): $($ex.Message)); this run will not delete a tree it could not claim" }
-    }
-    $failure = ""
-    try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($guid)
-        $stream.Write($bytes, 0, $bytes.Length)
-        $stream.Flush()
-    } catch {
-        $failure = "the ownership marker $file was created but could not be written ($($_.Exception.GetType().FullName): $($_.Exception.Message))"
-    }
-    if (-not $failure) {
-        $back = Get-OwnerMarkText $file
-        if ($back.State -ne "read") {
-            $failure = "the ownership marker $file did not read back through its own path: $($back.Detail)"
-        } elseif ($back.Text -ne $guid) {
-            $failure = "the ownership marker $file reads back as '$($back.Text)', not the '$guid' just written"
-        }
-    }
-    if ($failure) {
-        # A marker written and then NOT owned must not be left behind: that is
-        # the marker residue, and it is a leak that makes every later run read
-        # this tree as pre-existing. Dispose IS the removal here, because of
-        # DeleteOnClose -- and a Dispose that failed is reported rather than
-        # swallowed, which is the other half of the same finding.
-        $rid = "the half-made marker went with its handle"
-        try { $stream.Dispose() }
-        catch { $rid = "AND THE HANDLE WOULD NOT CLOSE ($($_.Exception.Message)), so $file MAY STILL BE THERE" }
-        return [pscustomobject]@{ State = "unmeasurable"; Guid = ""; File = $file; Path = $Path; Stream = $null
-            Detail = "$failure; $rid" }
-    }
-    return [pscustomobject]@{ State = "owned"; Guid = $guid; File = $file; Path = $Path; Stream = $stream
-        Detail = "$file was created exclusively by this run, carries $guid, and is HELD OPEN, so $Path cannot be removed or renamed while this run holds it" }
-}
-
-# Is the tree at $Path still the tree this run claimed? Asked IMMEDIATELY
-# before the release-and-delete, not once at the top of the teardown.
-#
-# Every state but `verified` and `gone` means DO NOT DELETE. The exception
-# types inside Get-OwnerMarkText are compared BY NAME for the reason
-# Get-ProcessLiveness gives at length: a type literal is resolved at run time
-# and throws when its assembly is not loaded, and a throw inside the classifier
-# is the classifier failing at the one job it has.
-function Test-OwnerMark($Mark, [string]$Path) {
-    if ($null -eq $Mark) {
-        return [pscustomobject]@{ State = "unmarked"
-            Detail = "no ownership marker was ever attempted for this tree, so nothing binds it to this run" }
-    }
-    if ($Mark.State -eq "released") {
-        # The install dir's claim is given up ON PURPOSE immediately before the
-        # uninstaller runs, so that `uninstall-removes-dir` grades the product
-        # and not a file this script is holding open. After that there is
-        # exactly one thing left to establish about the path, and it happens to
-        # be the one the teardown backstop needs.
-        $now = Get-DirPresence $Mark.Path
-        if ($now.State -eq "absent") {
-            return [pscustomobject]@{ State = "gone"
-                Detail = "$($Mark.Path) is gone, which is what this run released its claim on it for: the uninstaller was left free to remove it" }
-        }
-        if ($now.State -eq "present") {
-            return [pscustomobject]@{ State = "released"
-                Detail = "this run gave up its claim on $($Mark.Path) before the uninstaller ran, and something is standing there now; nothing binds that tree to this run any more, so it is not this run's to delete" }
-        }
-        return [pscustomobject]@{ State = "unmeasurable"
-            Detail = "this run released its claim on $($Mark.Path) and cannot now read whether anything is there -- $($now.Detail)" }
-    }
-    if ($Mark.State -ne "owned" -or $null -eq $Mark.Stream) {
-        return [pscustomobject]@{ State = "unmarked"
-            Detail = "this run never claimed this tree ($($Mark.State)): $($Mark.Detail)" }
-    }
-    if (-not [string]::Equals("$($Mark.Path)".TrimEnd('\'), "$Path".TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
-        return [pscustomobject]@{ State = "not-this-run"
-            Detail = "this run's mark is on '$($Mark.Path)' and the tree about to be deleted is '$Path'; a claim on one path is not a claim on another" }
-    }
-    $got = Get-OwnerMarkText $Mark.File
-    if ($got.State -eq "gone") {
-        return [pscustomobject]@{ State = "not-this-run"
-            Detail = "the marker this run created is no longer at $($Mark.File) ($($got.Detail)); whatever is at $Path now is not the tree this run created" }
-    }
-    if ($got.State -ne "read") {
-        return [pscustomobject]@{ State = "unmeasurable"
-            Detail = "the marker $($Mark.File) could not be read: $($got.Detail)" }
-    }
-    if ([string]::Equals($got.Text, $Mark.Guid, [System.StringComparison]::OrdinalIgnoreCase)) {
-        return [pscustomobject]@{ State = "verified"
-            Detail = "$($Mark.File) still carries this run's marker $($Mark.Guid), read back through its own path" }
-    }
-    return [pscustomobject]@{ State = "not-this-run"
-        Detail = "$($Mark.File) carries '$($got.Text)', not this run's marker $($Mark.Guid)" }
-}
-
-# Give up the claim, and MEASURE that it was given up. Four states:
-# released / residue / unmeasurable / nothing-held.
-#
-# Two callers, for two different reasons. `uninstall-silent` releases the
-# install dir so the uninstaller can remove a tree this script is not holding
-# open. The teardown releases whatever is left, because a tree cannot be
-# deleted while a handle is open inside it -- the lock working as designed. A
-# failure to release is REPORTED, never swallowed, because the marker residue
-# IS a removal that did not happen and did not say so.
-function Close-OwnerMark($Mark) {
-    if ($null -eq $Mark -or $Mark.State -ne "owned" -or $null -eq $Mark.Stream) {
-        return [pscustomobject]@{ State = "nothing-held"
-            Detail = "this run holds no marker to release$(if ($null -ne $Mark) { " (the mark is '$($Mark.State)': $($Mark.Detail))" })" }
-    }
-    $file = $Mark.File
-    try { $Mark.Stream.Dispose() }
-    catch {
-        return [pscustomobject]@{ State = "unmeasurable"
-            Detail = "the marker handle on $file would not close ($($_.Exception.GetType().FullName): $($_.Exception.Message)); the marker may still be there and the tree may still be locked against deletion" }
-    }
-    $Mark.Stream = $null
-    $Mark.State = "released"
-    # DeleteOnClose is a kernel flag, not a promise this script keeps, so it is
-    # CHECKED rather than assumed.
-    $after = Get-OwnerMarkText $file
-    if ($after.State -eq "gone") {
-        return [pscustomobject]@{ State = "released"; Detail = "$file went with its handle, as DeleteOnClose requires" }
-    }
-    if ($after.State -eq "read") {
-        return [pscustomobject]@{ State = "residue"
-            Detail = "$file is STILL THERE after its handle was closed; this run has left a marker behind, the uninstaller may now fail to remove the tree because of it, and the next run will refuse to claim that tree" }
-    }
-    return [pscustomobject]@{ State = "unmeasurable"
-        Detail = "whether $file went with its handle could not be read: $($after.Detail)" }
-}
-
-# A delete that failed ten times was indistinguishable from one that succeeded:
-# every error was swallowed, nothing was returned, and the caller's next line --
-# and the row that grades the teardown -- read a silent exhaustion as a removal.
-# Round-5 review's C4 turns on exactly that. It reports now, in three states,
-# and both callers require the report.
-function Remove-Retry([string]$Target) {
-    $lastError = ""
-    for ($attempt = 1; $attempt -le 10; $attempt++) {
-        try { Remove-Item -Recurse -Force -LiteralPath $Target -ErrorAction Stop }
-        catch { $lastError = "$($_.Exception.GetType().FullName): $($_.Exception.Message)" }
-        # Test-Path answers $false for "there, but I was not allowed to look",
-        # which is how the old loop could return on a tree it never touched.
-        $after = Get-DirPresence $Target
-        if ($after.State -eq "absent") {
-            return [pscustomobject]@{ State = "removed"; Attempts = $attempt
-                Detail = "$Target was measured gone after attempt $attempt$(if ($lastError) { " (last error before it went: $lastError)" })" }
-        }
-        if ($after.State -eq "unmeasurable") {
-            return [pscustomobject]@{ State = "unmeasurable"; Attempts = $attempt
-                Detail = "after attempt $attempt, whether $Target is gone could not be read -- $($after.Detail)$(if ($lastError) { "; last delete error: $lastError" })" }
-        }
-        if ($attempt -lt 10) { Start-Sleep -Milliseconds 500 }
-    }
-    return [pscustomobject]@{ State = "failed"; Attempts = 10
-        Detail = "$Target is still there after 10 delete attempts over about 5s; last error: $(if ($lastError) { $lastError } else { "none was reported" })" }
-}
+#   THE INSTALL DIR CARRIES A MARKER AND IT IS RELEASED ON PURPOSE, immediately
+#       before `uninstall-silent`, so the file is gone before the uninstaller
+#       ever sees it and `uninstall-removes-dir` -- the row this whole channel
+#       exists to produce -- grades the product rather than a handle this script
+#       is holding open. A creation-TIMESTAMP check is not an alternative: NTFS
+#       FILE-SYSTEM TUNNELING gives a directory recreated under the same name
+#       within about fifteen seconds the creation timestamp of the one it
+#       replaced, so such a check answers "verified" for exactly the replacement
+#       it exists to catch.
+#   AND FROM THAT RELEASE ONWARD NOTHING BINDS THAT PATH TO THIS RUN. The
+#       teardown backstop therefore deletes NOTHING there; it can only report
+#       the tree gone (`Test-OwnerMark` -> `gone`) or refuse.
 
 # The rows this channel owes, declared before the run rather than derived from
 # it. The helpers declare their own (cli-*, mcp-*) from their own inputs.
