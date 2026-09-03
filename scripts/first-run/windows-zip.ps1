@@ -403,18 +403,29 @@ function Get-HealthReachability([string]$Url) {
 #
 # The parse is the one scripts/lib/host-process.sh already argues for, ported:
 #
-#   Every line that CLAIMS to be a protocol row must BE one -- TCP with five
-#       fields, UDP with four, a numeric pid last. A merged warning that begins
-#       with a protocol name, or a row torn in half, is a REFUSAL, because a
-#       failed parse that matched no row for our port would otherwise read as a
-#       measured negative.
+#   EVERY non-blank line must BE a row -- TCP with five fields, UDP with four,
+#       a numeric pid last -- except at most two before the first row, which is
+#       netstat's own preamble (the banner and the column header, both
+#       localised, so they can only be counted). A status-0 `WARNING: partial
+#       results` merged beside real rows begins with neither protocol name, so
+#       a parse that only inspected lines already starting TCP/UDP never looked
+#       at it and reported a truncated remainder as a measured negative.
 #   LISTENING IS NOT A KEY. netstat's State column is localised -- German
 #       Windows prints ABHOEREN -- so the structural rule is used instead: a
 #       listening socket is the TCP row with a WILDCARD foreign address, because
 #       a connected one names its peer.
+#   A UDP ROW IS THE END WITNESS. `netstat -ano` prints the whole TCP table and
+#       then the whole UDP table, so a UDP row is evidence the stream got past
+#       every TCP row there was; without one the table may have stopped early,
+#       and every remaining row still validates. The ordering that inference
+#       rests on is checked rather than assumed: a TCP row after a UDP row is a
+#       stream this argument does not apply to.
 #   At least one listening row must exist somewhere in the table, so a netstat
 #       whose columns have moved is unmeasurable rather than empty. Same stated
 #       cost as above, same reason it is unreachable on Windows.
+#   THE RESIDUAL, stated: a hole in the MIDDLE of the TCP section is invisible
+#       here -- the UDP rows after it still arrive -- and so is a short TCP
+#       section, because netstat has no row that must appear in every table.
 function Get-PortListenerWitness([int]$Port) {
     $r = Invoke-Native "netstat.exe" @("-ano")
     if (-not $r.Ran) {
@@ -426,24 +437,40 @@ function Get-PortListenerWitness([int]$Port) {
             Detail = "netstat -ano exited $($r.ExitCode): $($r.Output -replace "`r?`n", ' ')" }
     }
     $listening = 0
+    $rows = 0
+    $preamble = 0
     $notARow = 0
+    $udp = 0
+    $tcpAfterUdp = 0
     $hits = New-Object System.Collections.Generic.List[string]
     foreach ($line in @($r.Output -split "`r?`n")) {
         $f = @(($line -split '\s+') | Where-Object { $_ })
         if ($f.Count -eq 0) { continue }
-        if ($f[0] -ne "TCP" -and $f[0] -ne "UDP") { continue }
         $wellFormed = (($f[0] -eq "TCP" -and $f.Count -eq 5 -and $f[4] -match '^\d+$') -or
                        ($f[0] -eq "UDP" -and $f.Count -eq 4 -and $f[3] -match '^\d+$'))
-        if (-not $wellFormed) { $notARow++; continue }
+        if (-not $wellFormed) {
+            if ($rows -ne 0) { $notARow++ } else { $preamble++ }
+            continue
+        }
+        $rows++
+        if ($f[0] -eq "UDP") { $udp++ } elseif ($udp -ne 0) { $tcpAfterUdp++ }
         if ($f[0] -ne "TCP") { continue }
         if ($f[2] -ne "0.0.0.0:0" -and $f[2] -ne "[::]:0" -and $f[2] -ne "*:*") { continue }
         $listening++
         # Anchored, so :7878 does not match :78780 or a foreign address.
         if ($f[1] -match (':' + $Port + '$')) { $hits.Add($f[4]) }
     }
-    if ($notARow -ne 0) {
+    if ($notARow -ne 0 -or $preamble -gt 2) {
         return [pscustomobject]@{ State = "unmeasurable"; OwningProcess = $null
-            Detail = "$notARow of netstat's protocol lines are not rows this parse understands; a table it cannot read cannot witness for $Port" }
+            Detail = "$($preamble + $notARow) of netstat's lines are not rows this parse understands ($preamble before the first row, where netstat's own preamble is two, and $notARow after it); a table it cannot read cannot witness for $Port" }
+    }
+    if ($tcpAfterUdp -ne 0) {
+        return [pscustomobject]@{ State = "unmeasurable"; OwningProcess = $null
+            Detail = "netstat printed $tcpAfterUdp TCP rows after a UDP row, so the sections are interleaved and a UDP row no longer witnesses that the TCP section ended; the table cannot witness for $Port" }
+    }
+    if ($udp -lt 1) {
+        return [pscustomobject]@{ State = "unmeasurable"; OwningProcess = $null
+            Detail = "netstat printed no UDP row, so nothing witnesses that the TCP section ENDED rather than stopped early; a table that may be truncated cannot witness for $Port" }
     }
     if ($listening -lt 1) {
         return [pscustomobject]@{ State = "unmeasurable"; OwningProcess = $null
