@@ -41,6 +41,7 @@ jobs:
       plugin-rust-contract: ${{ steps.filter.outputs.plugin-rust-contract }}
       plugin-version-contract: ${{ steps.filter.outputs.plugin-version-contract }}
       npm:     ${{ steps.filter.outputs.npm }}
+      release-contract: ${{ steps.filter.outputs.release-contract }}
       app:     ${{ steps.filter.outputs.app }}
       macos:   ${{ steps.filter.outputs.macos }}
       windows: ${{ steps.filter.outputs.windows }}
@@ -183,6 +184,14 @@ jobs:
               # or hook installation reports green.
               - 'scripts/dev-all.sh'
               - 'scripts/dev-runtime.sh'
+              # host-process.sh is the shared port/liveness/image probe library
+              # dev-runtime.sh and the smokes stand on, and host-process.test.ts
+              # is its only suite. Without this line a PR touching ONLY the
+              # library matches `scripts/**` in the rust filter, which runs
+              # cargo and not Vitest -- so app-check is never scheduled and
+              # none of its cases run. The library every probe depends on was
+              # the one file whose own changes were unguarded.
+              - 'scripts/lib/host-process.sh'
               - 'scripts/install-git-hooks.mjs'
               - 'scripts/run-bash.mjs'
               - '.github/workflows/ci.yml'
@@ -281,6 +290,22 @@ jobs:
               - 'scripts/bump-version.test.sh'
               - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
+            # The release workflow's shipped contracts. `docs` already routes
+            # release.yml and ci.yml to the Ubuntu provenance lane, which runs
+            # this suite -- but the Authenticode half of it needs a host that
+            # can call Get-AuthenticodeSignature over a real signed file, and
+            # Ubuntu reports those rows UNCHECKED and moves on. This filter
+            # feeds the Windows lane that runs the same suite with
+            # WENLAN_REQUIRE_AUTHENTICODE=1, where UNCHECKED is fatal.
+            #
+            # The suite's own file is listed, which `docs` does not do: a change
+            # to release-workflow-contract.test.py alone currently runs nothing
+            # at all.
+            release-contract:
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/release.yml'
+              - '.github/workflows/signpath-status.yml'
+              - 'scripts/release-workflow-contract.test.py'
             npm:
               - 'crates/*/npm/**'
             macos:
@@ -2178,6 +2203,43 @@ jobs:
           python3 scripts/update-readme-eval.test.py
           bash scripts/validate-versions.test.sh
 
+  # The Authenticode half of scripts/release-workflow-contract.test.py needs a
+  # Windows host. On Ubuntu -- the `docs` lane, which is where that suite runs
+  # today -- Get-AuthenticodeSignature does not exist, so five of the truth
+  # table's six rows and four of its five mutations print UNCHECKED and the
+  # suite exits 0. That is the repository's own recurring defect: a measurement
+  # that could not be taken, reported in a way that reads like one that came
+  # back clean. WENLAN_REQUIRE_AUTHENTICODE=1 turns those UNCHECKED lines fatal,
+  # and it is set HERE and only here, because a lane that cannot run the check
+  # must not be told to require it.
+  #
+  # Deliberately not folded into app-windows-bundle: that job is
+  # workflow_dispatch-only and is not in `conclusion` below, so nothing it
+  # measures is required of a pull request. This one is small (a checkout and a
+  # python run, no cargo) and it is required.
+  windows-release-contract:
+    name: windows release contract
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.release-contract == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      # `shell: bash` is Git Bash on this runner, which is what the suite's own
+      # posix_bash() resolves for the SignPath guard fragments; pwsh is found by
+      # its _powershell(). Nothing here installs anything: python, Git Bash and
+      # PowerShell are all on the windows-2022 image.
+      - name: Run the release workflow contract with Authenticode required
+        shell: bash
+        env:
+          WENLAN_REQUIRE_AUTHENTICODE: "1"
+        run: python scripts/release-workflow-contract.test.py
+
   runtime-image:
     name: runtime image smoke
     needs: [detect-changes]
@@ -2240,7 +2302,7 @@ jobs:
   # with no matching diff must be skipped.
   conclusion:
     name: conclusion
-    needs: [detect-changes, release-base-proof, fmt, lint, linux-nextest-build, linux-nextest, macos-nextest-build, macos-nextest, test, mcp-platform, canonical-acceptance, contract-integration, release-preflight, docs, plugin, plugin-rust-contract, npm, runtime-image, app-check]
+    needs: [detect-changes, release-base-proof, fmt, lint, linux-nextest-build, linux-nextest, macos-nextest-build, macos-nextest, test, mcp-platform, canonical-acceptance, contract-integration, release-preflight, docs, windows-release-contract, plugin, plugin-rust-contract, npm, runtime-image, app-check]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     steps:
@@ -2287,6 +2349,7 @@ jobs:
           expect_job contract-integration "$run_contract" '${{ needs.contract-integration.result }}'
           expect_job release-preflight '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && (github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'release-please--branches--') || needs.detect-changes.outputs.release-preflight == 'true') }}' '${{ needs.release-preflight.result }}'
           expect_job docs '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.docs == 'true' }}' '${{ needs.docs.result }}'
+          expect_job windows-release-contract '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.release-contract == 'true' }}' '${{ needs.windows-release-contract.result }}'
           expect_job plugin '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.plugin == 'true' }}' '${{ needs.plugin.result }}'
           expect_job plugin-rust-contract '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.plugin-rust-contract == 'true' }}' '${{ needs.plugin-rust-contract.result }}'
           expect_job npm '${{ needs.detect-changes.outputs.verified-release-merge != 'true' && needs.detect-changes.outputs.npm == 'true' }}' '${{ needs.npm.result }}'
