@@ -595,6 +595,27 @@ lsof_enumerated_listeners() {
 # existed to prevent, and collapsing it is how a port-conflict bug ships.
 listener_pid_for_port() {
   local table hit out rc
+  # An argument that is not a port is not a question this probe can answer, and
+  # "no row matched" is the wrong answer to it -- that is the same sentence as
+  # "nothing is listening", which is exactly the collapse the third state above
+  # exists to prevent. It reached the ledger: with a malformed port,
+  # first-run/port-precheck.sh wrote `PASS ... measured free` and exited 0,
+  # about a port nothing had looked at. Guarded here rather than in that script
+  # because the smokes and dev-runtime.sh pass ports through too, and only one
+  # of the four validates its own.
+  # One spelling. The first cut of this guard was `^[0-9]+$` plus a `10#`
+  # range check, which admitted a zero-padded port and then looked it up with
+  # the RAW argument -- `awk -v port=":$1\$"` against a table that prints
+  # `:135`. Measured, same port, two spellings, opposite answers:
+  #     135         -> rc=0 found, pid 1576
+  #     0000000135  -> rc=1 measured free
+  # A busy port reported as free, inside the guard written to stop exactly
+  # that. Normalising for one of the two uses is how it happened, so this
+  # admits no spelling that needs normalising: no leading zero, at most five
+  # digits (which also settles what `$(( 10#$1 ))` would do with a 23-digit
+  # argument, namely overflow).
+  [[ "${1-}" =~ ^[1-9][0-9]{0,4}$ ]] || return 2
+  (( $1 <= 65535 )) || return 2
   if (( HOST_IS_WINDOWS == 1 )); then
     # netstat is the only listener table Windows offers here. Anchoring the
     # port keeps :17895 from matching :178950 or a foreign address.
