@@ -24,6 +24,22 @@
 # findings.tsv behind; `python3 scripts/first-run/summary.py gauntlet-out`
 # renders the same Markdown the summary job does.
 #
+# GAUNTLET_RUN_TOKEN MUST BE EXPORTED ONCE PER RUN, and the port precheck and the
+# channel that follows it must see the SAME value. Running channel after channel
+# into one reused `$PWD/gauntlet-out` is the documented manual mode above, and
+# both ledgers there are append-only: the precheck row an EARLIER run left sits
+# in exactly the carried region a fresh one lands in, and `Record-CarriedRow`
+# has nothing else to tell the two apart. So the precheck stamps `run=<token>`
+# into its row and the channel refuses a carried row that names a different run
+# -- or none.
+#
+#   export GAUNTLET_RUN_TOKEN="$(date +%s)-$USER"
+#
+# is enough. Export a NEW one when you start the next run; reusing the last
+# one re-arms the defect this closes. Below, each job sets it from
+# `${{ github.run_id }}-${{ github.run_attempt }}-<channel>` at the JOB level,
+# so the precheck step and the channel step read one variable.
+#
 # GAUNTLET_HEALTH_TIMEOUT_SEC (windows-zip only, optional, default 5, floor 5).
 # The health probe's client timeout. A REFUSED loopback connect is not instant
 # on Windows -- it retries the SYN, and measured on the reference host it takes
@@ -351,6 +367,22 @@ jobs:
   # `summary` always sees the full picture; the channel script itself decides
   # pass/fail per check and never aborts early. WENLAN_TEST_FASTEMBED_CACHE is
   # deliberately not set: a new user has no warm model cache.
+  #
+  # `continue-on-error` is also why every job records its channel step's raw
+  # OUTCOME into the artifact. It rewrites the JOB result to `success`, so
+  # `needs.<job>.result` in the summary reads green for a leg that was cancelled
+  # at `timeout-minutes` -- and a leg killed after its precheck and a handful of
+  # PASS rows leaves a NON-EMPTY findings.tsv with no FAIL row in it, which is
+  # the one shape the summary's FAIL-row grep reports as clean. `steps.<id>.outcome`
+  # is the step's result BEFORE continue-on-error masks it. It travels in the
+  # leg's own artifact rather than in a job output because the legs of a matrix
+  # job share one output map and would overwrite each other's value.
+  #
+  # GAUNTLET_RUN_TOKEN is set at the JOB level, never on a step, because the
+  # precheck step and the channel step have to read the same value: the precheck
+  # stamps it into its row and the channel's Record-CarriedRow requires the row
+  # it carries to name this run. Per-run, per-leg, so no two legs and no two runs
+  # can inherit each other's precheck.
   # ---------------------------------------------------------------------------
 
   macos-app:
@@ -366,6 +398,7 @@ jobs:
       IS_LATEST: ${{ needs.resolve.outputs.is_latest }}
       GAUNTLET_OUT: ${{ github.workspace }}/gauntlet-out
       GAUNTLET_CHANNEL: macos-app
+      GAUNTLET_RUN_TOKEN: ${{ github.run_id }}-${{ github.run_attempt }}-macos-app
       REPO_ROOT: ${{ github.workspace }}
       # The app installer's release lookup is a GitHub API call; the workflow
       # token keeps repeated runs off the anonymous per-IP limit.
@@ -378,7 +411,16 @@ jobs:
         shell: bash
         run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
+        id: channel
         run: bash scripts/first-run/macos-app.sh
+      - name: Record channel outcome
+        # The raw step result, before `continue-on-error` rewrites the job's.
+        if: always()
+        env:
+          CHANNEL_OUTCOME: ${{ steps.channel.outcome }}
+        run: |
+          mkdir -p "$GAUNTLET_OUT"
+          printf '%s\n' "${CHANNEL_OUTCOME:-unrecorded}" > "$GAUNTLET_OUT/channel-outcome.txt"
       - name: Upload findings
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -401,6 +443,7 @@ jobs:
       IS_LATEST: ${{ needs.resolve.outputs.is_latest }}
       GAUNTLET_OUT: ${{ github.workspace }}/gauntlet-out
       GAUNTLET_CHANNEL: npx-setup
+      GAUNTLET_RUN_TOKEN: ${{ github.run_id }}-${{ github.run_attempt }}-npx-setup
       REPO_ROOT: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -413,7 +456,16 @@ jobs:
         shell: bash
         run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
+        id: channel
         run: bash scripts/first-run/npx-setup.sh
+      - name: Record channel outcome
+        # The raw step result, before `continue-on-error` rewrites the job's.
+        if: always()
+        env:
+          CHANNEL_OUTCOME: ${{ steps.channel.outcome }}
+        run: |
+          mkdir -p "$GAUNTLET_OUT"
+          printf '%s\n' "${CHANNEL_OUTCOME:-unrecorded}" > "$GAUNTLET_OUT/channel-outcome.txt"
       - name: Upload findings
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -436,6 +488,7 @@ jobs:
       IS_LATEST: ${{ needs.resolve.outputs.is_latest }}
       GAUNTLET_OUT: ${{ github.workspace }}/gauntlet-out
       GAUNTLET_CHANNEL: brew
+      GAUNTLET_RUN_TOKEN: ${{ github.run_id }}-${{ github.run_attempt }}-brew
       REPO_ROOT: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -445,7 +498,16 @@ jobs:
         shell: bash
         run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
+        id: channel
         run: bash scripts/first-run/brew.sh
+      - name: Record channel outcome
+        # The raw step result, before `continue-on-error` rewrites the job's.
+        if: always()
+        env:
+          CHANNEL_OUTCOME: ${{ steps.channel.outcome }}
+        run: |
+          mkdir -p "$GAUNTLET_OUT"
+          printf '%s\n' "${CHANNEL_OUTCOME:-unrecorded}" > "$GAUNTLET_OUT/channel-outcome.txt"
       - name: Upload findings
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -472,6 +534,7 @@ jobs:
       IS_LATEST: ${{ needs.resolve.outputs.is_latest }}
       GAUNTLET_OUT: ${{ github.workspace }}/gauntlet-out
       GAUNTLET_CHANNEL: npx-mcp-${{ matrix.os }}
+      GAUNTLET_RUN_TOKEN: ${{ github.run_id }}-${{ github.run_attempt }}-npx-mcp-${{ matrix.os }}
       REPO_ROOT: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -484,12 +547,30 @@ jobs:
         shell: bash
         run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
+        id: channel
         if: runner.os != 'Windows'
         run: bash scripts/first-run/npx-mcp.sh
       - name: Run channel (Windows)
+        id: channel-windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: pwsh -File scripts/first-run/npx-mcp.ps1
+      - name: Record channel outcome
+        # The raw step result, before `continue-on-error` rewrites the job's.
+        # Exactly one of the two steps above runs; the other reports `skipped`
+        # from its own `if`. Both skipped means the precheck failed and neither
+        # ran, which is not a success either.
+        if: always()
+        env:
+          CHANNEL_OUTCOME: ${{ steps.channel.outcome }}
+          CHANNEL_OUTCOME_WINDOWS: ${{ steps.channel-windows.outcome }}
+        run: |
+          outcome="$CHANNEL_OUTCOME"
+          if [ -z "$outcome" ] || [ "$outcome" = skipped ]; then
+            outcome="$CHANNEL_OUTCOME_WINDOWS"
+          fi
+          mkdir -p "$GAUNTLET_OUT"
+          printf '%s\n' "${outcome:-unrecorded}" > "$GAUNTLET_OUT/channel-outcome.txt"
       - name: Upload findings
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -516,6 +597,7 @@ jobs:
       IS_LATEST: ${{ needs.resolve.outputs.is_latest }}
       GAUNTLET_OUT: ${{ github.workspace }}/gauntlet-out
       GAUNTLET_CHANNEL: linux-install-${{ matrix.os }}
+      GAUNTLET_RUN_TOKEN: ${{ github.run_id }}-${{ github.run_attempt }}-linux-install-${{ matrix.os }}
       REPO_ROOT: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -525,7 +607,16 @@ jobs:
         shell: bash
         run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
+        id: channel
         run: bash scripts/first-run/linux-install.sh
+      - name: Record channel outcome
+        # The raw step result, before `continue-on-error` rewrites the job's.
+        if: always()
+        env:
+          CHANNEL_OUTCOME: ${{ steps.channel.outcome }}
+        run: |
+          mkdir -p "$GAUNTLET_OUT"
+          printf '%s\n' "${CHANNEL_OUTCOME:-unrecorded}" > "$GAUNTLET_OUT/channel-outcome.txt"
       - name: Upload findings
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -548,6 +639,7 @@ jobs:
       IS_LATEST: ${{ needs.resolve.outputs.is_latest }}
       GAUNTLET_OUT: ${{ github.workspace }}/gauntlet-out
       GAUNTLET_CHANNEL: windows-zip
+      GAUNTLET_RUN_TOKEN: ${{ github.run_id }}-${{ github.run_attempt }}-windows-zip
       REPO_ROOT: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -557,8 +649,17 @@ jobs:
         shell: bash
         run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
+        id: channel
         shell: pwsh
         run: pwsh -File scripts/first-run/windows-zip.ps1
+      - name: Record channel outcome
+        # The raw step result, before `continue-on-error` rewrites the job's.
+        if: always()
+        env:
+          CHANNEL_OUTCOME: ${{ steps.channel.outcome }}
+        run: |
+          mkdir -p "$GAUNTLET_OUT"
+          printf '%s\n' "${CHANNEL_OUTCOME:-unrecorded}" > "$GAUNTLET_OUT/channel-outcome.txt"
       - name: Upload findings
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -581,6 +682,7 @@ jobs:
       IS_LATEST: ${{ needs.resolve.outputs.is_latest }}
       GAUNTLET_OUT: ${{ github.workspace }}/gauntlet-out
       GAUNTLET_CHANNEL: windows-nsis
+      GAUNTLET_RUN_TOKEN: ${{ github.run_id }}-${{ github.run_attempt }}-windows-nsis
       REPO_ROOT: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -590,8 +692,17 @@ jobs:
         shell: bash
         run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
+        id: channel
         shell: pwsh
         run: pwsh -File scripts/first-run/windows-nsis.ps1
+      - name: Record channel outcome
+        # The raw step result, before `continue-on-error` rewrites the job's.
+        if: always()
+        env:
+          CHANNEL_OUTCOME: ${{ steps.channel.outcome }}
+        run: |
+          mkdir -p "$GAUNTLET_OUT"
+          printf '%s\n' "${CHANNEL_OUTCOME:-unrecorded}" > "$GAUNTLET_OUT/channel-outcome.txt"
       - name: Upload findings
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -614,6 +725,7 @@ jobs:
       IS_LATEST: ${{ needs.resolve.outputs.is_latest }}
       GAUNTLET_OUT: ${{ github.workspace }}/gauntlet-out
       GAUNTLET_CHANNEL: cargo-mcp
+      GAUNTLET_RUN_TOKEN: ${{ github.run_id }}-${{ github.run_attempt }}-cargo-mcp
       REPO_ROOT: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -623,7 +735,16 @@ jobs:
         shell: bash
         run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
+        id: channel
         run: bash scripts/first-run/cargo-mcp.sh
+      - name: Record channel outcome
+        # The raw step result, before `continue-on-error` rewrites the job's.
+        if: always()
+        env:
+          CHANNEL_OUTCOME: ${{ steps.channel.outcome }}
+        run: |
+          mkdir -p "$GAUNTLET_OUT"
+          printf '%s\n' "${CHANNEL_OUTCOME:-unrecorded}" > "$GAUNTLET_OUT/channel-outcome.txt"
       - name: Upload findings
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -650,6 +771,7 @@ jobs:
       IS_LATEST: ${{ needs.resolve.outputs.is_latest }}
       GAUNTLET_OUT: ${{ github.workspace }}/gauntlet-out
       GAUNTLET_CHANNEL: plugin-setup-${{ matrix.os }}
+      GAUNTLET_RUN_TOKEN: ${{ github.run_id }}-${{ github.run_attempt }}-plugin-setup-${{ matrix.os }}
       REPO_ROOT: ${{ github.workspace }}
       RELEASE_SRC: ${{ github.workspace }}/release-src
     steps:
@@ -670,7 +792,16 @@ jobs:
         shell: bash
         run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
+        id: channel
         run: bash scripts/first-run/plugin-setup.sh
+      - name: Record channel outcome
+        # The raw step result, before `continue-on-error` rewrites the job's.
+        if: always()
+        env:
+          CHANNEL_OUTCOME: ${{ steps.channel.outcome }}
+        run: |
+          mkdir -p "$GAUNTLET_OUT"
+          printf '%s\n' "${CHANNEL_OUTCOME:-unrecorded}" > "$GAUNTLET_OUT/channel-outcome.txt"
       - name: Upload findings
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -773,6 +904,23 @@ jobs:
               echo "::error::$leg produced no findings.tsv — that leg is unchecked, not green" >&2
               status=1
             fi
+            # A NON-EMPTY findings.tsv is not a finished leg. A channel killed at
+            # `timeout-minutes` after its precheck row and a few PASS rows leaves
+            # exactly that: rows in the file, no FAIL row in it, ~27 declared rows
+            # never recorded and Evaluate never reached -- and the grep below then
+            # prints "No FAIL rows". `continue-on-error` rewrites the JOB result to
+            # `success`, so needs.<job>.result cannot see it either. The channel
+            # STEP's raw outcome can, and each leg carries its own beside its
+            # findings. Missing, cancelled, failure and skipped are all refusals:
+            # a leg that did not finish is unchecked, not green.
+            outcome=unrecorded
+            if [ -s "all-findings/$leg/channel-outcome.txt" ]; then
+              outcome="$(tr -d '\r\n' < "all-findings/$leg/channel-outcome.txt")"
+            fi
+            if [ "$outcome" != "success" ]; then
+              echo "::error::$leg's channel step ended '$outcome', not 'success' — that leg did not finish, so it is unchecked, not green" >&2
+              status=1
+            fi
           done
           if failing="$(grep -rl --include=findings.tsv $'\tFAIL\t' all-findings)"; then
             echo "::error::FAIL rows found in:" >&2
@@ -782,6 +930,7 @@ jobs:
             grep -rh --include=findings.tsv $'\tFAIL\t' all-findings | cut -c1-300 >&2
             status=1
           else
-            echo "No FAIL rows in any findings.tsv"
+            echo "No FAIL rows in any findings.tsv (one condition of several; the per-leg"
+            echo "outcome and findings.tsv checks above are the rest of this verdict)"
           fi
           exit "$status"
