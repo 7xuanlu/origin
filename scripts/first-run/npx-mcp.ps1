@@ -43,9 +43,10 @@ function Remove-Retry([string]$Target) {
 # The rows this channel owes. $Spec is fixed above, so the npx row names are
 # known before the run; the MCP helper declares its own mcp-* rows.
 Expect-Rows -Names @(
-    # Recorded by the workflow's precheck step, before this script starts, and
-    # declared here because Evaluate now fails on an undeclared row.
-    "port-7878-precheck",
+    # The workflow's precheck step records `port-7878-precheck` before this
+    # script starts, so that row is carried in; Record-CarriedRow below restates
+    # its verdict as a row of this run's.
+    "port-7878-precheck-carried",
     "download-zip",
     "extract-zip",
     "smoke-windows",
@@ -54,6 +55,7 @@ Expect-Rows -Names @(
     "npx-version-matches",
     "mcp-roundtrip-driver"
 )
+Record-CarriedRow -Name "port-7878-precheck"
 
 try {
     New-Item -ItemType Directory -Force -Path $Bin, $DaemonData | Out-Null
