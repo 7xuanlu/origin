@@ -456,3 +456,65 @@ fn data_root_lock_excludes_another_process_with_a_different_temp_dir() {
     std::fs::write(&release, b"release").unwrap();
     assert!(child.wait().unwrap().success());
 }
+
+fn repo_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+// Pulls the exact `sed` program out of smoke-common.sh's `logged_root=` line
+// rather than pasting a copy of it, so an edit to the script's parser (not
+// just to `data_root_log_line` above) is what this test is exercising.
+fn smoke_common_data_root_sed_program(script: &str) -> String {
+    let line = script
+        .lines()
+        .find(|line| line.contains("logged_root="))
+        .expect("scripts/lib/smoke-common.sh must still assign logged_root");
+    let after_flag = line
+        .split_once("sed -n '")
+        .expect("logged_root must still be extracted with `sed -n '...'`")
+        .1;
+    after_flag
+        .split_once('\'')
+        .expect("the sed -n program must still be closed by a single quote")
+        .0
+        .to_string()
+}
+
+// Proves the daemon's startup log line and smoke-common.sh's parser of it
+// agree end to end, so a future edit to either one fails here instead of
+// only in canonical-acceptance, which is path-selected and often skipped.
+#[cfg(unix)]
+#[test]
+fn smoke_common_sed_strips_the_database_suffix_the_daemon_logs() {
+    let script = std::fs::read_to_string(repo_root().join("scripts/lib/smoke-common.sh")).unwrap();
+    let program = smoke_common_data_root_sed_program(&script);
+
+    let scratch_root = std::path::Path::new("/tmp/smoke-cli.jxV6Xu");
+    let data_dir = scratch_root.join("memorydb");
+    let log_line = data_root_log_line(scratch_root, &data_dir);
+
+    let log_dir = tempfile::tempdir().unwrap();
+    let log_path = log_dir.path().join("daemon.log");
+    std::fs::write(
+        &log_path,
+        format!("2026-09-02T21:42:54.123852Z  INFO wenlan_server: {log_line}\n"),
+    )
+    .unwrap();
+
+    let output = std::process::Command::new("sed")
+        .arg("-n")
+        .arg(&program)
+        .arg(&log_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "sed failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let extracted = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        extracted.trim_end_matches('\n'),
+        scratch_root.to_str().unwrap()
+    );
+}

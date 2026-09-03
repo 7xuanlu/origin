@@ -448,6 +448,17 @@ fn existing_daemon_may_satisfy_startup(startup_repair_claimed: bool) -> bool {
     !startup_repair_claimed
 }
 
+// Shared with the startup log line above so `scripts/lib/smoke-common.sh`'s
+// parser and this emitter cannot drift apart unnoticed; see
+// `bind_addr_tests::smoke_common_sed_strips_the_database_suffix_the_daemon_logs`.
+fn data_root_log_line(wenlan_root: &std::path::Path, data_dir: &std::path::Path) -> String {
+    format!(
+        "Wenlan data root: {} (database {})",
+        wenlan_root.display(),
+        data_dir.join("origin_memory.db").display()
+    )
+}
+
 #[cfg(test)]
 #[path = "bind_addr_tests.rs"]
 mod bind_addr_tests;
@@ -732,11 +743,7 @@ async fn run_daemon(startup_repair_claim: Option<StartupRepairClaim>) -> anyhow:
     // First thing after the version banner, and the line `wenlan doctor` sends
     // people to: a daemon pointed at the wrong store looks healthy otherwise.
     // The file name mirrors `MemoryDB` in wenlan-core (`db.rs`).
-    tracing::info!(
-        "Wenlan data root: {} (database {})",
-        wenlan_root.display(),
-        data_dir.join("origin_memory.db").display()
-    );
+    tracing::info!("{}", data_root_log_line(&wenlan_root, &data_dir));
     let _data_root_lock = DaemonDataLock::acquire(&wenlan_root, startup_repair_claimed)?;
 
     let startup::PreparedStartupState {
