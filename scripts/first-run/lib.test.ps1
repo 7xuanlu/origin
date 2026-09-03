@@ -96,6 +96,88 @@ if ($Case) {
             Set-Content -Path $script -Value 'Write-Output "returned before Expect-Rows"; exit 0' -Encoding utf8
             Check-Helper -Name "driver" -Interpreter (Get-Process -Id $PID).Path -InterpreterArgs @("-NoProfile", "-File") -Path $script -MustDeclare "^cli-"
         }
+        "health-refused-is-a-negative" {
+            # A REAL refusal, from the shell running this suite. Everything else
+            # in this file is a stub, and stubs are exactly what hid the defect
+            # this covers: they raised System.Net.WebException, which Windows
+            # PowerShell 5.1 raises and pwsh 7 -- the edition
+            # first-run-gauntlet.yml runs every channel with -- never does. So
+            # `down` and `negative`, the two answers the health probes exist to
+            # be able to give, were unreachable on the only host that runs them,
+            # and no test in the tree could see it.
+            Expect-Rows -Names @("refusal-classified")
+            Check -Name "refusal-classified" -Script {
+                # Bind port 0, read what the OS gave out, release it. The port
+                # was free one instruction ago, which is the closest thing to a
+                # guaranteed-closed port that does not hard-code a number.
+                $probe = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Loopback), 0
+                $probe.Start()
+                $port = $probe.LocalEndpoint.Port
+                $probe.Stop()
+                $kind = "no exception was raised at all"
+                try {
+                    $null = Invoke-WebRequest -Uri "http://127.0.0.1:$port/health" `
+                        -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                } catch { $kind = Get-WebFailureKind $_ }
+                if ($kind -ne "negative") {
+                    throw ("a refused loopback connection classified as '$kind' under " +
+                           "PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)): " +
+                           "the probe cannot report a daemon that is not there")
+                }
+                Write-Output "refused -> negative"
+            }
+        }
+        "health-reset-is-not-a-negative" {
+            # A reset is a LIVE peer slamming the door -- a proxy, a firewall, a
+            # service falling over mid-response. Reporting it as "the daemon is
+            # gone" certifies a shutdown while the daemon is still on the port.
+            # Under 5.1 a refusal and a reset were told apart by WebException's
+            # .Status; under pwsh 7 they share an outer type and there is no
+            # .Status, so the only thing left is how deep the SocketException
+            # sits: directly inside for a refusal, under an IOException for a
+            # reset. This case is what holds that rule.
+            Expect-Rows -Names @("reset-classified")
+            Check -Name "reset-classified" -Script {
+                # Windows PowerShell 5.1 does not load System.Net.Http unless
+                # asked, and without it this case dies constructing its own
+                # fixture -- measured: "Cannot find type
+                # [System.Net.Http.HttpRequestException]". That is the same fact
+                # lib.ps1 compares type names for rather than using `-is [T]`.
+                Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+                $sock = New-Object System.Net.Sockets.SocketException 10054
+                $io = New-Object System.IO.IOException -ArgumentList @("the connection was reset", $sock)
+                $ex = New-Object System.Net.Http.HttpRequestException -ArgumentList @("boom", $io)
+                $rec = New-Object System.Management.Automation.ErrorRecord -ArgumentList @($ex, "stub", "NotSpecified", $null)
+                $kind = Get-WebFailureKind $rec
+                if ($kind -ne "unmeasured") {
+                    throw ("a reset from a live listener classified as '$kind'; " +
+                           "something was there to send it, which is evidence " +
+                           "AGAINST a shutdown, not for one")
+                }
+                Write-Output "reset -> unmeasured"
+            }
+        }
+        "health-refused-stub-is-a-negative" {
+            # The positive control for the case above. Same constructed shape,
+            # same outer type, SocketException moved to depth 1 and the errno
+            # changed to a refusal. Without this, a Get-WebFailureKind that
+            # returned "unmeasured" for everything -- which is precisely the bug
+            # being fixed -- would pass `health-reset-is-not-a-negative` and look
+            # like a working rule.
+            Expect-Rows -Names @("refusal-stub-classified")
+            Check -Name "refusal-stub-classified" -Script {
+                Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+                $sock = New-Object System.Net.Sockets.SocketException 10061
+                $ex = New-Object System.Net.Http.HttpRequestException -ArgumentList @("boom", $sock)
+                $rec = New-Object System.Management.Automation.ErrorRecord -ArgumentList @($ex, "stub", "NotSpecified", $null)
+                $kind = Get-WebFailureKind $rec
+                if ($kind -ne "negative") {
+                    throw ("a refusal whose SocketException is directly inside " +
+                           "classified as '$kind'; depth 1 is the refusal shape")
+                }
+                Write-Output "refused-stub -> negative"
+            }
+        }
         "helper-declares-required-prefix" {
             # The positive half of the same property: a helper that does reach
             # its Expect-Rows passes. Without this case, an assertion that
@@ -464,6 +546,24 @@ Assert-Case -Name "helper-ok" -ExpectExit 0 -ExpectText @("[PASS] driver")
 # must FAIL rather than certify a round trip that never happened.
 Assert-Case -Name "helper-exits-0-declaring-nothing" -ExpectExit 1 `
     -ExpectText @("[FAIL] driver", "declared no NEW row matching '^cli-'") -RejectText @("GONE")
+
+# The health classifier, against a REAL exception from the shell running this
+# suite. Every other case here is a stub, and stubs raising WebException are
+# what let a classifier that cannot answer under pwsh 7 look correct.
+Assert-Case -Name "health-refused-is-a-negative" -ExpectExit 0 `
+    -ExpectText @("[PASS] refusal-classified", "refused -> negative") `
+    -RejectText @("GONE", "unmeasured")
+
+# A reset is a live peer. The pair below is a rule and its control: remove the
+# depth test and the first fails; break the classifier entirely and the second
+# fails. One without the other proves nothing.
+Assert-Case -Name "health-reset-is-not-a-negative" -ExpectExit 0 `
+    -ExpectText @("[PASS] reset-classified", "reset -> unmeasured") `
+    -RejectText @("GONE")
+
+Assert-Case -Name "health-refused-stub-is-a-negative" -ExpectExit 0 `
+    -ExpectText @("[PASS] refusal-stub-classified", "refused-stub -> negative") `
+    -RejectText @("GONE")
 
 Assert-Case -Name "helper-declares-required-prefix" -ExpectExit 0 `
     -ExpectText @("[PASS] driver", "PASS cli-roundtrip", "declared 1 new '^cli-' row(s)") `

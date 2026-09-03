@@ -219,6 +219,16 @@ function Get-HealthTimeoutSec {
 # ONLY A REFUSED CONNECTION IS `down`. That is the daemon answering the question
 # by not being there; everything else is the question not being asked.
 #
+# THE TABLE BELOW WAS MEASURED ON THE WRONG EDITION. It is correct for Windows
+# PowerShell 5.1 and this script is run by first-run-gauntlet.yml with
+# `shell: pwsh`, which is PowerShell 7, where Invoke-WebRequest is built on
+# HttpClient and raises none of these types. The verdict logic now reads the
+# exception SHAPE through Get-WebExceptionShape / Test-ConnectionRefused /
+# Test-HttpErrorResponse in lib.ps1, whose header carries the re-measured table
+# for both editions. This one is kept because the reasoning under it -- why a
+# reset is not a refusal, why ConnectFailure alone is not enough -- is what
+# those helpers implement, and it is edition-independent.
+#
 # MEASURED ON THIS HOST (Windows PowerShell 5.1.26100.9278), because a
 # classification built on guessed exception classes measures nothing:
 #
@@ -266,45 +276,42 @@ function Get-HealthReachability([string]$Url) {
         $r = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec $timeoutSec -ErrorAction Stop
         return [pscustomobject]@{ State = "reachable"; Detail = "HTTP $($r.StatusCode) from $Url" }
     } catch {
+        # Shape, not type. `$ex -as [System.Net.WebException]` stood here, and
+        # under pwsh 7 -- the edition first-run-gauntlet.yml actually runs this
+        # script with -- it is $null for EVERY failure, so this probe could
+        # never once return "down". See the re-measured table over
+        # Get-WebExceptionShape in lib.ps1.
         $ex = $_.Exception
-        $we = $ex -as [System.Net.WebException]
-        if (-not $we) {
-            # Not even a web exception: a bad URI, a missing assembly, a
-            # scriptblock error. Nothing was asked of the network.
-            return [pscustomobject]@{ State = "unmeasurable"
-                Detail = "the health probe did not reach the network ($($ex.GetType().FullName): $($ex.Message))" }
+        $shape = Get-WebExceptionShape $ex
+        # THE ONLY NEGATIVE: the peer refused. Not a reset, which is a live peer
+        # slamming the door and if anything evidence AGAINST a shutdown; not
+        # HostNotFound; not a timeout, because a wedged daemon times out too.
+        if (Test-ConnectionRefused $shape) {
+            return [pscustomobject]@{ State = "down"; Detail = "$($shape.SocketError) from $Url" }
         }
         # An HTTP error still proves something is listening and speaking HTTP,
-        # which is the property this probe is for. Kept from the old form.
-        if ($null -ne $we.Response) {
+        # which is the property this probe is for. Kept from the old form, and
+        # asked AFTER the refusal so the two cannot overlap.
+        if (Test-HttpErrorResponse $shape) {
             return [pscustomobject]@{ State = "reachable"
-                Detail = "HTTP error from ${Url} (status $($we.Status)) -- an HTTP error still proves reachable" }
+                Detail = "HTTP error from ${Url} -- an HTTP error still proves reachable ($($shape.Type))" }
         }
-        # Walk the chain, do not read InnerException alone: measured above, a
-        # live listener's reset hides its SocketException under an IOException,
-        # and a probe that cannot even NAME the socket error reports every one
-        # of them as the same silence.
-        $sockErr = ""
-        $inner = $we.InnerException
-        while ($inner -and -not $sockErr) {
-            $s = $inner -as [System.Net.Sockets.SocketException]
-            if ($s) { $sockErr = $s.SocketErrorCode.ToString() }
-            $inner = $inner.InnerException
+        # Nothing was asked of the network at all: a bad URI, a missing
+        # assembly, a scriptblock error.
+        if ($shape.Type -eq "System.NotSupportedException" -or
+            $shape.Type -eq "System.UriFormatException" -or
+            $shape.Type -eq "System.ArgumentException") {
+            return [pscustomobject]@{ State = "unmeasurable"
+                Detail = "the health probe did not reach the network ($($shape.Type): $($ex.Message))" }
         }
-        # THE ONLY NEGATIVE.
-        if ($we.Status -eq [System.Net.WebExceptionStatus]::ConnectFailure -and
-            $sockErr -eq "ConnectionRefused") {
-            return [pscustomobject]@{ State = "down"; Detail = "$sockErr from $Url" }
-        }
-        # Everything else, enumerated so the reader can see it is a decision and
-        # not an oversight: Timeout (a wedged daemon times out too),
-        # ReceiveFailure and ConnectionClosed (the measured shape of a LIVE peer
-        # resetting -- if anything, evidence AGAINST a shutdown),
-        # NameResolutionFailure, TrustFailure/SecureChannelFailure,
-        # ProxyNameResolutionFailure, RequestCanceled, and any ConnectFailure
-        # whose socket error is not a refusal -- reset included.
+        # Everything else, so the reader can see it is a decision and not an
+        # oversight: a timeout (TaskCanceledException under pwsh 7, Status=
+        # Timeout under 5.1 -- a wedged daemon times out too), a reset or a
+        # ConnectionClosed (the measured shape of a LIVE peer), HostNotFound and
+        # NameResolutionFailure, TLS and proxy failures, and any refusal whose
+        # SocketException was buried rather than direct.
         return [pscustomobject]@{ State = "unmeasurable"
-            Detail = "the health probe failed without reaching a verdict (status $($we.Status)$(if ($sockErr) { ", socket $sockErr" }): $($we.Message))" }
+            Detail = "the health probe failed without reaching a verdict ($($shape.Type)$(if ($shape.Status) { ", status $($shape.Status)" })$(if ($shape.SocketError) { ", socket $($shape.SocketError) at depth $($shape.SocketDepth)" }): $($ex.Message))" }
     }
 }
 # Tri-state listener probe: found / none / unmeasurable.

@@ -539,12 +539,19 @@ function Check-Helper {
             $after = Count-Declared $MustDeclare
             $added = $after - $before
             if ($added -le 0) {
-                throw ("$Path exited 0 but declared no NEW row matching '$MustDeclare' " +
-                       "(before=$before after=$after); it cannot have reached its own " +
-                       "Expect-Rows, so nothing it was supposed to check is owed. " +
-                       "Output in $helperLog")
+                # Verdict first, paths after. Record-Row truncates the
+                # console line at 200 characters, and both $Path and
+                # $Interpreter are absolute; with the verdict last, whether it
+                # is visible depends on where the interpreter happens to be
+                # installed. Measured: pwsh from the MSIX package pushes it off
+                # the end, pwsh from the MSI does not.
+                throw ("declared no NEW row matching '$MustDeclare' " +
+                       "(before=$before after=$after): $Path exited 0, so it " +
+                       "cannot have reached its own Expect-Rows, and nothing " +
+                       "it was supposed to check is owed. Output in $helperLog")
             }
-            Write-Output "$Interpreter $Path ran and declared $added new '$MustDeclare' row(s); output in $helperLog"
+            # Verdict first, for the reason given on the throw above.
+            Write-Output "declared $added new '$MustDeclare' row(s); $Interpreter $Path ran; output in $helperLog"
             return
         }
         Write-Output "$Interpreter $Path ran; output in $helperLog"
@@ -564,30 +571,115 @@ function Info([string]$Name, [string]$Value) {
 # indistinguishable from a negative one, and this was that collapse in the two
 # checks a channel leans on hardest.
 #
-# WebException carries the discriminator. `.Status` is a WebExceptionStatus, and
-# a ConnectFailure's inner SocketException carries the errno -- read here for the
-# same reason `errno_says_no_such_process` in scripts/lib/host-process.sh reads
-# strerror text: the status alone cannot tell "nothing is listening" from "the
-# request never got anywhere".
+# THE EXCEPTION TYPE IS EDITION-SPECIFIC, and the edition that runs these
+# scripts is not the edition the first table was measured on. first-run-
+# gauntlet.yml runs every channel with `shell: pwsh` -- PowerShell 7, whose
+# Invoke-WebRequest is built on HttpClient and never raises WebException. A
+# classifier that tests for WebException therefore falls to its default on
+# every failure under CI, and the default is "unmeasured". Both probes below
+# lean on the NEGATIVE answer -- "the peer refused, nothing is listening" -- and
+# that answer was unreachable on the only host that runs them.
+#
+# RE-MEASURED, both editions, same machine, loopback, isolated ports, and for
+# the reset case a listener that accepts and closes with SO_LINGER(1,0):
+#
+#   pwsh 7.6.5 (Core)                    Windows PowerShell 5.1.26100.9278
+#   ---------------------------------    ---------------------------------
+#   HTTP 500 from a live server
+#     HttpResponseException                WebException Status=ProtocolError
+#     Response NON-NULL                    Response NON-NULL
+#   connection refused
+#     HttpRequestException                 WebException Status=ConnectFailure
+#       -> SocketException                   -> SocketException
+#          ConnectionRefused                    ConnectionRefused
+#   unresolvable host
+#     HttpRequestException                 WebException
+#       -> SocketException HostNotFound     Status=NameResolutionFailure
+#   live listener that RSTs
+#     HttpRequestException                 WebException Status=ReceiveFailure
+#       -> IOException                       -> IOException
+#          -> SocketException                    -> SocketException
+#             ConnectionReset                       ConnectionReset
+#   timeout
+#     TaskCanceledException                WebException Status=Timeout
+#       -> TimeoutException
+#
+# WHAT THAT COSTS THE DESIGN. Under 5.1 a refusal and a reset were told apart by
+# `.Status` (ConnectFailure vs ReceiveFailure). Under pwsh 7 they arrive with the
+# SAME outer type and there is no Status property at all, so the only thing left
+# is the socket error and HOW DEEP IT SITS: a refusal puts the SocketException
+# directly inside the outer exception, a reset hides it one layer down under an
+# IOException. That is the same line 5.1 drew, read off different facts, and it
+# matters as much here as it did there -- A RESET IS A LIVE PEER. Classifying it
+# as "down" certifies a daemon gone while it is still on the port.
 #
 # Only two things are NEGATIVES: a connection the peer REFUSED (nothing is
 # listening on that port, which is the answer this probe exists to be able to
 # give) and a response that completed with a non-200 status. Everything else --
 # a timeout above all, which is a request that did not finish -- is unmeasured.
-# The type is compared by NAME because `-is [T]` throws when the assembly
-# holding T is not loaded.
+# Types are compared by NAME because `-is [T]` throws when the assembly holding
+# T is not loaded.
+
+# The two facts both classifiers branch on, read once. `SocketDepth` is 1 when
+# the SocketException is the outer exception's direct inner, and deeper when it
+# is buried -- which is the refusal/reset discriminator under pwsh 7.
+function Get-WebExceptionShape($Exception) {
+    $shape = [pscustomobject]@{
+        Type        = ""
+        Status      = ""
+        HasResponse = $false
+        SocketError = ""
+        SocketDepth = 0
+    }
+    if ($null -eq $Exception) { return $shape }
+    $shape.Type = $Exception.GetType().FullName
+    $names = $Exception.PSObject.Properties.Name
+    if ($names -contains "Status") { $shape.Status = "" + $Exception.Status }
+    if ($names -contains "Response") { $shape.HasResponse = ($null -ne $Exception.Response) }
+    $depth = 0
+    $cur = $Exception.InnerException
+    while ($cur) {
+        $depth++
+        if ($cur.GetType().FullName -eq "System.Net.Sockets.SocketException") {
+            $shape.SocketError = "" + $cur.SocketErrorCode
+            $shape.SocketDepth = $depth
+            break
+        }
+        $cur = $cur.InnerException
+    }
+    return $shape
+}
+
+# Did the peer REFUSE the connection -- the one shape that means "nothing is
+# listening on that port"? Not a reset, which is a live peer; not HostNotFound,
+# which is not an answer about the port at all.
+function Test-ConnectionRefused($Shape) {
+    if ($null -eq $Shape) { return $false }
+    if ($Shape.SocketError -ne "ConnectionRefused") { return $false }
+    # Directly inside, not buried under an IOException: see the table above.
+    if ($Shape.SocketDepth -ne 1) { return $false }
+    if ($Shape.Type -eq "System.Net.Http.HttpRequestException") { return $true }
+    if ($Shape.Type -eq "System.Net.WebException" -and $Shape.Status -eq "ConnectFailure") { return $true }
+    return $false
+}
+
+# Did a response COMPLETE with a non-200 status? Something answered in HTTP,
+# which is a measured negative for a version check and proof of reachability
+# for a health check.
+function Test-HttpErrorResponse($Shape) {
+    if ($null -eq $Shape) { return $false }
+    if ($Shape.Type -eq "Microsoft.PowerShell.Commands.HttpResponseException") { return $true }
+    if ($Shape.Type -eq "System.Net.WebException" -and $Shape.Status -eq "ProtocolError") { return $true }
+    return $false
+}
+
 function Get-WebFailureKind($ErrorRecord) {
     $ex = $null
     if ($ErrorRecord) { $ex = $ErrorRecord.Exception }
     if ($null -eq $ex) { return "unmeasured" }
-    if ($ex.GetType().FullName -ne "System.Net.WebException") { return "unmeasured" }
-    $status = "" + $ex.Status
-    if ($status -eq "ProtocolError") { return "negative" }
-    if ($status -eq "ConnectFailure") {
-        $inner = $ex.InnerException
-        if ($null -ne $inner -and ("" + $inner.SocketErrorCode) -eq "ConnectionRefused") { return "negative" }
-        return "unmeasured"
-    }
+    $shape = Get-WebExceptionShape $ex
+    if (Test-HttpErrorResponse $shape) { return "negative" }
+    if (Test-ConnectionRefused $shape) { return "negative" }
     return "unmeasured"
 }
 
