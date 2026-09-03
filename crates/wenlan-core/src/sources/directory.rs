@@ -397,12 +397,19 @@ fn modified_unix_seconds(metadata: &fs::Metadata) -> i64 {
 /// in `catch_unwind` upholds the "one bad file never aborts" contract. This is
 /// a sync CPU function — callers on async paths wrap it in `spawn_blocking`.
 ///
-/// That guard covers panics only, and only panics. A stack overflow aborts the
-/// process instead of unwinding, so it escapes `catch_unwind` entirely — which
-/// is exactly RUSTSEC-2026-0187, where a ~21 KB PDF holding a 10,000-deep
-/// nested array `SIGABRT`s any caller of `lopdf`. The lopdf `>= 0.42` floor is
-/// what fixes that, not this wrapper. Keep the depth limit in the dependency,
-/// and do not read this `catch_unwind` as making arbitrary PDF input safe.
+/// That guard covers panics, and only panics. It does NOT make arbitrary PDF
+/// input safe, and one live advisory proves it: RUSTSEC-2026-0187 is a stack
+/// overflow in `lopdf` (a ~21 KB PDF holding a 10,000-deep nested array), and a
+/// stack overflow aborts the process instead of unwinding, so `catch_unwind`
+/// never sees it. Folder ingestion feeds untrusted PDFs through here, so a
+/// crafted file in a watched folder can still take the daemon down.
+///
+/// We are knowingly still exposed. The fix is lopdf `>= 0.42`, whose only route
+/// is `pdf-extract` 0.12 (it requires `lopdf ^0.42`) — and 0.12 is the version
+/// `tests/pdf_per_page_font_decoding.rs` exists to keep out, because it caches
+/// fonts by local resource name and silently returns wrong text as `Ok`. A
+/// crash we recover from beat corrupt memories we cannot detect. Revisit when
+/// pdf-extract ships the per-page font fix (jrmuizel/pdf-extract#157).
 pub fn extract_pdf_text(bytes: &[u8]) -> Result<String, String> {
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pdf_extract::extract_text_from_mem(bytes)
