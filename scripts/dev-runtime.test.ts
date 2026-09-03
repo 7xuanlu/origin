@@ -2289,6 +2289,136 @@ describe("dev runtime lock release and recovery", () => {
     expect(run.stdout.trim(), run.stderr).toBe("rc=1 held=0 owner=none");
   }, 60_000);
 
+  // --- THE STALE BREAK IS ONE ATOMIC RENAME ---------------------------------
+  //
+  // The ABA the re-read could not close. `rm -f owner` then `rmdir` is two
+  // destructive steps, and the owner comparison sits BEFORE both of them, so a
+  // second breaker could remove the same stale lock, `mkdir` a fresh one, write
+  // its own token and start work inside the interval -- and the first breaker's
+  // removals then destroyed that live generation, its own `mkdir` succeeded, and
+  // both ran against one isolated port and data directory. The first breaker's
+  // release compares its own token, finds it, and reports `ok`; only the victim
+  // ever notices.
+  //
+  // `mv` is the removal and the test in one step: at most one process can move a
+  // given directory away. The three cases below are the control, the ABA itself,
+  // and the shape assertion that the two destructive steps are gone.
+  const BREAK_DRIVER = [
+    'eval "$WENLAN_TEST_FIXTURE"',
+    "rc=0",
+    "acquire_runtime_lock || rc=$?",
+    "aside=0",
+    // Anything left under the break-aside name is litter this run created. The
+    // glob is checked with `-e` because an unmatched glob stays literal.
+    'for d in "$STATE_DIR"/runtime.lock.breaking.*; do',
+    '  if [[ -e "$d" ]]; then aside=$(( aside + 1 )); fi',
+    "done",
+    `printf 'rc=%s held=%s owner=%s aside=%s\\n' "$rc" "$RUNTIME_LOCK_HELD" ` +
+      `"$(cat "$LOCK_OWNER_FILE" 2>/dev/null || printf none)" "$aside"`,
+  ].join("\n");
+
+  const breakRun = (fixture: string, shims?: Record<string, string>) => {
+    const saved = process.env.WENLAN_TEST_FIXTURE;
+    process.env.WENLAN_TEST_FIXTURE = fixture;
+    try {
+      return drive(BREAK_DRIVER, acquireFns, { sourceLib: true, shims });
+    } finally {
+      if (saved === undefined) delete process.env.WENLAN_TEST_FIXTURE;
+      else process.env.WENLAN_TEST_FIXTURE = saved;
+    }
+  };
+
+  // The control the two below are read against: a lock whose owner is measurably
+  // gone is still broken and still taken, and the directory it was moved aside
+  // into is not left behind.
+  it("breaks a genuinely stale lock and leaves nothing moved aside", () => {
+    const run = breakRun(['mkdir -p "$LOCK_DIR"', `printf '999999\\n' >"$LOCK_OWNER_FILE"`].join("\n"));
+    expect(run.stdout.trim(), run.stderr).toMatch(
+      /^rc=0 held=1 owner=\d+ \d+\.\d+\.\d+ aside=0$/,
+    );
+  }, 60_000);
+
+  // THE ABA, driven. The owner re-read happens first and matches; the lock is
+  // then replaced by a whole new generation inside the second test hook's
+  // window, which is exactly the interleaving the re-read cannot see. Under
+  // `rm`+`rmdir` this run deleted the new generation's owner file and its
+  // directory and took the lock: `rc=0 held=1` beside a live holder. Under the
+  // rename it moves that generation aside, reads a token that is not the one it
+  // measured, puts it straight back and goes round -- where the new owner is
+  // unparsable as a pid and is therefore refused rather than broken.
+  //
+  // The proof that it was put back INTACT is `owner=LIVE-GENERATION`: the
+  // victim's own record, still in the lock directory, still readable.
+  //
+  // ARRANGED, NOT WAITED FOR. The interleaving is placed by SHIMMING the hook's
+  // `sleep`, so the swap happens at the hook and nowhere else. A background
+  // shell on a wall-clock delay would race the liveness probe -- slow enough and
+  // the swap lands before the re-read instead of after it, and the run refuses
+  // for the OTHER reason with the same stdout. The hook's `sleep` is the only
+  // one this path reaches (`poll_delay` belongs to the ownerless wait, which an
+  // owner file present from the start never enters).
+  it("puts back a live generation it renamed away, and takes nothing", () => {
+    const run = breakRun(
+      ['mkdir -p "$LOCK_DIR"', `printf '999999\\n' >"$LOCK_OWNER_FILE"`, "DEV_RUNTIME_RACE_SLEEP_BREAK=1"].join(
+        "\n",
+      ),
+      {
+        sleep: [
+          'lock="$WENLAN_TEST_STATE_DIR/runtime.lock"',
+          'rm -f "$lock/pid"',
+          'rmdir "$lock"',
+          'mkdir "$lock"',
+          `printf 'LIVE-GENERATION\\n' >"$lock/pid"`,
+        ].join("\n"),
+      },
+    );
+    expect(run.stdout.trim(), run.stderr).toBe("rc=1 held=0 owner=LIVE-GENERATION aside=0");
+    expect(run.stderr).toContain("the dev runtime lock owner is not a pid");
+  }, 60_000);
+
+  // And the shape, because the behaviour above is only reachable while the two
+  // destructive steps are actually gone. A `rmdir "$LOCK_DIR"` reintroduced
+  // anywhere in this function is the defect coming back.
+  it("breaks the stale lock by rename, with no two-step removal left in it", () => {
+    const text = readFileSync(resolve(root, "scripts/dev-runtime.sh"), "utf8");
+    const start = text.indexOf("acquire_runtime_lock() {");
+    expect(start).toBeGreaterThan(-1);
+    const body = text.slice(start, text.indexOf("\n}\n", start));
+    const code = body
+      .split("\n")
+      .filter((line) => !/^\s*#/.test(line))
+      .join("\n");
+    // Only the CONTENDED half — everything before the owner write. The
+    // give-back after a failed owner write legitimately removes a directory
+    // this run created moments earlier and is not a break of anybody's lock.
+    const contended = code.slice(0, code.indexOf('token="$(lock_new_token)"'));
+    expect(contended, "the stale break is not an atomic rename").toContain(
+      'mv "$LOCK_DIR" "$breaking"',
+    );
+    expect(contended, "the stale break still removes the lock in two steps").not.toMatch(
+      /rmdir "\$LOCK_DIR"/,
+    );
+    expect(contended, "the stale break still deletes the owner file in place").not.toMatch(
+      /rm -f "\$LOCK_OWNER_FILE"\s*;?\s*then/,
+    );
+    // The renamed directory is read before it is destroyed, and destroyed only
+    // when it is the generation that was measured.
+    const rename = contended.indexOf('mv "$LOCK_DIR" "$breaking"');
+    const verify = contended.indexOf('"$breaking/${LOCK_OWNER_FILE##*/}"');
+    const destroy = contended.indexOf('rm -rf "$breaking"');
+    expect(verify, "the renamed lock is destroyed without being read").toBeGreaterThan(rename);
+    expect(destroy, "the renamed lock is destroyed before it is identified").toBeGreaterThan(
+      verify,
+    );
+    // Both hooks exist, and the second one sits in the interval the first
+    // cannot reach: after the re-read, before the rename.
+    const reread = contended.indexOf('owner_again="$(sed');
+    const hook2 = contended.indexOf("DEV_RUNTIME_RACE_SLEEP_BREAK");
+    expect(contended).toContain("DEV_RUNTIME_RACE_SLEEP:-0");
+    expect(hook2, "the second race hook does not follow the re-read").toBeGreaterThan(reread);
+    expect(rename, "the second race hook does not precede the rename").toBeGreaterThan(hook2);
+  });
+
   // --- ROUND 5: a LIVE daemon's record is not a stale one --------------------
   //
   // `is_owned_process` answered 1 -- "no" -- for two states that call for
