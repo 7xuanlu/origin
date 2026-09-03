@@ -1524,7 +1524,7 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
         version_txt = (repo_root / "version.txt").read_text().strip()
         major, minor, patch = (int(part) for part in version_txt.split("."))
         # A deliberate minor/major is steered by a `release-as` override in the
-        # real config (RELEASING.md, version-steering policy); while one is in
+        # real config (docs/RELEASING.md, version-steering policy); while one is in
         # place the candidate must carry exactly that version, not next patch.
         release_as = json.loads(config_text)["packages"]["."].get("release-as")
         next_version = release_as or f"{major}.{minor}.{patch + 1}"

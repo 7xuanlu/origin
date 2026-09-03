@@ -283,7 +283,7 @@ Full workflow reference: [plugin/skills](plugin/skills/README.md). Technical mod
 
 Nothing is locked in. Pages and session notes are Markdown under `~/.wenlan/`; memories live in one libSQL database under the platform data directory (`~/Library/Application Support/wenlan/` on macOS, `~/.local/share/wenlan/` on Linux, `%LOCALAPPDATA%\wenlan\` on Windows). Copy those two folders to back up or move a Wenlan. An install upgraded from Origin still holds a full copy of its data in `~/.origin/` and in the sibling `origin` data folder (`~/Library/Application Support/origin/` on macOS, `~/.local/share/origin/` on Linux, `%LOCALAPPDATA%\origin\` on Windows); delete or copy those two as well.
 
-To uninstall: the app's *Run Wenlan in background at login* toggle removes the launch registration — turn it off, quit, and delete `Wenlan.app` or run the Windows uninstaller, then delete the folders above. `wenlan background off` only stops the daemon and disables autostart; it does not remove the launch registration, so a CLI-only install should instead follow the daemon uninstall bullet in [PRIVACY.md](PRIVACY.md). The paths Wenlan writes are listed there.
+To uninstall: the app's *Run Wenlan in background at login* toggle removes the launch registration — turn it off, quit, and delete `Wenlan.app` or run the Windows uninstaller, then delete the folders above. `wenlan background off` only stops the daemon and disables autostart; it does not remove the launch registration, so a CLI-only install should instead follow the daemon uninstall bullet in [PRIVACY.md](docs/PRIVACY.md). The paths Wenlan writes are listed there.
 
 ---
 
@@ -354,7 +354,7 @@ pnpm dev:all
 pnpm build:all
 ```
 
-`pnpm dev:all` is the supported development entry point for the desktop app. It keeps development ports, data, process ownership, app identity, MCP sockets, and Remote Access state separate from the installed production runtime; a debug app started without that isolation refuses to run. See this repository's [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md), plus the in-tree [app/AGENTS.md](app/AGENTS.md), for the complete development workflow. Security reports: [SECURITY.md](SECURITY.md). Privacy policy: [PRIVACY.md](PRIVACY.md). Please also read the [Code of Conduct](CODE_OF_CONDUCT.md).
+`pnpm dev:all` is the supported development entry point for the desktop app. It keeps development ports, data, process ownership, app identity, MCP sockets, and Remote Access state separate from the installed production runtime; a debug app started without that isolation refuses to run. See this repository's [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](.github/CONTRIBUTING.md), plus the in-tree [app/AGENTS.md](app/AGENTS.md), for the complete development workflow. Security reports: [SECURITY.md](.github/SECURITY.md). Privacy policy: [PRIVACY.md](docs/PRIVACY.md). Please also read the [Code of Conduct](.github/CODE_OF_CONDUCT.md).
 
 ---
 
@@ -370,7 +370,7 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 
 Multi-factor authentication is required of every maintainer, on GitHub and on SignPath, and nobody is added to either without it. Releases are built only by the tagged release workflow in this repository, on GitHub-hosted runners, from the commit the tag points at.
 
-**Privacy policy:** [PRIVACY.md](PRIVACY.md) — what Wenlan stores, where it stores it, and each case we know of in which it reaches the network. How each platform is signed: [docs/code-signing.md](docs/code-signing.md).
+**Privacy policy:** [PRIVACY.md](docs/PRIVACY.md) — what Wenlan stores, where it stores it, and each case we know of in which it reaches the network. How each platform is signed: [docs/code-signing.md](docs/code-signing.md).
 
 The SignPath application is pending. Windows installers are not signed yet.
 

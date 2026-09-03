@@ -17,11 +17,11 @@ If you have a local `plans/` or `superpowers/` directory, treat everything in it
 
 - Repository overview and quickstart: `README.md`
 - Retrieval, graph, and model details: `technical-foundations.md`
-- Contributor workflow and CI commands: `CONTRIBUTING.md`
+- Contributor workflow and CI commands: `.github/CONTRIBUTING.md`
 - Agent and developer conventions: `AGENTS.md` at the repo root (`CLAUDE.md` re-imports it)
 - Test layers (what runs at L1-L8, where, when, whether it blocks): `test-layers.md`
 - Platform code (per-OS data dirs, service registration, GPU backends): `cross-platform.md`
-- Release operator runbook: `RELEASING.md` at the repo root
+- Release operator runbook: `docs/RELEASING.md`
 - AI-assisted install path used by the README: `setup-with-ai.md`
 - Intermittent CI failure policy: `ci-flake-policy.md`
 - Review-flavor UI environment for realistic native rendering: `review-environment.md`

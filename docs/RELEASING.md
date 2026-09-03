@@ -8,7 +8,7 @@ Merge conventional commits to `main` (for example, `feat:`, `fix:`, or `chore:`)
 
 > This document is the canonical release procedure. Coding changes must preserve
 > the conventional-title and synchronized-version rules in root
-> [`AGENTS.md`](AGENTS.md) "Git and release".
+> [`AGENTS.md`](../AGENTS.md) "Git and release".
 
 The `.release-please-manifest.json` is the canonical version source; check the pending version with `cat .release-please-manifest.json`. The release-please workflow syncs Cargo manifests, npm package manifests, plugin metadata, and pinned install URLs from `version.txt`. It also syncs the workspace `Cargo.toml` version on the release branch because release-please cannot reliably handle Cargo workspaces with the `simple` release type.
 

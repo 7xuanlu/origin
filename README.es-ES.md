@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=5c37ed76d5c530ace9aa15f851cb4c06d9b0107d8e495c717eefabcee201c123 -->
+<!-- README_SYNC: source=README.md sha256=7c7d6c8fba5ea5036d603ad2670082ab97e41a3629c9fee2b1d790fd98384738 -->
 
 <p align="center">
   <picture>
@@ -281,7 +281,7 @@ Referencia completa del flujo de trabajo: [plugin/skills](plugin/skills/README.m
 
 Nada queda encerrado. Las páginas y las notas de sesión son Markdown en `~/.wenlan/`; las memorias viven en una base de datos libSQL dentro del directorio de datos de la plataforma (`~/Library/Application Support/wenlan/` en macOS, `~/.local/share/wenlan/` en Linux, `%LOCALAPPDATA%\wenlan\` en Windows). Copia esas dos carpetas para hacer una copia de seguridad o mover tu Wenlan. Si esta instalación se actualizó desde Origin, todavía conserva una copia completa de sus datos en `~/.origin/` y en la carpeta hermana de datos `origin` (`~/Library/Application Support/origin/` en macOS, `~/.local/share/origin/` en Linux, `%LOCALAPPDATA%\origin\` en Windows); borra o copia también esas dos.
 
-Para desinstalar: el interruptor *Ejecutar Wenlan en segundo plano al iniciar sesión* de la app elimina el registro de arranque — desactívalo, cierra la app y borra `Wenlan.app` o ejecuta el desinstalador de Windows, y después borra las carpetas anteriores. `wenlan background off` solo detiene el daemon y desactiva el arranque automático; no elimina el registro de arranque, así que una instalación solo de CLI debe seguir en su lugar el punto de desinstalación del daemon en [PRIVACY.md](PRIVACY.md). Las rutas que Wenlan escribe están ahí.
+Para desinstalar: el interruptor *Ejecutar Wenlan en segundo plano al iniciar sesión* de la app elimina el registro de arranque — desactívalo, cierra la app y borra `Wenlan.app` o ejecuta el desinstalador de Windows, y después borra las carpetas anteriores. `wenlan background off` solo detiene el daemon y desactiva el arranque automático; no elimina el registro de arranque, así que una instalación solo de CLI debe seguir en su lugar el punto de desinstalación del daemon en [PRIVACY.md](docs/PRIVACY.md). Las rutas que Wenlan escribe están ahí.
 
 ---
 
@@ -352,7 +352,7 @@ pnpm dev:all
 pnpm build:all
 ```
 
-`pnpm dev:all` es el punto de entrada de desarrollo admitido para la aplicación de escritorio. Mantiene los puertos de desarrollo, los datos, la propiedad de los procesos, la identidad de la aplicación, los sockets MCP y el estado de Remote Access separados del runtime de producción instalado; una compilación de depuración iniciada sin ese aislamiento se niega a ejecutarse. Consulta el [AGENTS.md](AGENTS.md) y [CONTRIBUTING.md](CONTRIBUTING.md) de este repositorio, además del [app/AGENTS.md](app/AGENTS.md) dentro del repositorio, para el flujo de trabajo de desarrollo completo. Reportes de seguridad: [SECURITY.md](SECURITY.md). Política de privacidad: [PRIVACY.md](PRIVACY.md). Por favor, lee también el [Código de Conducta](CODE_OF_CONDUCT.md).
+`pnpm dev:all` es el punto de entrada de desarrollo admitido para la aplicación de escritorio. Mantiene los puertos de desarrollo, los datos, la propiedad de los procesos, la identidad de la aplicación, los sockets MCP y el estado de Remote Access separados del runtime de producción instalado; una compilación de depuración iniciada sin ese aislamiento se niega a ejecutarse. Consulta el [AGENTS.md](AGENTS.md) y [CONTRIBUTING.md](.github/CONTRIBUTING.md) de este repositorio, además del [app/AGENTS.md](app/AGENTS.md) dentro del repositorio, para el flujo de trabajo de desarrollo completo. Reportes de seguridad: [SECURITY.md](.github/SECURITY.md). Política de privacidad: [PRIVACY.md](docs/PRIVACY.md). Por favor, lee también el [Código de Conducta](.github/CODE_OF_CONDUCT.md).
 
 ---
 
@@ -368,7 +368,7 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 
 La autenticación multifactor es obligatoria para cada mantenedor, en GitHub y en SignPath, y nadie se añade a ninguno de los dos sin ella. Las versiones se compilan únicamente con el workflow de release por etiqueta de este repositorio, en runners alojados por GitHub, desde el commit al que apunta la etiqueta.
 
-**Política de privacidad:** [PRIVACY.md](PRIVACY.md) — qué guarda Wenlan, dónde lo guarda y cada caso que conocemos en que accede a la red. Cómo se firma cada plataforma: [docs/code-signing.md](docs/code-signing.md).
+**Política de privacidad:** [PRIVACY.md](docs/PRIVACY.md) — qué guarda Wenlan, dónde lo guarda y cada caso que conocemos en que accede a la red. Cómo se firma cada plataforma: [docs/code-signing.md](docs/code-signing.md).
 
 La solicitud a SignPath está pendiente. Los instaladores de Windows aún no están firmados.
 

@@ -47,7 +47,7 @@ The workflow is already wired, and the secrets are in place: releases from v0.17
    | `APPLE_TEAM_ID` | the Team ID from step 1 |
 
    These are the names the Tauri CLI reads (`APPLE_CERTIFICATE` and `APPLE_CERTIFICATE_PASSWORD` import the certificate into a temporary keychain on the runner; `APPLE_SIGNING_IDENTITY` overrides `signingIdentity` in `tauri.conf.json`; `APPLE_ID` with `APPLE_PASSWORD` and `APPLE_TEAM_ID` reach only the steps that talk to the notary service, never `pnpm tauri build` — see the outermost-container note below).
-6. **Cut a release** as usual (`RELEASING.md`). In the `app-bundle` job of `release.yml` the steps run in Apple's prescribed order:
+6. **Cut a release** as usual (`docs/RELEASING.md`). In the `app-bundle` job of `release.yml` the steps run in Apple's prescribed order:
    1. *Load Apple signing and notarization secrets* exports the three signing secrets and deliberately withholds the three notarization ones.
    2. `pnpm tauri build` signs the app and every bundled binary (`wenlan`, `wenlan-server`, `wenlan-mcp`, `cloudflared`) with the hardened runtime and `app/Entitlements.plist`, signs the disk image, and — because it cannot see the notarization secrets — submits nothing.
    3. *Notarize and staple the DMG* makes the single submission and staples the ticket to the disk image.

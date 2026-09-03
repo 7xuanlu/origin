@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=5c37ed76d5c530ace9aa15f851cb4c06d9b0107d8e495c717eefabcee201c123 -->
+<!-- README_SYNC: source=README.md sha256=7c7d6c8fba5ea5036d603ad2670082ab97e41a3629c9fee2b1d790fd98384738 -->
 
 <p align="center">
   <picture>
@@ -283,7 +283,7 @@ a1b2c3d distill: 4 pages
 
 沒有任何鎖定。頁面和工作階段筆記是 `~/.wenlan/` 下的 Markdown；記憶保存在平台資料目錄下的一個 libSQL 資料庫中（macOS 為 `~/Library/Application Support/wenlan/`，Linux 為 `~/.local/share/wenlan/`，Windows 為 `%LOCALAPPDATA%\wenlan\`）。複製這兩個資料夾即可備份或搬移你的 Wenlan。如果這次安裝是從 Origin 升級而來，仍會在 `~/.origin/` 和同層的 `origin` 資料資料夾中（macOS 為 `~/Library/Application Support/origin/`，Linux 為 `~/.local/share/origin/`，Windows 為 `%LOCALAPPDATA%\origin\`）各保留一份完整資料；這兩個資料夾也請一併刪除或複製。
 
-移除：app 中「登入時在背景執行文瀾」開關會移除開機註冊——關閉它並結束程式，刪除 `Wenlan.app` 或執行 Windows 解除安裝程式，然後刪除上述資料夾。`wenlan background off` 只會停止守護程序並關閉開機自動啟動，不會移除開機註冊；僅使用 CLI 的安裝請改為參照 [PRIVACY.md](PRIVACY.md) 中守護程序的解除安裝項目。Wenlan 寫入的路徑列在其中。
+移除：app 中「登入時在背景執行文瀾」開關會移除開機註冊——關閉它並結束程式，刪除 `Wenlan.app` 或執行 Windows 解除安裝程式，然後刪除上述資料夾。`wenlan background off` 只會停止守護程序並關閉開機自動啟動，不會移除開機註冊；僅使用 CLI 的安裝請改為參照 [PRIVACY.md](docs/PRIVACY.md) 中守護程序的解除安裝項目。Wenlan 寫入的路徑列在其中。
 
 ---
 
@@ -354,7 +354,7 @@ pnpm dev:all
 pnpm build:all
 ```
 
-`pnpm dev:all` 是桌面 app 受支援的開發進入點。它讓開發用的連接埠、資料、行程歸屬、app 識別、MCP socket 與 Remote Access 狀態都與已安裝的正式執行環境隔離；未處於該隔離環境的 debug build 會拒絕啟動。完整開發流程見本 repository 的 [AGENTS.md](AGENTS.md) 與 [CONTRIBUTING.md](CONTRIBUTING.md)，以及儲存庫內的 [app/AGENTS.md](app/AGENTS.md)。安全性問題請見 [SECURITY.md](SECURITY.md)，隱私權政策請見 [PRIVACY.md](PRIVACY.md)，也請閱讀 [Code of Conduct](CODE_OF_CONDUCT.md)。
+`pnpm dev:all` 是桌面 app 受支援的開發進入點。它讓開發用的連接埠、資料、行程歸屬、app 識別、MCP socket 與 Remote Access 狀態都與已安裝的正式執行環境隔離；未處於該隔離環境的 debug build 會拒絕啟動。完整開發流程見本 repository 的 [AGENTS.md](AGENTS.md) 與 [CONTRIBUTING.md](.github/CONTRIBUTING.md)，以及儲存庫內的 [app/AGENTS.md](app/AGENTS.md)。安全性問題請見 [SECURITY.md](.github/SECURITY.md)，隱私權政策請見 [PRIVACY.md](docs/PRIVACY.md)，也請閱讀 [Code of Conduct](.github/CODE_OF_CONDUCT.md)。
 
 ---
 
@@ -370,7 +370,7 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 
 本專案要求每位 maintainer 在 GitHub 與 SignPath 上都啟用多因素驗證；未啟用者不會被加入其中任何一方。Release 只由本 repository 的 tag release workflow 建置，執行在 GitHub 託管的 runner 上，來源是該 tag 指向的 commit。
 
-**隱私權政策：**[PRIVACY.md](PRIVACY.md) —— Wenlan 保存什麼、保存在哪裡，以及我們已知它會存取網路的各種情況。各平台的簽章方式見 [docs/code-signing.md](docs/code-signing.md)。
+**隱私權政策：**[PRIVACY.md](docs/PRIVACY.md) —— Wenlan 保存什麼、保存在哪裡，以及我們已知它會存取網路的各種情況。各平台的簽章方式見 [docs/code-signing.md](docs/code-signing.md)。
 
 SignPath 的申請正在審核中，Windows 安裝包尚未簽署。
 

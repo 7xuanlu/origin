@@ -75,7 +75,7 @@ pub const EXTRACT_KNOWLEDGE_GRAPH_PROMPT_VERSION: &str = "v2";
 
 /// Locate `quote` as an exact CHAR-wise substring of `content`, returning
 /// `(char_start, char_end)` -- **character** offsets, never byte offsets
-/// (CONTRIBUTING.md "Code Conventions", UTF-8 safety). Used at capture time (M3g span capture,
+/// (.github/CONTRIBUTING.md "Code Conventions", UTF-8 safety). Used at capture time (M3g span capture,
 /// `docs/plans/2026-07-25-m3g-promotion-mechanics.md` §2.3): the model
 /// supplies the verbatim quote, CODE (never the model) locates it. Returns
 /// `None` when `quote` is empty or is not an exact substring of `content`
@@ -335,7 +335,7 @@ mod tests {
     fn test_locate_span_chars_multibyte_unicode() {
         // Multi-byte chars (CJK + a ZWJ emoji sequence) make byte offsets
         // diverge sharply from char offsets -- the regression case for the
-        // "never byte-index" rule (CONTRIBUTING.md "Code Conventions").
+        // "never byte-index" rule (.github/CONTRIBUTING.md "Code Conventions").
         let content = "爱丽丝 (Alice) 👩‍💻 leads the 后端 team.";
         let quote = "leads the 后端 team";
         let result = locate_span_chars(content, quote);
