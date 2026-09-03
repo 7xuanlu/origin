@@ -26,9 +26,7 @@ Useful work with AI shouldn't disappear when a conversation ends. Wenlan builds 
   <a href="#learn-more">Learn&nbsp;more</a>
 </p>
 
-<p align="center">
-  <img src="./docs/assets/desktop-wiki-preview.png" alt="Wenlan desktop app showing a source-backed wiki page with inspectable citations." width="100%">
-</p>
+https://github.com/user-attachments/assets/77272089-84ea-4eb0-a074-c9cc8b7b28fd
 
 <p align="center">
   <sub>A maintained Page in the desktop app: open any citation to inspect the Source or Memory behind the claim.</sub>
@@ -124,8 +122,6 @@ Wenlan turns documents, notes, and past AI conversations into a source-backed kn
 For the complete workflow, see the [LLM-wiki implementation guide](https://wenlan.app/learn/distilled-wiki-pages-ai-memory).
 
 **Wenlan's distinctive move:** Sources and atomic Memories independently support maintained Pages. Memory history preserves how knowledge changed; Page history shows which current evidence supports the synthesis. Machine-maintained Pages can rebuild from current support, while changes to human writing wait as reviewable revisions.
-
-https://github.com/user-attachments/assets/ee4c3a7f-3609-46e5-8538-be26c4963caa
 
 <a id="knowledge-graph"></a>
 
