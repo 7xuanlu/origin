@@ -424,11 +424,19 @@ stage_file_by_identity() {
 stage_windows_daemon() {
   local source="$1" source_dir dir listing name want rc
   local staged=0 prepared=0 staged_names=" "
+  local line previous previous_rc
   local -a missing=()
   local -a stray=()
   # name -> the digest that was verified into the stage for it. Two source
   # directories are walked, and the same DLL name can be in both.
-  local -A staged_digest=()
+  #
+  # A NEWLINE-DELIMITED "name<TAB>digest" STRING AND NOT AN ASSOCIATIVE ARRAY.
+  # `local -A` is bash 4; macOS ships 3.2, where it is a `local: -A: invalid
+  # option` and every `staged_digest[$name]` read after it is parsed as an
+  # ARITHMETIC index, so `onnxruntime.dll` is a syntax error on the dot. The
+  # lookup below compares the WHOLE first field, so no name can be found inside
+  # another, and a miss stays distinguishable from a recorded empty digest.
+  local staged_digest=""
   # The runtime libraries the daemon resolves from its own directory.
   #
   # Not a guess and not a glob's opinion. `scripts/prepare-sidecars.sh` refuses
@@ -522,22 +530,29 @@ stage_windows_daemon() {
       # prepared into both places -- and is allowed silently. A collision on
       # different bytes is a layout nobody can call correct, and picking one is
       # exactly the guess this file refuses to make.
-      if [[ -n "${staged_digest[$name]:-}" &&
-        "${staged_digest[$name]}" != "$STAGED_FILE_DIGEST" ]]; then
+      previous=""
+      previous_rc=1
+      while IFS= read -r line; do
+        [[ "${line%%$'\t'*}" == "$name" ]] || continue
+        previous="${line#*$'\t'}"
+        previous_rc=0
+        break
+      done <<<"$staged_digest"
+      if (( previous_rc == 0 )) && [[ "$previous" != "$STAGED_FILE_DIGEST" ]]; then
         echo "error: two different runtime libraries are both called $name" >&2
         echo "       $REPO_ROOT/app/binaries and $source_dir disagree about it" >&2
-        echo "       first:  ${staged_digest[$name]}" >&2
+        echo "       first:  $previous" >&2
         echo "       second: $STAGED_FILE_DIGEST ($dir/$name)" >&2
         echo "       staging the second over the first would decide by walk" >&2
         echo "       order which library the daemon loads; re-run" >&2
         echo "       pnpm prepare:sidecars so the two agree" >&2
         return 1
       fi
-      if [[ -z "${staged_digest[$name]:-}" ]]; then
+      if (( previous_rc != 0 )); then
         staged=$((staged + 1))
         staged_names+="$name "
+        staged_digest+="$name"$'\t'"$STAGED_FILE_DIGEST"$'\n'
       fi
-      staged_digest[$name]="$STAGED_FILE_DIGEST"
     done <<<"$listing"
   done
   # THE STAGED SET, verified as a set and not as a series of copies.
