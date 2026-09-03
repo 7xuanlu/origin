@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=abd449a0aa5ce5325c272e35ef486a6a8b7295bd5009c620aaf50f317f805fe9 -->
+<!-- README_SYNC: source=README.md sha256=a0461fc92a4c4fb5027d1f063f425f25438c5181ff3cb478c2705385e779b4ab -->
 
 <p align="center">
   <picture>
@@ -123,9 +123,7 @@ Wenlan convierte documentos, notas y conversaciones pasadas con IA en una base d
 
 **El elemento distintivo de Wenlan:** Las Fuentes y las Memorias atómicas sustentan independientemente las Páginas mantenidas. El historial de Memoria preserva cómo cambió el conocimiento; el historial de la Página muestra qué evidencia actual sustenta la síntesis. Las Páginas mantenidas por máquina pueden reconstruirse a partir del sustento actual, mientras que los cambios en la escritura humana esperan como revisiones revisables.
 
-<p align="center">
-  <img src="./docs/assets/feature-reel.gif" alt="Demo de funciones de Wenlan mostrando páginas respaldadas por fuentes, inspección de fuentes, contexto de grafo, captura por agente y curación." width="100%">
-</p>
+https://github.com/user-attachments/assets/ee4c3a7f-3609-46e5-8538-be26c4963caa
 
 <a id="knowledge-graph"></a>
 

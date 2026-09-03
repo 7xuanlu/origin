@@ -5262,6 +5262,133 @@ async fn accept_pending_revision_legacy_page_write_card_without_version_still_ac
     );
 }
 
+/// A card staged before source-revision fencing (PR #598) records no base to
+/// check its evidence against, and `version` cannot stand in for one: attaching
+/// or detaching a source leaves `version` untouched. Accepting such a card on
+/// the version fence alone would write prose citing sources the page may no
+/// longer hold. It is refused, deleted, and the page re-queued instead.
+#[tokio::test]
+async fn accept_pending_revision_discards_a_page_card_staged_before_source_revision_fencing() {
+    let (db, _dir) = test_db().await;
+    let mem_id = "mem_page_accept_prefence_original";
+    let new_mem_id = "mem_page_accept_prefence_new";
+    let original_content = "Rust ownership keeps memory safety rules explicit";
+    let human_content = "Rust ownership keeps memory safety rules explicit, with human notes";
+    let proposed_content =
+        "Rust ownership lets the compiler enforce memory safety during page refresh";
+
+    seed_memory(&db, mem_id, original_content).await;
+    seed_memory(&db, new_mem_id, proposed_content).await;
+    let page_id = seed_page(&db, mem_id, original_content).await;
+    update_page(
+        &db,
+        &page_id,
+        UpdatePageRequest {
+            content: human_content.to_string(),
+            source_memory_ids: vec![mem_id.to_string()],
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        },
+        "fs_edit",
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let before = db.get_page(&page_id).await.unwrap().unwrap();
+    let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
+    let card = stage_page_revision_card(
+        &db,
+        &before,
+        proposed_content,
+        &[mem_id.to_string(), new_mem_id.to_string()],
+        staged_source_revision,
+        "page_growth",
+        None,
+    )
+    .await
+    .unwrap();
+    let card_id = card
+        .revision_card_id
+        .as_deref()
+        .expect("staged page card must return an id")
+        .to_string();
+
+    // Age the card back to a pre-#598 staging: the field is gone entirely,
+    // which is what the cards already sitting in real queues look like.
+    {
+        let conn = db.test_primary_session().await;
+        let mut rows = conn
+            .query(
+                "SELECT structured_fields FROM memories WHERE source_id = ?1",
+                libsql::params![card_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("revision card row must exist");
+        let structured_fields = row.get::<String>(0).unwrap();
+        drop(rows);
+
+        let mut structured: serde_json::Value = serde_json::from_str(&structured_fields).unwrap();
+        structured
+            .as_object_mut()
+            .expect("structured_fields must be an object")
+            .remove("source_revision");
+        conn.execute(
+            "UPDATE memories SET structured_fields = ?1 WHERE source_id = ?2",
+            libsql::params![structured.to_string(), card_id.clone()],
+        )
+        .await
+        .unwrap();
+    }
+
+    let err = accept_pending_revision(&db, &card_id, "test-agent")
+        .await
+        .unwrap_err();
+    let WenlanError::Conflict(message) = err else {
+        panic!("a card carrying no source_revision must be refused as a conflict: {err:?}");
+    };
+    assert!(
+        message.contains(&card_id) && message.contains(&page_id),
+        "the refusal must name the card and the page: {message}"
+    );
+    assert!(
+        message.contains("discarded") && message.contains("re-queued"),
+        "the refusal is permanent, so it must say the card is gone and the page will be \
+         regenerated rather than invite a retry that can never succeed: {message}"
+    );
+
+    let after = db.get_page(&page_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.content, human_content,
+        "the stale card's prose must not reach the page"
+    );
+    assert_eq!(
+        after.stale_reason.as_deref(),
+        Some("source_updated"),
+        "the page must be re-queued for regeneration"
+    );
+    assert!(
+        db.get_page_source_revision(&page_id).await.unwrap() > staged_source_revision,
+        "re-queueing must bump the source revision so no other card staged against the \
+         old evidence can win a later race"
+    );
+    assert!(
+        db.pending_memory_revision_payload(&card_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the discarded card must be gone from the pending queue"
+    );
+}
+
 #[tokio::test]
 async fn accept_pending_revision_returns_not_found_on_missing_id() {
     let (db, _tmp) = crate::db::tests::test_db().await;

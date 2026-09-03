@@ -1152,6 +1152,32 @@ function pageDraftErrorText(error: unknown): string {
   return String(error);
 }
 
+/**
+ * The daemon's own sentence out of a rejected Tauri command.
+ *
+ * A rejected command carries a formatted string, not an Error:
+ * `HTTP POST /api/... returned 409 Conflict: {"error":"..."}` (app/src/api.rs
+ * `post_empty`). The URL and the status are ours; the part worth showing a
+ * person is the `error` field of the JSON body the daemon sent, which is where
+ * a route explains what it refused and what it did instead. Returns null when
+ * the rejection carries no daemon body, so callers keep their own wording for
+ * transport failures.
+ */
+export function daemonErrorMessage(error: unknown): string | null {
+  const text = pageDraftErrorText(error);
+  const objectStart = text.indexOf("{");
+  if (objectStart < 0) return null;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text.slice(objectStart));
+  } catch {
+    return null;
+  }
+  if (typeof payload !== "object" || payload === null) return null;
+  const message = Reflect.get(payload, "error");
+  return typeof message === "string" && message.trim() !== "" ? message : null;
+}
+
 function parsePageDraftError(error: unknown): PageDraftApiError | null {
   const message = pageDraftErrorText(error);
   const objectStart = message.indexOf("{");

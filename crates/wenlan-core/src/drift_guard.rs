@@ -12568,3 +12568,321 @@ fn retired_parity_machinery_guard_detects_a_live_reference() {
     let hits = live_references_to_retired_symbols_in_source(source, &re);
     assert_eq!(hits, vec![(1, "SCOPED_ENTITIES_CONSUMER".to_string())]);
 }
+
+// ── Teeth #17: every db-layer COMMIT rolls back when the COMMIT itself fails ──
+
+/// Bytes of source after a `COMMIT` execute in which its error handling must
+/// begin. Every real shape in the db layer opens that block within a few dozen
+/// bytes of the literal (`…await {`, or the `match …await {` head); this is
+/// wide enough to survive rustfmt splitting the call across lines and narrow
+/// enough that an unrelated block further down the function cannot be mistaken
+/// for the commit's own.
+const COMMIT_ERROR_ARM_REACH: usize = 240;
+
+/// Names of db-layer helpers that perform the `ROLLBACK` for their caller. A
+/// commit whose error arm calls one is recovered even though the SQL word
+/// appears only inside the helper. The list is checked, not trusted:
+/// `every_db_commit_rolls_back_when_the_commit_fails` asserts each name is a
+/// real function in a scanned file whose own body executes `"ROLLBACK"`, so a
+/// rename or a gutted helper cannot quietly turn this into a blanket
+/// exemption. `commit_or_rollback` is deliberately absent — it rolls back in
+/// its own error arm, so it satisfies the guard like any other site.
+const ROLLBACK_HELPERS: &[&str] = &["rollback_repair_transaction"];
+
+/// The db layer: the one file that owns the writer connection plus its child
+/// modules, which reach the same connection through `super::`. A `COMMIT` that
+/// fails anywhere else does not wedge this process's only writer.
+fn is_db_layer_module(path: &str) -> bool {
+    path == "crates/wenlan-core/src/db.rs" || path.starts_with("crates/wenlan-core/src/db/")
+}
+
+/// True when a commit's error-handling block reaches a rollback — either the
+/// SQL statement itself or one of the named helpers that runs it.
+fn error_arm_rolls_back(arm: &str) -> bool {
+    arm.contains("ROLLBACK") || ROLLBACK_HELPERS.iter().any(|helper| arm.contains(helper))
+}
+
+/// Offset of the `}` closing the `{` at `open`, on brace-masked text.
+fn matching_brace(masked: &str, open: usize) -> Option<usize> {
+    let bytes = masked.as_bytes();
+    let mut depth = 0usize;
+    for (offset, byte) in bytes[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Name of the function a byte offset sits in, for a readable site label.
+/// Read off the brace-masked text so an `fn ` inside a string or comment
+/// cannot claim the site.
+fn enclosing_fn_name(masked: &str, at: usize) -> String {
+    masked[..at]
+        .match_indices("fn ")
+        .filter(|(start, _)| {
+            *start == 0
+                || !masked[..*start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+        .last()
+        .map(|(start, _)| {
+            masked[start + 3..]
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "<unknown fn>".to_string())
+}
+
+/// Body of `fn <name>` in `source`, literals kept, or `None` when the file
+/// does not define it.
+fn fn_body(source: &str, name: &str) -> Option<String> {
+    let braces = mask_lexical(source, false);
+    let strings = mask_lexical(source, true);
+    let needle = format!("fn {name}");
+    let at = braces.find(&needle)?;
+    let after = at + needle.len();
+    if braces[after..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let open = after + braces[after..].find('{')?;
+    let close = matching_brace(&braces, open)?;
+    Some(strings[open..close].to_string())
+}
+
+/// Production `COMMIT` executes whose error handling does not roll back,
+/// reported as `path::fn`.
+///
+/// SQLite leaves the transaction **open** when `COMMIT` fails (the
+/// `SQLITE_BUSY` case), so a site that returns the commit error without a
+/// `ROLLBACK` wedges the process's single writer connection: every later write
+/// fails with "cannot start a transaction within a transaction" until the
+/// daemon restarts. PR #611 fixed the sites that existed then; this guard is
+/// what stops the twenty-second one from being written.
+///
+/// Two masked copies of the same source are read at the same offsets, which is
+/// exactly the split `mask_lexical` was built for: braces are counted on the
+/// copy with literals blanked, so a `{e}` inside a `format!` cannot move the
+/// depth counter, while `"COMMIT"` and `"ROLLBACK"` are read on the copy that
+/// keeps literals.
+fn commit_sites_without_rollback(path: &str, source: &str) -> Vec<String> {
+    let production = strip_cfg_test_items(source);
+    let strings = mask_lexical(&production, true);
+    let braces = mask_lexical(&production, false);
+    assert_eq!(
+        strings.len(),
+        braces.len(),
+        "mask_lexical must preserve byte length so one offset indexes both copies"
+    );
+
+    let mut sites = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(found) = strings[cursor..].find("\"COMMIT") {
+        let at = cursor + found;
+        cursor = at + "\"COMMIT".len();
+
+        // Only an executed statement counts. `conn.execute("COMMIT", ())`
+        // reads as `…execute(` before the literal; rustfmt may put the literal
+        // on its own line, so whitespace is skipped.
+        let head = strings[..at].trim_end();
+        let head = head.strip_suffix('(').unwrap_or(head).trim_end();
+        if !head.ends_with("execute") && !head.ends_with("execute_batch") {
+            continue;
+        }
+
+        // Back the window off to a char boundary: the reach is a byte count,
+        // and code outside blanked literals and comments is not guaranteed
+        // ASCII.
+        let mut reach = braces.len().min(at + COMMIT_ERROR_ARM_REACH);
+        while reach > at && !braces.is_char_boundary(reach) {
+            reach -= 1;
+        }
+        let arm = braces[at..reach]
+            .find('{')
+            .map(|offset| at + offset)
+            .and_then(|open| matching_brace(&braces, open).map(|close| (open, close)));
+        match arm {
+            Some((open, close)) if error_arm_rolls_back(&strings[open..close]) => {}
+            _ => sites.push(format!("{path}::{}", enclosing_fn_name(&braces, at))),
+        }
+    }
+    sites
+}
+
+#[test]
+fn every_db_commit_rolls_back_when_the_commit_fails() {
+    let root = repo_root();
+    let db_layer: Vec<String> = git_ls_files(&root, "*.rs")
+        .into_iter()
+        .filter(|path| is_db_layer_module(path) && !is_test_only_module(path))
+        .collect();
+    // A scan over nothing passes for free. `db.rs` plus its production child
+    // modules are always more than one file, so a smaller result means the
+    // pathspec stopped resolving rather than that the layer got clean.
+    assert!(
+        db_layer.len() > 1,
+        "the db layer resolved to {} file(s), so the scan cannot have run",
+        db_layer.len()
+    );
+
+    // The allow-list is only worth what its members do. Each named helper must
+    // be a real function in a scanned file whose own body executes a ROLLBACK.
+    for helper in ROLLBACK_HELPERS {
+        let found = db_layer.iter().find_map(|path| {
+            let source = std::fs::read_to_string(root.join(path)).expect("read Rust source");
+            fn_body(&source, helper).map(|body| (path.clone(), body))
+        });
+        let (path, body) = found.unwrap_or_else(|| {
+            panic!("rollback helper `{helper}` is not defined in any scanned db-layer file")
+        });
+        assert!(
+            body.contains("\"ROLLBACK\""),
+            "rollback helper `{helper}` in {path} no longer executes a ROLLBACK, so every \
+             commit error arm that calls it is unguarded"
+        );
+    }
+
+    let mut sites = Vec::new();
+    for path in &db_layer {
+        let source = std::fs::read_to_string(root.join(path)).expect("read Rust source");
+        sites.extend(commit_sites_without_rollback(path, &source));
+    }
+    assert!(
+        sites.is_empty(),
+        "a db-layer COMMIT returns its error without a ROLLBACK: {sites:?}. \
+         SQLite leaves the transaction open when COMMIT fails, so this wedges the \
+         process's only writer connection and every later write dies with \
+         \"cannot start a transaction within a transaction\". Roll back in the \
+         error arm, or call `commit_or_rollback`, which does it for you"
+    );
+}
+
+#[test]
+fn commit_rollback_guard_detects_the_wedge_and_ignores_recovered_shapes() {
+    // Positive control: the exact shape PR #611 removed -- commit, map the
+    // error, return it, transaction still open.
+    assert_eq!(
+        commit_sites_without_rollback(
+            "crates/wenlan-core/src/db.rs",
+            "impl MemoryDB { async fn wedge(&self, conn: &Connection) -> Result<()> { \
+             conn.execute(\"COMMIT\", ()).await.map_err(|e| Error::Db(format!(\"x: {e}\")))?; \
+             Ok(()) } }",
+        ),
+        ["crates/wenlan-core/src/db.rs::wedge"],
+        "a commit whose error is returned without a rollback must be caught"
+    );
+
+    // The `{e}` in that `format!` is why braces are counted on the
+    // literals-blanked copy: read on the other copy it opens a block that
+    // never closes.
+    for (label, source) in [
+        (
+            "if-let error arm",
+            "async fn ok_if_let(conn: &Connection) -> Result<()> { \
+             if let Err(error) = conn.execute(\"COMMIT\", ()).await { \
+             let _ = conn.execute(\"ROLLBACK\", ()).await; \
+             return Err(Error::Db(format!(\"commit: {error}\"))); } Ok(()) }",
+        ),
+        (
+            "match with both arms",
+            "async fn ok_match(conn: &Connection) -> Result<u64> { \
+             match conn.execute(\"COMMIT\", ()).await { Ok(rows) => Ok(rows), \
+             Err(e) => { let _ = conn.execute(\"ROLLBACK\", ()).await; \
+             Err(Error::Db(format!(\"commit: {e}\"))) } } }",
+        ),
+        (
+            "shared rollback helper",
+            "async fn ok_helper(conn: &Connection) -> Result<()> { \
+             if let Err(error) = conn.execute(\"COMMIT\", ()).await { \
+             let commit_error = Error::Db(format!(\"commit: {error}\")); \
+             rollback_repair_transaction(conn, &commit_error, false).await?; \
+             return Err(commit_error); } Ok(()) }",
+        ),
+        (
+            "rustfmt split across lines",
+            "async fn ok_split(conn: &Connection) -> Result<()> {\n    if let Err(error) = conn\n\
+             \x20       .execute(\n            \"COMMIT\",\n            (),\n        )\n\
+             \x20       .await\n    {\n        let _ = conn.execute(\"ROLLBACK\", ()).await;\n\
+             \x20       return Err(Error::Db(format!(\"commit: {error}\")));\n    }\n    Ok(())\n}",
+        ),
+    ] {
+        assert!(
+            commit_sites_without_rollback("crates/wenlan-core/src/db.rs", source).is_empty(),
+            "{label}: a commit that already rolls back is not a violation"
+        );
+    }
+
+    // Not executes at all: a doc comment naming COMMIT, and a literal that is
+    // never handed to the connection.
+    for (label, source) in [
+        (
+            "doc comment",
+            "/// Runs conn.execute(\"COMMIT\") for the caller.\n\
+             async fn documented(conn: &Connection) { let _ = conn; }",
+        ),
+        (
+            "literal that is never executed",
+            "async fn labelled(conn: &Connection) { let stage = \"COMMIT\"; \
+             let _ = (conn, stage); }",
+        ),
+    ] {
+        assert!(
+            commit_sites_without_rollback("crates/wenlan-core/src/db.rs", source).is_empty(),
+            "{label}: only an executed COMMIT statement is a site"
+        );
+    }
+
+    // Test-only code is out of scope both ways: by path, and by cfg attribute
+    // inside a production file.
+    assert!(
+        !is_db_layer_module("crates/wenlan-core/src/post_ingest.rs"),
+        "the guard covers the db layer, which is where the writer connection lives"
+    );
+    assert!(
+        is_test_only_module("crates/wenlan-core/src/db/main_tests.rs"),
+        "db test modules must be out of scope -- their bare COMMITs are fixtures"
+    );
+    assert!(
+        commit_sites_without_rollback(
+            "crates/wenlan-core/src/db.rs",
+            "#[cfg(test)]\nmod tests {\n    async fn fixture(conn: &Connection) {\n\
+             \x20       conn.execute(\"COMMIT\", ()).await.unwrap();\n    }\n}",
+        )
+        .is_empty(),
+        "a cfg(test) module inside a production file is not a production writer"
+    );
+
+    // `fn_body` is what makes the allow-list checkable, so it must actually
+    // read a body and stop at its close.
+    let body = fn_body(
+        "async fn helper(conn: &Connection) { conn.execute(\"ROLLBACK\", ()).await; }\n\
+         async fn after() { let _ = \"COMMIT\"; }",
+        "helper",
+    )
+    .expect("fn_body must find a defined function");
+    assert!(body.contains("\"ROLLBACK\""));
+    assert!(
+        !body.contains("\"COMMIT\""),
+        "fn_body must stop at the function's closing brace"
+    );
+    assert!(
+        fn_body("async fn helper_two() {}", "helper").is_none(),
+        "a longer name must not answer for the one asked about"
+    );
+}

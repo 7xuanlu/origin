@@ -1156,7 +1156,8 @@ pub const EMBEDDING_DIM: usize = 768;
 /// `observations`/`memory_entities`/`entity_minhash_bands` without their
 /// `REFERENCES entities(id)` foreign key. Migration 123 (G6 Stage 3) drops
 /// `entities` and `entity_aliases` outright. Migration 127 adds
-/// `pages.refresh_blocked_reason` (citation-gate surfacing).
+/// `pages.refresh_blocked_reason` (citation-gate surfacing). Migration 128
+/// adds `pages.incarnation` (delete-and-recreate ABA fencing).
 ///
 /// This constant is also the **downgrade barrier**. `run_migrations` refuses
 /// to open a database whose `user_version` exceeds it, so a build that
@@ -1164,7 +1165,7 @@ pub const EMBEDDING_DIM: usize = 768;
 /// `entities` table, skip every `version < N` branch, and quietly operate
 /// against a schema it cannot see. Refusing to open is recoverable; writing is
 /// not.
-pub const SCHEMA_VERSION: u32 = 127;
+pub const SCHEMA_VERSION: u32 = 128;
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -1175,6 +1176,18 @@ pub const SCHEMA_VERSION: u32 = 127;
 /// sentinel on the name-unique constraint. `create_space`/`update_space` reject
 /// this exact string as a user-supplied name, keeping the reservation closed.
 pub(crate) const UNFILED_SPACE_ID: &str = "00000000-0000-4000-8000-000000000001";
+
+/// The row-level fences a machine writer snapshots BEFORE reading evidence,
+/// read in one statement so they describe the same row state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageFence {
+    /// Immutable per-row token minted at page creation (migration 127). A
+    /// page deleted and re-created under the same id gets a new one, so a
+    /// CAS carrying the old token cannot match the new row even though
+    /// `version` and `source_revision` restart at their initial values.
+    pub incarnation: String,
+    pub source_revision: i64,
+}
 
 /// A retry receipt to commit alongside a mutation.
 ///
@@ -9814,6 +9827,15 @@ impl MemoryDB {
                 self.migrate_127_page_refresh_blocked_reason(version)
                     .await?;
             }
+
+            // Migration 128 (2026-08-29 page incarnation): every page row
+            // carries an immutable, never-reused `incarnation` token so a
+            // CAS captured against a page that was since deleted and
+            // re-created under the same id cannot match the new row. See
+            // migrate_128_page_incarnation.
+            if version < 128 {
+                self.migrate_128_page_incarnation(version).await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -11349,13 +11371,13 @@ impl MemoryDB {
                 id, title, summary, content, kind, entity_type, confidence, entity_confirmed,
                 embedding, space, workspace, source_memory_ids, version, status,
                 created_at, last_compiled, last_modified, creation_kind, review_status,
-                aliases, source_agent, entity_created_at, entity_updated_at
+                aliases, source_agent, entity_created_at, entity_updated_at, incarnation
              )
              VALUES (?1, ?2, NULL, '', 'entity', ?3, ?4, ?5,
                      CASE WHEN ?6 IS NULL THEN NULL ELSE vector32(?6) END,
                      COALESCE(?7, ?8), COALESCE(?7, ?8), '[]', 1, 'active',
                      ?9, ?9, ?9, 'entity', 'unconfirmed',
-                     ?10, ?11, ?12, ?13)",
+                     ?10, ?11, ?12, ?13, lower(hex(randomblob(16))))",
             libsql::params![
                 page_id,
                 name,
@@ -16809,7 +16831,10 @@ impl MemoryDB {
     /// keys (`citation_backfill_attempts:<page_id>:v...`), predating the
     /// one-row-per-page redesign (`citations::attempt_key`) -- a dead key a
     /// live page can never match again, since every read is gated on the
-    /// current `v{version}:s{source_revision}:` generation prefix. See
+    /// current generation prefix. The `LIKE` pattern cannot say that on its
+    /// own: a page id that itself contains `:v` makes the page's *live* key
+    /// `citation_backfill_attempts:<id>` match the pattern too. So the delete
+    /// also excludes, by exact value, every key a current page owns. See
     /// migrate_126_rearm_empty_citations_and_drop_legacy_attempt_keys.
     async fn migrate_126_rearm_empty_citations_and_drop_legacy_attempt_keys(
         &self,
@@ -16831,7 +16856,11 @@ impl MemoryDB {
                 .map_err(|e| WenlanError::VectorDb(format!("m126 rearm: {e}")))?;
             let legacy_attempt_keys_dropped = conn
                 .execute(
-                    "DELETE FROM app_metadata WHERE key LIKE 'citation_backfill_attempts:%:v%'",
+                    "DELETE FROM app_metadata \
+                     WHERE key LIKE 'citation_backfill_attempts:%:v%' \
+                       AND key NOT IN (\
+                           SELECT 'citation_backfill_attempts:' || id FROM pages\
+                       )",
                     (),
                 )
                 .await
@@ -16902,6 +16931,78 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("m127 bump: {e}")))?;
         log::info!("[migration] Migration 127 applied: pages.refresh_blocked_reason column added");
+        Ok(())
+    }
+
+    /// Migration 128 (2026-08-29): add `pages.incarnation`, an opaque token
+    /// minted once per row at creation and never rewritten.
+    ///
+    /// `version` and `source_revision` both restart at their initial values
+    /// when a page is deleted and re-created under the same id, so a machine
+    /// writer that captured both fences against the OLD row still matches
+    /// the NEW one (delete-and-recreate ABA). Carrying the incarnation in the
+    /// CAS closes that: the re-created row gets a fresh token, so the stale
+    /// write matches nothing. Existing rows are backfilled with fresh tokens
+    /// here; every production page INSERT stamps its own from the same
+    /// expression. The column check keeps a replay on a store that already
+    /// has the column from failing on the ALTER.
+    async fn migrate_128_page_incarnation(&self, prior_version: i64) -> Result<(), WenlanError> {
+        self.backup_before_migration(128, prior_version).await?;
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m128 begin: {e}")))?;
+
+        let result: Result<u64, WenlanError> = async {
+            let has_incarnation = {
+                let mut rows = conn
+                    .query(
+                        "SELECT COUNT(*) FROM pragma_table_info('pages') WHERE name = 'incarnation'",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m128 column check: {e}")))?;
+                rows.next()
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m128 column row: {e}")))?
+                    .is_some_and(|row| row.get::<i64>(0).unwrap_or(0) > 0)
+            };
+            if !has_incarnation {
+                conn.execute(
+                    "ALTER TABLE pages ADD COLUMN incarnation TEXT NOT NULL DEFAULT ''",
+                    (),
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("m128 add incarnation: {e}")))?;
+            }
+            conn.execute(
+                "UPDATE pages SET incarnation = lower(hex(randomblob(16))) WHERE incarnation = ''",
+                (),
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m128 backfill: {e}")))
+        }
+        .await;
+
+        let stamped = match result {
+            Ok(value) => {
+                commit_or_rollback(&conn)
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m128 commit: {e}")))?;
+                value
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+
+        conn.execute("PRAGMA user_version = 128", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m128 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 128 applied: {stamped} page row(s) stamped with an incarnation token"
+        );
         Ok(())
     }
 
@@ -31616,7 +31717,7 @@ impl MemoryDB {
                      (id,title,summary,content,entity_id,space,source_memory_ids,
                       version,status,embedding,created_at,last_compiled,last_modified,
                       sources_updated_count,stale_reason,user_edited,changelog,
-                      creation_kind,review_status,workspace,citations,kind)
+                      creation_kind,review_status,workspace,citations,kind,incarnation)
                  SELECT ?1,title,summary,content,entity_id,space,source_memory_ids,
                         version,status,embedding,created_at,last_compiled,last_modified,
                         sources_updated_count,stale_reason,user_edited,changelog,
@@ -31625,7 +31726,8 @@ impl MemoryDB {
                              WHEN creation_kind = 'authored' THEN 'authored'
                              WHEN creation_kind IN ('imported', 'source') THEN 'source'
                              WHEN creation_kind = 'entity' THEN 'entity'
-                             ELSE 'concept' END
+                             ELSE 'concept' END,
+                        lower(hex(randomblob(16)))
                  FROM pages
                  WHERE id = ?2 AND creation_kind = 'source'",
                 libsql::params![new_page_id, old_page_id],
@@ -48223,15 +48325,15 @@ impl MemoryDB {
         let concept_result = match &embedding_sql {
             Some(emb) => {
                 conn.execute(
-                    "INSERT INTO pages (id, title, summary, content, entity_id, space, source_memory_ids, version, status, embedding, created_at, last_compiled, last_modified, creation_kind, review_status, workspace, citations, kind)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', vector32(?8), ?9, ?9, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    "INSERT INTO pages (id, title, summary, content, entity_id, space, source_memory_ids, version, status, embedding, created_at, last_compiled, last_modified, creation_kind, review_status, workspace, citations, kind, incarnation)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', vector32(?8), ?9, ?9, ?9, ?10, ?11, ?12, ?13, ?14, lower(hex(randomblob(16))))",
                     libsql::params![id, title, summary, content, entity_id, space, source_ids_json, emb.as_str(), now, creation_kind, review_status, workspace, citations_json, kind],
                 ).await
             }
             None => {
                 conn.execute(
-                    "INSERT INTO pages (id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, creation_kind, review_status, workspace, citations, kind)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', ?8, ?8, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    "INSERT INTO pages (id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, creation_kind, review_status, workspace, citations, kind, incarnation)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'active', ?8, ?8, ?8, ?9, ?10, ?11, ?12, ?13, lower(hex(randomblob(16))))",
                     libsql::params![id, title, summary, content, entity_id, space, source_ids_json, now, creation_kind, review_status, workspace, citations_json, kind],
                 ).await
             }
@@ -49069,6 +49171,7 @@ impl MemoryDB {
             None,
             None,
             None,
+            None,
             false,
         )
         .await
@@ -49095,6 +49198,7 @@ impl MemoryDB {
             source_memory_ids,
             link_reason,
             true,
+            None,
             None,
             None,
             None,
@@ -49133,6 +49237,7 @@ impl MemoryDB {
             citations_json,
             None,
             Some(expected_source_revision),
+            None,
             None,
             receipt,
             None,
@@ -49179,6 +49284,7 @@ impl MemoryDB {
             expected_version,
             None,
             None,
+            None,
             receipt,
             None,
             false,
@@ -49210,6 +49316,7 @@ impl MemoryDB {
             Some(changelog),
             citations_json,
             Some(expected_version),
+            None,
             None,
             None,
             receipt,
@@ -49244,6 +49351,7 @@ impl MemoryDB {
         citations_json: Option<&str>,
         expected_version: i64,
         expected_source_revision: i64,
+        expected_incarnation: &str,
         receipt: Option<OperationReceipt<'_>>,
     ) -> Result<bool, WenlanError> {
         self.try_update_page_content(
@@ -49256,6 +49364,7 @@ impl MemoryDB {
             citations_json,
             Some(expected_version),
             Some(expected_source_revision),
+            Some(expected_incarnation),
             None,
             receipt,
             None,
@@ -49299,6 +49408,7 @@ impl MemoryDB {
             Some(expected_source_revision),
             None,
             None,
+            None,
             Some((source_id, expected_memory_version)),
             true,
         )
@@ -49329,6 +49439,7 @@ impl MemoryDB {
             None,
             expected_version,
             expected_source_revision,
+            None,
             Some(revision_source_id),
             None,
             None,
@@ -49357,6 +49468,7 @@ impl MemoryDB {
         citations_json: Option<&str>,
         expected_version: Option<i64>,
         expected_source_revision: Option<i64>,
+        expected_incarnation: Option<&str>,
         consume_revision_id: Option<&str>,
         receipt: Option<OperationReceipt<'_>>,
         page_growth_guard: Option<(&str, i64)>,
@@ -49381,6 +49493,20 @@ impl MemoryDB {
         {
             return Err(WenlanError::Validation(
                 "only page growth, citation backfill, and revision accept may combine version and source-revision CAS".to_string(),
+            ));
+        }
+        // The incarnation fence only rides with a fully fenced changelog
+        // write (the citation backfill's shape): that is the one SQL builder
+        // below that binds it, so accepting it anywhere else would silently
+        // drop the fence.
+        if expected_incarnation.is_some()
+            && (expected_version.is_none()
+                || expected_source_revision.is_none()
+                || changelog.is_none())
+        {
+            return Err(WenlanError::Validation(
+                "the page incarnation fence requires version, source-revision, and changelog"
+                    .to_string(),
             ));
         }
         let citations_bind = citations_json;
@@ -49536,6 +49662,9 @@ impl MemoryDB {
                     sql.push_str(" AND COALESCE(source_revision, 0) = ?8 AND status = 'active'");
                 }
             }
+            if expected_incarnation.is_some() {
+                sql.push_str(" AND incarnation = ?10");
+            }
             let update_result = match (expected_version, expected_source_revision) {
                 (Some(version), None) => {
                     conn.execute(
@@ -49584,23 +49713,43 @@ impl MemoryDB {
                     )
                     .await
                 }
-                (Some(version), Some(revision)) => {
-                    conn.execute(
-                        &sql,
-                        libsql::params![
-                            content,
-                            source_ids_json,
-                            now,
-                            link_reason,
-                            id,
-                            cl,
-                            citations_bind,
-                            version,
-                            revision
-                        ],
-                    )
-                    .await
-                }
+                (Some(version), Some(revision)) => match expected_incarnation {
+                    Some(incarnation) => {
+                        conn.execute(
+                            &sql,
+                            libsql::params![
+                                content,
+                                source_ids_json,
+                                now,
+                                link_reason,
+                                id,
+                                cl,
+                                citations_bind,
+                                version,
+                                revision,
+                                incarnation
+                            ],
+                        )
+                        .await
+                    }
+                    None => {
+                        conn.execute(
+                            &sql,
+                            libsql::params![
+                                content,
+                                source_ids_json,
+                                now,
+                                link_reason,
+                                id,
+                                cl,
+                                citations_bind,
+                                version,
+                                revision
+                            ],
+                        )
+                        .await
+                    }
+                },
             };
             match update_result {
                 Ok(n) => n,
@@ -52833,6 +52982,11 @@ impl MemoryDB {
     /// give-up `[]`), permanently dropping it out of the citations-missing
     /// queue. Same `COALESCE(source_revision, 0) = ?N` pattern as
     /// `try_update_page_content_with_changelog_at_source_revision`.
+    ///
+    /// `expected_incarnation` closes the third window: a page deleted and
+    /// re-created under the same id restarts BOTH counters, so a writer that
+    /// captured them against the old row would match the new one. The token
+    /// is minted per row and never reused (migration 127).
     pub async fn set_page_citations_with_changelog_at_version(
         &self,
         page_id: &str,
@@ -52840,6 +52994,7 @@ impl MemoryDB {
         changelog_json: &str,
         expected_version: i64,
         expected_source_revision: i64,
+        expected_incarnation: &str,
     ) -> Result<bool, WenlanError> {
         let conn = self.conn.lock().await;
         conn.execute("BEGIN", ()).await.map_err(|e| {
@@ -52852,13 +53007,15 @@ impl MemoryDB {
                 .execute(
                     "UPDATE pages SET citations = ?1, changelog = ?2
                      WHERE id = ?3 AND version = ?4 AND status = 'active'
-                       AND citations IS NULL AND COALESCE(source_revision, 0) = ?5",
+                       AND citations IS NULL AND COALESCE(source_revision, 0) = ?5
+                       AND incarnation = ?6",
                     libsql::params![
                         citations_json,
                         changelog_json,
                         page_id,
                         expected_version,
-                        expected_source_revision
+                        expected_source_revision,
+                        expected_incarnation
                     ],
                 )
                 .await?;
@@ -53874,6 +54031,40 @@ impl MemoryDB {
         row.get::<i64>(0)
             .map(Some)
             .map_err(|e| WenlanError::VectorDb(format!("try_get_page_source_revision: {e}")))
+    }
+
+    /// [`Self::try_get_page_source_revision`] plus the row's incarnation
+    /// token, read together. `Ok(None)` when the page is missing. The
+    /// citation backfill carries both into its terminal CAS writes: the
+    /// source revision catches a re-arm, the incarnation catches a
+    /// delete-and-recreate under the same id.
+    pub async fn try_get_page_fence(
+        &self,
+        page_id: &str,
+    ) -> Result<Option<PageFence>, WenlanError> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn
+            .query(
+                "SELECT incarnation, COALESCE(source_revision, 0) FROM pages WHERE id = ?1",
+                libsql::params![page_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("try_get_page_fence: {e}")))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("try_get_page_fence: {e}")))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(PageFence {
+            incarnation: row
+                .get::<String>(0)
+                .map_err(|e| WenlanError::VectorDb(format!("try_get_page_fence: {e}")))?,
+            source_revision: row
+                .get::<i64>(1)
+                .map_err(|e| WenlanError::VectorDb(format!("try_get_page_fence: {e}")))?,
+        }))
     }
 
     /// A verified refresh can produce byte-identical prose and sources. In

@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import {
+  daemonErrorMessage,
   getEntityDetail,
   getMemoryDetail,
   getPage,
@@ -535,7 +536,12 @@ export default function ReviewDialog({
   const [showDone, setShowDone] = useState(false);
   const [sideBySide, setSideBySide] = useState(false);
   const [flash, setFlash] = useState<string | null>(null);
-  const [resolveError, setResolveError] = useState(false);
+  // The sentence shown when a resolve fails, not just a flag. Some refusals
+  // are permanent and say so — a revision card staged before source-revision
+  // fencing is discarded and its page re-queued, so "Try again" would be an
+  // instruction to do something that can never work. Falls back to the
+  // generic wording when the daemon sent no explanation.
+  const [resolveError, setResolveError] = useState<string | null>(null);
   const [resolvingLocally, setResolvingLocally] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
   const navigationVersionRef = useRef(0);
@@ -657,7 +663,7 @@ export default function ReviewDialog({
 
   useEffect(() => {
     navigationVersionRef.current += 1;
-    setResolveError(false);
+    setResolveError(null);
   }, [openId]);
 
   const resolveCurrent = async (approve: boolean) => {
@@ -677,16 +683,16 @@ export default function ReviewDialog({
     const next = items[index + 1] ?? (index > 0 ? items[index - 1] : null);
     const navigationVersion = navigationVersionRef.current;
     const requestId = ++resolveRequestRef.current;
-    setResolveError(false);
+    setResolveError(null);
     setResolvingLocally(true);
     try {
       await onResolve({ item, approve });
-    } catch {
+    } catch (error) {
       if (
         resolveRequestRef.current === requestId &&
         navigationVersionRef.current === navigationVersion
       ) {
-        setResolveError(true);
+        setResolveError(daemonErrorMessage(error) ?? t("review.actionError"));
       }
       return;
     } finally {
@@ -1462,7 +1468,7 @@ export default function ReviewDialog({
                   padding: "9px 11px",
                 }}
               >
-                {t("review.actionError")}
+                {resolveError}
               </p>
             )}
 
