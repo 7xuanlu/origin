@@ -10,11 +10,8 @@
 #
 # Every probe here is TRI-STATE -- measured / negative / could not measure --
 # and returns a distinct status for the third case so that callers can branch
-# on it. The two-state versions these replace all failed the same way: a
-# missing or broken tool produced empty output, and empty output read as "port
-# free", "process dead", "not our image". A port check that cannot run must
-# fail exactly as `lsof`'s absence used to fail, loudly, and never quietly
-# report the port as available.
+# on it. A missing or broken tool produces empty output, and empty output must
+# never read as "port free", "process dead" or "not our image".
 #
 # Return conventions used throughout:
 #   0  measured, affirmative (found / alive / matched)
@@ -40,21 +37,14 @@
 # and the Windows pid every Windows tool reports, so callers record the Windows
 # pid and compare like with like.
 #
-# `case "$(uname -s)" in` stood here, and it is this file's own invariant broken
-# in the one line every other line depends on. A command substitution has
-# nowhere to put a failure: a `uname` that is not on PATH, or that exits
-# non-zero, or that prints nothing, yields the empty string -- which matches no
-# Windows pattern and falls into `*)`, so an UNMEASURED platform came out as a
-# confident POSIX. On a Windows host that means `lsof` (absent), POSIX `kill`
-# (which cannot reach a native process by its Windows pid) and the unstaged
-# server path: three wrong measurements, all of them the fail-OPEN direction,
-# from one dropped status.
-#
-# So the platform is a measurement like everything else, with three answers, and
-# the third one REFUSES. Sourcing this file fails, which under the caller's
-# `set -e` is a way out that `dev-runtime.sh`'s EXIT trap turns into
-# `DEV_RUNTIME_RESULT: unknown` -- the honest kind for a host nobody could
-# identify.
+# A bare `case "$(uname -s)"` has nowhere to put a failure: a `uname` that is
+# absent, exits non-zero or prints nothing yields the empty string, which
+# matches no Windows pattern and falls into `*)` -- an unmeasured platform read
+# as a confident POSIX, which on Windows reaches for `lsof` (absent), a POSIX
+# `kill` (cannot reach a native process by its Windows pid) and the unstaged
+# server path. So the platform is a measurement with three answers and the
+# third REFUSES: sourcing fails, which `dev-runtime.sh`'s EXIT trap turns into
+# `DEV_RUNTIME_RESULT: unknown`.
 HOST_IS_WINDOWS=""
 _host_uname=""
 _host_uname_rc=0
@@ -122,9 +112,8 @@ native_path() {
 # promise a case. The recorded server path is whatever the caller wrote. Both
 # sides go through this so the identity check compares one spelling.
 #
-# exit: 0 normalized, 2 the normalization could not be made. The old form fell
-# back to the raw string on a cygpath failure, which made an unmeasurable
-# spelling look like a mismatched one.
+# exit: 0 normalized, 2 the normalization could not be made. Never fall back to
+# the raw string: an unmeasurable spelling is not a mismatched one.
 normalize_program_path() {
   local path="${1%.[eE][xX][eE]}" out
   if (( HOST_IS_WINDOWS == 1 )); then
@@ -150,23 +139,10 @@ normalize_program_path() {
 # Everything this cannot classify answers 1, the safe direction: the caller
 # treats the pid as possibly alive rather than deleting its ownership record.
 #
-# THE RESIDUAL, recorded rather than fixed. Round-3 review adjudicated this
-# helper "narrowly defensible as fail-closed" and the reasoning is worth
-# keeping, because it is a chain of three facts and not one:
-#
-#   * `LC_ALL=C LANGUAGE=C` removes the locale objection -- the message is the
-#     string the C library defines for ESRCH, not the operator's language.
-#   * `kill` is resolved by bash to its own BUILTIN, so a BusyBox or BSD `kill`
-#     with different wording is not normally in this path at all.
-#   * anything this does not recognise answers "not ESRCH", which KEEPS the
-#     lock and keeps the ownership record -- the safe direction.
-#
-# What remains is a dependency on the exact text bash's builtin prints in the C
-# locale. If that text ever changes, this helper degrades to "always cautious"
-# rather than to "always confident", so the failure mode is a lock that is never
-# recovered rather than a lock that is stolen. That is the acceptable half. The
-# fail-OPEN lock defects were never here: they were in `acquire_runtime_lock`,
-# which used to reach its decision without consulting this at all.
+# THE RESIDUAL, recorded rather than fixed: this depends on the exact text
+# bash's builtin prints in the C locale. If that text changes the helper
+# degrades to "always cautious" rather than "always confident" -- a lock that is
+# never recovered rather than one that is stolen.
 errno_says_no_such_process() {
   local err
   # Tests only, and ONE-WAY on purpose, exactly like the platform override
@@ -188,11 +164,9 @@ errno_says_no_such_process() {
 # Is a process still running?
 # exit: 0 alive, 1 not alive, 2 could not measure.
 #
-# The form this replaces was `tasklist ... | grep -q '^"'`, where a tasklist
-# that failed produced no output, grep found nothing, and the answer was
-# "dead". Callers then deleted the ownership record of a daemon that was still
-# running -- the worst outcome available, because nothing can identity-check
-# that process again.
+# A failed `tasklist` prints nothing, and "nothing" must not read as dead: the
+# caller's next move is deleting the ownership record of a daemon that is still
+# running, after which nothing can identity-check it again.
 process_is_alive() {
   local out rc
   # A pid that is not a pid is not a dead process. `tasklist //FI "PID eq abc"`
@@ -201,45 +175,27 @@ process_is_alive() {
   [[ "$1" =~ ^[0-9]+$ ]] || return 2
   if (( HOST_IS_WINDOWS == 1 )); then
     command -v tasklist >/dev/null 2>&1 || return 2
-    # NOT a filtered query. Measured on this host: `tasklist //FI "PID eq N"`
-    # exits 0 and prints `INFO: No tasks are running which match the specified
-    # criteria.` for an absent pid -- and exits 0 and prints one line of prose
-    # for anything else that goes wrong too. There is no CSV row either way, so
-    # "no row" could not tell a real miss from a broken tool, and the previous
-    # rule -- anything not starting with a quote is absence -- read every
-    # status-0 diagnostic as a dead process.
+    # NOT a filtered query. Measured: `tasklist //FI "PID eq N"` exits 0 and
+    # prints one line of prose both for an absent pid and for anything else
+    # that goes wrong, with no CSV row either way -- so "no row" cannot tell a
+    # real miss from a broken tool. The WHOLE table is self-validating instead.
+    # stderr is merged rather than dropped, so a warning line is not a row.
     #
-    # The whole table can tell them apart, because it is self-validating: a
-    # working tasklist returns a row per process, so FEW rows means the tool
-    # did not answer, and many rows with none matching is a real negative. 268
-    # rows and 0.35s on this host. The test is the CSV shape, not a wording:
-    # a leading quote and at least five quote-comma-quote fields, with the pid
-    # in field 2.
+    # THE COST, accepted deliberately: ~0.35s per call against a filtered
+    # query's ~0.05s, so `dev-runtime.sh`'s bounded fifty-round polls take ~22s
+    # instead of ~5s in their worst case.
     #
-    # The cost is real and is accepted deliberately: this is ~0.35s per call
-    # against a filtered query's ~0.05s, so `dev-runtime.sh`'s bounded
-    # fifty-round poll loops take about 22s instead of about 5s in their worst
-    # case -- a process that refuses to die. The worst case of the fast version
-    # was deleting the ownership record of a daemon that was still running.
-    # `rows < 2` was too weak for the word "table", and 2>/dev/null threw away
-    # the one signal that says the tool had something to complain about. Both
-    # are fixed here, and stderr is MERGED rather than dropped: a warning line
-    # is then not a row, and "every non-empty line is a row" turns it into a
-    # refusal instead of letting it ride alongside a partial answer.
+    # Three independent conditions, because none alone means "complete":
     #
-    # Three independent conditions, because none of them alone means "complete":
-    #
-    #   every non-empty line is a CSV row  -- nothing else got into the stream:
-    #       no diagnostic, no merged stderr, no half-written record.
-    #   pid 4 is present  -- the System process exists on every Windows NT
-    #       kernel from boot to shutdown. A "process table" without it is not
-    #       one, whatever its shape.
-    #   at least 10 rows  -- this is the only number here, and it is the weakest
-    #       of the three: it exists to reject a fragment that is well-formed and
-    #       contains pid 4. Measured on this host: 267. A Windows session with a
-    #       login shell in it cannot have ten processes -- smss, csrss, wininit,
-    #       services, lsass and several svchosts are running before anything
-    #       user-visible starts.
+    #   every non-empty line is a CSV row -- a leading quote and at least five
+    #       quote-comma-quote fields, pid in field 2. Nothing else got into the
+    #       stream: no diagnostic, no merged stderr, no half-written record.
+    #   pid 4 is present -- the System process exists on every Windows NT
+    #       kernel from boot to shutdown.
+    #   at least 10 rows -- the weakest of the three; it rejects a fragment that
+    #       is well formed and contains pid 4. Measured on this host: 267 rows.
+    #       smss, csrss, wininit, services, lsass and several svchosts run
+    #       before anything user-visible starts.
     out="$(tasklist //NH //FO CSV 2>&1)" || return 2
     [[ -n "$out" ]] || return 2
     rc=0
@@ -265,17 +221,12 @@ process_is_alive() {
       *) return 2 ;;
     esac
   else
-    # `kill -0` cannot answer this on its own: it fails with ESRCH for "no such
-    # process" and with EPERM for "there it is, but it is not yours", and the
-    # shell shows the same status 1 for both. A daemon running as another user
-    # would read as dead, and the caller's next move is to delete its ownership
-    # record -- after which nothing can ever identity-check that process again.
-    #
-    # So kill answers only the affirmative case, and the process table settles
-    # the rest: `ps -p` lists a pid whoever owns it. stderr is the
-    # discriminator for its failure, the same way it is for lsof above --
-    # silence means no such pid, any text (a busybox `ps` without -p, a denied
-    # /proc) means the question was not answered.
+    # `kill -0` cannot answer this alone: ESRCH and EPERM share status 1, so a
+    # daemon running as another user would read as dead. Kill answers only the
+    # affirmative case; `ps -p` settles the rest because it lists a pid whoever
+    # owns it. stderr is the discriminator for its failure -- silence means no
+    # such pid, any text (a busybox `ps` without -p, a denied /proc) means the
+    # question was not answered.
     kill -0 "$1" 2>/dev/null && return 0
     command -v ps >/dev/null 2>&1 || return 2
     rc=0
@@ -284,18 +235,14 @@ process_is_alive() {
       [[ "$out" =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]] || return 2
       return 0
     fi
-    # Only status 1 can mean "no such pid". `ps` killed by a signal exits
-    # 128+N with nothing on either stream, and a usage error exits 2 -- both
-    # silent, both nonzero, and under the old rule both read as a measured
-    # absence. The caller's next move after "dead" is to delete the ownership
-    # record, so a `ps` that was SIGKILLed would strand a live daemon that
-    # nothing can identity-check again.
+    # Only status 1 can mean "no such pid": a signal death (128+N) and a usage
+    # error (2) are both silent and both nonzero.
     #
     # And silence from `ps` is not by itself absence. Under Linux
     # `hidepid=invisible` another user's process is not in /proc at all, so
-    # `ps -p` is silent with status 1 for a process that is running -- while the
-    # `kill -0` above failed with EPERM, which is the kernel saying it exists.
-    # Only ESRCH is allowed to close this out.
+    # `ps -p` is silent with status 1 for a process that is running -- while
+    # `kill -0` fails with EPERM, which is the kernel saying it exists. Only
+    # ESRCH may close this out.
     (( rc == 1 )) || return 2
     [[ -z "$out" ]] || return 2
     errno_says_no_such_process "$1" || return 2
@@ -306,23 +253,8 @@ process_is_alive() {
 # --- the `ps -W` table -------------------------------------------------------
 
 # `ps -W` is read, validated and parsed in EXACTLY ONE PLACE: `_ps_w_read`.
-#
-# This parse used to be inline in `process_image_path`, and `windows_pid_for_job`
-# carried a SECOND copy that no hardening ever reached: a bare `NF < 8` word
-# count, no System-process witness, no row floor. So a `ps -W` that printed a
-# header plus an eight-word warning, or a short partial table that did not yet
-# contain the row being waited for, came back from that helper as "the process
-# never appeared" instead of "the table could not be read". It failed safe --
-# the caller refuses to start -- and it reported the WRONG STATE, which is this
-# file's one defect wearing its smallest disguise, sitting in the copy the
-# remedy for the other copy never touched.
-#
-# Round 13h found the THIRD copy, in `dev-runtime.sh`'s `reap_staged_daemon`:
-# the same table, the same four witnesses, maintained separately, because it
-# scans ALL rows for an image instead of looking one row up by key and so did
-# not drop into `ps_w_row_for` unchanged. A different QUESTION is not a reason
-# for a different parse. So the shape of the answer is what varies and the
-# parse is what does not:
+# A different QUESTION is not a reason for a different parse, so the shape of
+# the answer is what varies:
 #
 #   ps_w_row_for KEY WANT      -- the first row whose KEY column is WANT.
 #   ps_w_rows_matching PATTERN -- every row whose COMMAND matches PATTERN
@@ -333,8 +265,7 @@ process_is_alive() {
 # exactly one place to be edited. A second CALL SITE is fine; a second PARSE is
 # the defect, which is why `scripts/host-process.test.ts` pins the number of
 # places that run the command at all -- across this file AND the scripts that
-# source it, because "exactly one place" is a claim about the repository and a
-# library-local check cannot see a copy that lives outside the library.
+# source it, since a library-local check cannot see a copy outside the library.
 #
 # args:   mode -- "row" or "scan"; the key column -- "PID", the MSYS pid `$!`
 #         yields, or "WINPID", the Windows pid every Windows tool reports; and
@@ -361,19 +292,14 @@ _ps_w_read() {
   # The command is taken from the COMMAND column's own offset in the header
   # rather than from field 8 onward, because `ps -W` prints STIME as "Aug 27"
   # for a process started on an earlier day and as "10:23:45" for one started
-  # today -- one field or two. Measured on this host: 214 of 246 rows carried
-  # a stray leading day number under the field-index form, so a daemon that
-  # outlived midnight stopped matching its own recorded path and `stop`
-  # refused to stop it.
+  # today -- one field or two. Measured on this host: 214 of 246 rows carried a
+  # stray leading day number under the field-index form, so a daemon that
+  # outlived midnight stopped matching its own recorded path.
   #
-  # Every column index is read from the header too, rather than assumed. And a
-  # header this parser cannot read is a FAILED MEASUREMENT, not an absent
-  # process: under the old `col > 0` guard every row was skipped, the result was
-  # empty, and the empty result fell through to a "no such pid" return.
-  # Measured with a stub `ps` whose header says CMDLINE instead of COMMAND:
-  # rc=1, indistinguishable from a pid that really is gone, for a pid that was
-  # in the table. Exiting 3 from the last block -- after all input is read, so
-  # the producer cannot take SIGPIPE -- makes it the 2 it always was.
+  # Every column index is read from the header too, and a header this parser
+  # cannot read is a FAILED MEASUREMENT, not an absent process. It exits 3 from
+  # the last block -- after all input is read, so the producer cannot take
+  # SIGPIPE.
   out="$(printf '%s\n' "$out" | awk -v mode="$mode" -v key="$key" -v want="$want" '
     NR == 1 {
       col = index($0, "COMMAND")
@@ -386,23 +312,19 @@ _ps_w_read() {
       next
     }
     NF == 0 { next }
-    # Round 13f: `NF < 8` was a WORD COUNT, not a row shape. An eight-word
-    # diagnostic merged in from stderr satisfied it and was counted as a row,
-    # so the merge above was decorative for exactly the lines it was added to
-    # catch. The shape is structural instead: every data line begins
-    # PID PPID PGID WINPID, four numbers, and nothing else on this host does.
-    # Measured: 277 data rows, 277 with four leading numbers, 0 without;
-    # field counts run 8 to 15, so the old floor also could not have been a
-    # ceiling. Localisation cannot move it, because no column here is a word.
+    # Structural, not a word count: an eight-word diagnostic merged in from
+    # stderr satisfies `NF < 8` and would be counted as a row. Every data line
+    # begins PID PPID PGID WINPID, four numbers, and nothing else on this host
+    # does. Measured: 277 data rows, 277 with four leading numbers, 0 without;
+    # field counts run 8 to 15. Localisation cannot move it -- no column here
+    # is a word.
     !($1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ &&
       $4 ~ /^[0-9]+$/) { notarow = 1; next }
     { rows++ }
-    # The same two witnesses `process_is_alive` demands of `tasklist`, for the
-    # same reason and with the same stated limit: WINPID 4 is the System
-    # process, which exists on every Windows NT kernel and is in this table
-    # (measured on this host), and a table with fewer than ten rows is not a
-    # machine anyone is running a daemon on. Neither proves the table is
-    # COMPLETE -- see the residual note below.
+    # The same two witnesses `process_is_alive` demands of `tasklist`: WINPID 4
+    # is the System process, present on every Windows NT kernel and in this
+    # table (measured), and fewer than ten rows is not a machine anyone runs a
+    # daemon on. Neither proves the table COMPLETE; see the residual below.
     wp && $wp == 4 { system_process = 1 }
     # The two questions, and the only two lines that differ between them. Each
     # collects into the same array so that everything after this point -- the
@@ -431,13 +353,10 @@ _ps_w_read() {
     1) return 1 ;;
     *) return 2 ;;
   esac
-  # THE RESIDUAL, stated because it is not fixed and round 13f was right to
-  # say so: a `ps -W` (or `tasklist`) that exits 0 having printed a
-  # well-formed table that is simply SHORT of the process being looked for is
-  # not detectable from here. The witnesses above make a truncation that keeps
-  # row 1 and drops row 200 harder to produce by accident; they do not make it
-  # visible. Contamination is caught. Silent truncation is not, for any of the
-  # three Windows tables, and the AGENTS.md note says so.
+  # THE RESIDUAL, stated because it is not fixed: a `ps -W` (or `tasklist`)
+  # that exits 0 having printed a well-formed table SHORT of the process looked
+  # for is not detectable from here. Contamination is caught; silent truncation
+  # is not, for any of the three Windows tables.
   out="$(printf '%s' "$out" | tr -d '\r')" || return 2
   while IFS= read -r line; do
     # Trailing padding is not part of the row.
@@ -487,13 +406,10 @@ process_image_path() {
   else
     command -v ps >/dev/null 2>&1 || return 2
     rc=0
-    # stderr is merged in, exactly as `process_is_alive` merges it, and for the
-    # same reason: with `-o command=` the only thing `ps` writes to stdout is
-    # the command, so any text alongside status 1 is the tool reporting a
-    # problem rather than an absence. Without that, a `ps` that failed with
-    # status 1 and a `kill -0` that failed with EPERM -- a live process owned by
-    # another user -- agreed on "no such process", and the caller's next move is
-    # to delete the ownership record of a daemon that is still running.
+    # stderr is merged in for the same reason `process_is_alive` merges it:
+    # with `-o command=` the only thing `ps` writes to stdout is the command,
+    # so any text alongside status 1 is the tool reporting a problem rather
+    # than an absence.
     out="$(ps -p "$1" -o command= 2>&1)" || rc=$?
     if (( rc == 0 )); then
       # And on the success path the merge has to be undone by a shape check:
@@ -501,39 +417,29 @@ process_image_path() {
       # stderr text that would otherwise be compared as part of the image path.
       # An identity this cannot prove must never be reported as one.
       [[ "$out" != *$'\n'* ]] || return 2
-      # "Exactly one line" has to mean one, not "at most one". A successful
-      # `ps` that printed NOTHING is a broken measurement -- a pid it listed
-      # always has a command -- and it used to fall all the way through to the
-      # `[[ -n "$out" ]] || return 1` at the bottom of this function and be
-      # reported as "no such process". Status 0 with silence is state three.
+      # "Exactly one line" means one, not "at most one": a pid `ps` listed
+      # always has a command, so status 0 with silence is state three, not the
+      # `return 1` at the bottom of this function.
       [[ -n "$out" ]] || return 2
     fi
     if (( rc != 0 )); then
       # `ps -p` exits non-zero both when the pid is gone and when ps itself
-      # failed. Two witnesses, in order, because neither is enough alone:
+      # failed. Four witnesses, in order, because none is enough alone:
       #
-      #   1. THE STATUS. Only 1 is `ps`'s "no match". A signal death (128+N) or
-      #      a usage error (2) is a failed measurement wearing a nonzero
-      #      status, and the old code accepted every one of them as absence.
+      #   1. THE STATUS. Only 1 is `ps`'s "no match"; a signal death (128+N) or
+      #      a usage error (2) is a failed measurement wearing a nonzero status.
       #   2. `kill -0`. If the kernel still knows the pid, ps's answer was a
-      #      failure whatever it said. But kill's own failure proves nothing:
-      #      it reports EPERM and ESRCH with the same status, so a process
-      #      owned by another user looks identical to one that is gone. That
-      #      is why kill can only ADD "still there", never confirm "absent" --
-      #      confirming absence is `ps -p`'s job, and `ps -p` does list
-      #      processes it does not own.
-      #   3. SILENCE. Merged stderr is the third witness and the one the two
-      #      above could not supply: `ps` failing with status 1 AND a message,
-      #      plus a `kill -0` that failed with EPERM, is two failed
-      #      measurements agreeing on a negative neither of them made.
-      #   4. WHICH errno. Witness 2 said kill "can only ADD still-there". That
-      #      was wrong in one direction that matters: under Linux
-      #      `hidepid=invisible`, another user's process is deliberately absent
-      #      from /proc, so `ps -p` is silent with status 1 -- the exact shape
-      #      of a real absence -- while `kill -0` fails with EPERM, which is
-      #      itself proof the process EXISTS. Reading only kill's status threw
-      #      that proof away and returned 1. `errno_says_no_such_process` reads
-      #      it, in the C locale, and only ESRCH is allowed to mean absence.
+      #      failure whatever it said. Kill can only ADD "still there": EPERM
+      #      and ESRCH share a status, so it can never confirm absence.
+      #   3. SILENCE. `ps` failing with status 1 AND a message, beside a
+      #      `kill -0` that failed with EPERM, is two failed measurements
+      #      agreeing on a negative neither of them made.
+      #   4. WHICH errno. Under Linux `hidepid=invisible` another user's
+      #      process is absent from /proc, so `ps -p` is silent with status 1 --
+      #      the exact shape of a real absence -- while `kill -0` fails with
+      #      EPERM, which is proof the process EXISTS.
+      #      `errno_says_no_such_process` reads it in the C locale, and only
+      #      ESRCH may mean absence.
       (( rc == 1 )) || return 2
       [[ -z "$out" ]] || return 2
       errno_says_no_such_process "$1" || return 2
@@ -560,11 +466,9 @@ process_image_path() {
 # alongside, and a scan with something to say is not a scan that ratifies an
 # absence.
 #
-# THE STATED COST, and it is the same one the Windows branch above accepts in
-# writing: a host with NO listening TCP socket at all cannot ratify anything, so
-# every port there answers "could not measure" rather than "free". That refuses
-# to start a daemon instead of colliding with one, which is the direction this
-# file exists to fail in. It is a real property of this rule, not an oversight.
+# THE STATED COST: a host with NO listening TCP socket at all cannot ratify
+# anything, so every port there answers "could not measure" rather than "free".
+# That refuses to start a daemon instead of colliding with one.
 #
 # exit: 0 lsof enumerated at least one listener with no error detected, 1 it
 # could not be shown to have enumerated anything.
@@ -589,31 +493,23 @@ lsof_enumerated_listeners() {
 # stdout: the listener pid when there is one.
 # exit:   0 found, 1 no listener, 2 could not measure.
 #
-# The third state is the whole point: it is what replaces the `lsof` hard gate
-# the smokes used to carry. A probe that cannot run must never be
-# indistinguishable from "port free" -- that is precisely the failure the gate
-# existed to prevent, and collapsing it is how a port-conflict bug ships.
+# The third state is the whole point: a probe that cannot run must never be
+# indistinguishable from "port free".
 listener_pid_for_port() {
   local table hit out rc
-  # An argument that is not a port is not a question this probe can answer, and
-  # "no row matched" is the wrong answer to it -- that is the same sentence as
-  # "nothing is listening", which is exactly the collapse the third state above
-  # exists to prevent. It reached the ledger: with a malformed port,
-  # first-run/port-precheck.sh wrote `PASS ... measured free` and exited 0,
-  # about a port nothing had looked at. Guarded here rather than in that script
-  # because the smokes and dev-runtime.sh pass ports through too, and only one
-  # of the four validates its own.
-  # One spelling. The first cut of this guard was `^[0-9]+$` plus a `10#`
-  # range check, which admitted a zero-padded port and then looked it up with
-  # the RAW argument -- `awk -v port=":$1\$"` against a table that prints
-  # `:135`. Measured, same port, two spellings, opposite answers:
+  # An argument that is not a port is not a question this probe can answer, so
+  # it is 2 and never "no row matched". Guarded here rather than in the
+  # callers because the smokes, dev-runtime.sh and first-run/port-precheck.sh
+  # all pass ports through and only one of the four validates its own.
+  #
+  # ONE SPELLING, because the lookup uses the raw argument (`awk -v
+  # port=":$1\$"`) against a table that prints `:135`. Measured, same port, two
+  # spellings, opposite answers:
   #     135         -> rc=0 found, pid 1576
   #     0000000135  -> rc=1 measured free
-  # A busy port reported as free, inside the guard written to stop exactly
-  # that. Normalising for one of the two uses is how it happened, so this
-  # admits no spelling that needs normalising: no leading zero, at most five
-  # digits (which also settles what `$(( 10#$1 ))` would do with a 23-digit
-  # argument, namely overflow).
+  # So no spelling that needs normalising is admitted: no leading zero, at most
+  # five digits (which also settles what `$(( 10#$1 ))` would do with a
+  # 23-digit argument, namely overflow).
   [[ "${1-}" =~ ^[1-9][0-9]{0,4}$ ]] || return 2
   (( $1 <= 65535 )) || return 2
   if (( HOST_IS_WINDOWS == 1 )); then
@@ -631,113 +527,60 @@ listener_pid_for_port() {
     # `exit` on first match, or a producer taking SIGPIPE reports 141 and looks
     # like a parser failure.
     #
-    # "At least one protocol row" was too weak, and the word LISTENING was the
-    # reason. netstat's State column is LOCALISED -- German Windows prints
-    # ABHOEREN -- while `TCP` is not, so a localised table cleared the old
-    # guard, matched no row for the port, and reported a busy port as FREE.
-    # Measured on this host with a stub table: rc=1, the measured negative,
-    # with pid 4242 listening in the very rows being read.
-    #
-    # The listening shape is what is asked for instead, and none of it is a
-    # word: a TCP row with five fields, a numeric pid last, and a WILDCARD
-    # foreign address -- which only a listening socket has, because a connected
-    # one names its peer. Measured against this host's real table: 34 rows have
-    # that shape, all 34 are the LISTENING rows, and no LISTENING row lacks it.
-    # The guard then demands that the shape exist SOMEWHERE in the table, so a
+    # NOTHING HERE KEYS ON A WORD. netstat's State column is LOCALISED (German
+    # Windows prints ABHOEREN) while `TCP` is not, so `LISTENING` is not a key.
+    # The listening SHAPE is: a TCP row with five fields, a numeric pid last,
+    # and a WILDCARD foreign address -- which only a listening socket has,
+    # because a connected one names its peer. Measured against this host's real
+    # table: 34 rows have that shape, all 34 are the LISTENING rows, and no
+    # LISTENING row lacks it. The shape must exist SOMEWHERE in the table, so a
     # table whose columns have moved is unmeasurable rather than empty.
     #
-    # The stated cost: a host with NO listening TCP socket at all answers "could
-    # not measure" for every port rather than "free". That is the safe direction
-    # -- it refuses to start a daemon rather than colliding with one -- and on
-    # Windows it is not reachable in practice, because the RPC endpoint mapper
-    # and svchost listen before a login shell exists. It is a real property of
-    # this rule, not an oversight.
     # stderr is merged in above rather than dropped, and EVERY non-empty line
-    # has to be accounted for -- which is the round-4 finding, because this
-    # rule used to fire only on lines whose first token was already `TCP` or
-    # `UDP`. A status-0 `WARNING: partial results` or `Access denied` merged
-    # beside real rows begins with neither, so nothing looked at it: the
-    # validator passed on the valid rows, the port query found no row for our
-    # port in the truncated remainder, and the branch returned 1 -- MEASURED
-    # FREE, off a table netstat itself had complained about. That answer feeds
-    # record deletion and a second start on an occupied port. The comment above
-    # it asserted the property; these rules now implement it.
+    # must be accounted for: a status-0 `WARNING: partial results` merged beside
+    # real rows begins with neither `TCP` nor `UDP`, so a rule keyed on those
+    # tokens never looks at it and the branch returns MEASURED FREE off a table
+    # netstat itself complained about.
     #
-    # Three rules, all measured against this host's real `netstat -ano` (183
-    # lines: 2 blank, 179 protocol rows, and exactly 2 non-row lines):
+    # Four rules, all measured against this host's real `netstat -ano` (183
+    # lines: 2 blank, 179 protocol rows, exactly 2 non-row lines):
     #
     #   * AFTER the first protocol row, every non-empty line must be a row.
     #     The real table has zero exceptions.
     #   * BEFORE it, at most 2 non-blank lines. The real preamble is exactly
     #     two -- the `Active Connections` banner and the column header -- and
-    #     both are LOCALISED, so they cannot be matched by text and can only be
-    #     counted. One merged diagnostic makes it three.
-    #   * At least one UDP row, which is what says the TCP section ENDED rather
-    #     than stopped. See the round-5 note below; it is the completeness
-    #     witness the first two rules cannot supply.
+    #     both are LOCALISED, so they can only be counted, not matched. One
+    #     merged diagnostic makes it three.
+    #   * At least one UDP row. `netstat -ano` prints the whole TCP table then
+    #     the whole UDP table (measured: 198 lines, TCP rows 5..97, UDP rows
+    #     98..198, no interleaving, no UDP header), so a UDP row WITNESSES THAT
+    #     THE TCP SECTION ENDED -- the stream got past every TCP row there was.
+    #     This function only asks about TCP listeners, so a table with a UDP row
+    #     cannot be missing the TCP row being asked about.
+    #   * Every TCP row precedes every UDP row. "A UDP row appeared" licenses
+    #     nothing on its own; the ordering is what makes it proof the TCP
+    #     section is complete, and a one-host observation of it is not a proof
+    #     for every Windows version and locale. `tcp_after_udp` exits 4.
     #
-    # Together they catch a diagnostic wherever it lands, which `2>&1` does not
-    # order. THE COST, stated: a netstat whose banner runs to three lines
-    # answers "could not measure" for every port. That refuses to start rather
-    # than colliding, and no locale is known to do it.
+    # THE COSTS, stated: a netstat whose banner runs to three lines, a host with
+    # no listening TCP socket, and a host with no UDP endpoint each answer
+    # "could not measure" for every port rather than "free". All three refuse to
+    # start a daemon rather than collide with one, and on Windows none is
+    # reachable in practice -- the RPC endpoint mapper and svchost listen, and
+    # the DNS and DHCP clients hold UDP sockets (101 UDP rows here), before a
+    # login shell exists.
     #
-    # ROUND 5 CLOSED THE TRUNCATION HALF, which the two rules above cannot see:
-    # they are a GRAMMAR, and a table cut after a well-formed row is still all
-    # well-formed rows. Every remaining row validates, the port query finds no
-    # row for our port in what survived, and the branch returns 1 -- MEASURED
-    # FREE, off a table that stopped early. The old note here said there was no
-    # equivalent of the System process for sockets, no row that must be present
-    # in every listener table. There is no such ROW, but there is a SECTION.
+    # THE RESIDUAL: this detects a table that stopped EARLY -- the shape a
+    # closed pipe, a killed writer or a truncated buffer produces. It cannot
+    # detect a hole in the MIDDLE of the TCP section, because the UDP rows after
+    # it still arrive. It also cannot detect a SHORT TCP section: one
+    # listening-shaped TCP row plus one UDP row satisfies every rule above.
+    # Unlike `tasklist` and `ps -W` this parser has NO row floor, because
+    # netstat's fixtures in scripts/host-process.test.ts stand for whole tables
+    # with two rows.
     #
-    # `netstat -ano` prints the whole TCP table and then the whole UDP table --
-    # measured on this host: 198 lines, TCP rows 5..97, UDP rows 98..198, no UDP
-    # row before a TCP one and no TCP row after a UDP one, and the UDP section
-    # carries no header of its own. So a UDP row is a WITNESS THAT THE TCP
-    # SECTION ENDED: the stream got past every TCP row there was. This function
-    # only ever asks about TCP listeners, so a table with a UDP row in it cannot
-    # be missing the TCP row we are asking about.
-    #
-    # ROUND 6: THE ORDERING THAT WITNESS RESTS ON IS NOW ENFORCED, NOT ASSUMED.
-    # The rule below used to record only that a UDP row had OCCURRED (`if ($1 ==
-    # "UDP") udp = 1`), which is a strictly weaker fact than the one the
-    # inference needs. "A UDP row appeared" licenses nothing on its own; "every
-    # TCP row precedes every UDP row" is what makes a UDP row proof that the TCP
-    # section is complete, and a stream in which a TCP row arrives AFTER a UDP
-    # row is a stream that does not have the shape the argument assumes -- so it
-    # is not a table this can reason about at all. `tcp_after_udp` exits 4, which
-    # the caller turns into "could not measure" like every other refusal here.
-    # A one-host observation of the ordering is not a proof of it on every
-    # Windows version and locale; checking it per read is.
-    #
-    # THE COST, stated like the two beside it: a host with no UDP endpoint at
-    # all answers "could not measure" for every port instead of "free". That
-    # refuses to start a daemon rather than colliding with one, and on Windows
-    # it is no more reachable than the no-TCP-listener case above -- the DNS and
-    # DHCP clients hold UDP sockets before a login shell exists (101 UDP rows on
-    # this host).
-    #
-    # THE RESIDUAL, narrowed and stated exactly: this detects a table that
-    # stopped EARLY -- the shape a closed pipe, a killed writer or a truncated
-    # buffer produces. It cannot detect a table with a hole in the MIDDLE of the
-    # TCP section, because the UDP rows after such a hole still arrive. Nothing
-    # reachable from here distinguishes that from a complete table; a writer
-    # that elides interior lines while continuing to the end is not a failure
-    # mode netstat has, and it is named rather than covered.
-    #
-    # THAT RESIDUAL INCLUDES A SHORT TCP SECTION. One listening-shaped TCP row
-    # followed by one UDP row satisfies every rule above -- the grammar, the
-    # preamble budget, the ordering and the UDP witness -- and is equally
-    # consistent with a producer that emitted the whole TCP table and one that
-    # emitted a single row of it. Unlike `tasklist` and `ps -W`, this parser has
-    # NO row floor: netstat's own fixtures in scripts/host-process.test.ts stand
-    # for whole tables with two rows, so a floor would have to be introduced
-    # together with them. Round 6 states it here rather than implying the
-    # witness covers it.
-    #
-    # The four exits are distinct for the reader's sake -- the caller turns all
-    # of them into 2, because "no listening row at all", "contaminated",
-    # "stopped before the UDP section" and "the sections are interleaved" are
-    # four things nobody measured a free port from.
+    # The four exits are distinct for the reader; the caller turns all of them
+    # into 2.
     printf '%s\n' "$table" | awk '
       /^[[:space:]]*$/ { next }
       ($1 == "TCP" && NF == 5 && $5 ~ /^[0-9]+$/) ||
@@ -770,33 +613,25 @@ listener_pid_for_port() {
     hit="$(printf '%s' "$hit" | tr -d '\r')" || return 2
   else
     command -v lsof >/dev/null 2>&1 || return 2
-    # lsof exits 1 for "nothing matched" AND for "something went wrong" -- a
-    # stat() failure on a mount, a denied /proc, a broken device node. Its own
-    # manual says it returns 1 "if any error was detected", so the status alone
-    # cannot tell a negative measurement from a failed one, and ruling out its
-    # absence one line up does not help: that only covers 127.
+    # lsof exits 1 for "nothing matched" AND for "something went wrong" -- its
+    # manual says it returns 1 "if any error was detected" -- so the status
+    # alone cannot tell a negative measurement from a failed one, and ruling
+    # out its absence one line up only covers 127.
     #
     # With -t the only thing lsof writes to stdout is pids, so stderr merged in
     # is the discriminator: silence with status 1 means nothing matched, any
-    # text means the probe itself had a problem.
+    # text means the probe had a problem. EXCEPT that `-w` is here to SUPPRESS
+    # that text -- it is needed because the benign "can't stat()" warnings on a
+    # host with a gvfs or docker mount would otherwise answer "could not
+    # measure" on every call, and it silences the loud warnings with the same
+    # hand. So `rc == 1` with both streams silent is also the shape of an lsof
+    # that hit an unreadable /proc, mount or device.
     #
-    # EXCEPT that `-w` is here to SUPPRESS that text. It was added because the
-    # benign "can't stat()" warnings on an ordinary Linux host with a gvfs or
-    # docker mount would otherwise answer "could not measure" on every call --
-    # and it suppresses the loud warnings with the same hand, so the shape this
-    # branch reads as a measured absence, `rc == 1` with nothing on either
-    # stream, is ALSO the shape of an lsof that hit an unreadable /proc, mount
-    # or device. `start_runtime` then starts a daemon on a port nobody looked
-    # at. That is this file's one defect, in the single most load-bearing
-    # measurement it makes, wearing the flag that was supposed to make the
-    # measurement usable.
-    #
-    # The flag stays and the NEGATIVE is ratified instead. `rc == 1` with
-    # silence is only allowed to mean "free" once a second read has shown that
-    # lsof can still enumerate the listening TCP set at all -- see
-    # `lsof_enumerated_listeners` below. Order matters for cost: the targeted
-    # query runs first, so "found" and "hard failure" still take one call, and
-    # only the negative pays for its own ratification.
+    # The flag stays and the NEGATIVE is ratified instead: silence with status 1
+    # may mean "free" only once `lsof_enumerated_listeners` has shown lsof can
+    # still enumerate the listening TCP set at all. Order matters for cost --
+    # the targeted query runs first, so "found" and "hard failure" still take
+    # one call and only the negative pays for its ratification.
     rc=0
     out="$(lsof -w -nP -tiTCP:"$1" -sTCP:LISTEN 2>&1)" || rc=$?
     if (( rc == 1 )) && [[ -z "$out" ]]; then
@@ -821,24 +656,18 @@ listener_pid_for_port() {
 # One slice of a bounded poll.
 # exit: 0 the delay was performed, 2 it could not be.
 #
-# ROUND 5, and it is the round-4 loop finding one level in. `seq` was taken off
-# the round COUNT so a tool that cannot run can no longer produce zero
-# iterations -- and the DELAY inside those loops was still a bare `sleep 0.1`
-# whose status nothing read. Every one of these loops is called from the left of
-# a `||`, or as an `if`/`while` condition, which disables errexit through the
-# WHOLE body, so a `sleep` that fails does not stop anything: all hundred rounds
+# Every polling loop here is called from the left of a `||` or as an `if`/
+# `while` condition, which disables errexit through the whole body -- so a bare
+# `sleep` whose status nothing reads does not stop anything. All hundred rounds
 # run back to back in microseconds and the function returns its terminal
-# NEGATIVE -- "the process never appeared", "the daemon is still alive after the
-# window" -- for a window that never elapsed. A ten-second wait that took ten
-# milliseconds is not a wait, and its negative is not a measurement. It is the
-# same collapse as the tools above, wearing the loop's clothes.
+# NEGATIVE for a window that never elapsed. A ten-second wait that took ten
+# milliseconds is not a wait, and its negative is not a measurement.
 #
 # So the delay answers, and every caller turns a 2 into its own "could not
-# measure". `sleep 0.1` is not universal -- POSIX only requires whole seconds --
+# measure". `sleep 0.1` is not universal -- POSIX requires only whole seconds --
 # so a rejected fractional argument falls back to one second rather than to no
-# delay at all: a poll that is slower than intended still measures its window,
-# and one that does not pause does not. Only a `sleep` that cannot delay AT ALL
-# is unmeasurable.
+# delay: a poll slower than intended still measures its window. Only a `sleep`
+# that cannot delay AT ALL is unmeasurable.
 poll_delay() {
   sleep "$1" 2>/dev/null && return 0
   sleep 1 2>/dev/null && return 0
@@ -866,19 +695,13 @@ windows_pid_for_job() {
     # come from either side of an exec.
     #
     # The parse is `ps_w_row_for`, the same validated one `process_image_path`
-    # uses, and not the copy that used to sit here. That copy tested `NF < 8` --
-    # a word count -- and demanded neither completeness witness, so a header
-    # plus an eight-word warning, or a short partial table, spun this loop for
-    # its full ten seconds and then returned 1: "the process never appeared",
-    # for a table nothing had managed to read. The only difference between the
-    # two questions is the column keyed on, so it is the only thing passed in.
+    # uses. The only difference between the two questions is the column keyed
+    # on, so that is the only thing passed in.
     rc=0
     row="$(ps_w_row_for PID "$job_pid")" || rc=$?
     # 2 is FINAL. A table that could not be read will not become readable by
     # asking again, and ten more seconds of asking would end at the `return 1`
-    # below, which is the state this helper must never confuse with it. The
-    # three callers all branch on 2 already; until now nothing in here could
-    # produce it for a table that merely refused to parse.
+    # below -- the state this helper must never confuse with it.
     (( rc == 2 )) && return 2
     # 1 is the MEASURED negative and it is not final: the exec has not landed
     # yet, which is the entire reason this polls. Only a run of measured
@@ -921,11 +744,10 @@ windows_pid_for_job() {
 # the kill both address it by pid, which is now pinned. A path that cannot be
 # read is not a match, so an identity this cannot prove kills nothing.
 #
-# The kill DECISION is unchanged. What changed is that the outcome is now
-# reported instead of swallowed by `|| true`: the caller still takes its verdict
-# from the liveness poll that follows -- a stop is proven by the process being
-# gone, never by this receipt -- but a refusal or a thrown kill is now
-# distinguishable from a success in the diagnostics.
+# The outcome is reported, never swallowed by `|| true`. The caller still takes
+# its verdict from the liveness poll that follows -- a stop is proven by the
+# process being gone, never by this receipt -- but a refusal or a thrown kill
+# must stay distinguishable from a success in the diagnostics.
 #
 # exit: 0 killed, 3 already gone, 4 refused (not our image), 5 kill threw,
 #       6 identity unreadable, 2 the helper itself could not run.
@@ -978,18 +800,15 @@ force_terminate_process() {
 # `set -e` makes `out="$(f)"; rc=$?` abort at the assignment, so these set named
 # globals instead and every caller branches on all three values. Nothing here
 # may be called inside a command substitution: a subshell's globals never reach
-# the caller, and a probe whose result silently never arrives is the same class
-# of defect as one whose failure silently reads as a negative.
+# the caller.
 
 LISTENER_PROBE_STATE=""
 LISTENER_PROBE_PID=""
 # Sets LISTENER_PROBE_STATE to found | none | unmeasured.
 #
 # `out="$(f)" || rc=$?` and not `if out="$(f)"; then ... fi; rc=$?`: after an
-# `if` whose condition is false and which has no else, `$?` is the compound's
-# own status, which is 0 -- so that form quietly turned every negative
-# measurement into an unmeasured one. Found by the three-state test below, in
-# the wrapper written to prevent exactly this.
+# `if` whose condition is false with no else, `$?` is the compound's own status,
+# which is 0, and every negative measurement becomes an unmeasured one.
 probe_listener_port() {
   local out="" rc=0
   LISTENER_PROBE_PID=""

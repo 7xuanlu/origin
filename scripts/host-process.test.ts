@@ -1679,6 +1679,19 @@ describe("host-process.sh: shape contracts the behaviour above cannot reach", ()
 });
 
 describe("the tri-state library is the one every caller uses", () => {
+  // The script itself plus every `scripts/lib/*.sh` it names in a shellcheck
+  // source= annotation, except host-process.sh: that one DEFINES the probes,
+  // so its internals are not call sites of the kind this contract governs.
+  const callerFiles = (relative: string): string[] => {
+    const text = readFileSync(resolve(root, relative), "utf8");
+    const libs = [
+      ...text.matchAll(/# shellcheck source=(scripts\/lib\/[A-Za-z0-9._-]+\.sh)/g),
+    ]
+      .map((m) => m[1])
+      .filter((p) => p !== "scripts/lib/host-process.sh");
+    return [relative, ...new Set(libs)];
+  };
+
   it.each([
     ["scripts/dev-runtime.sh"],
     ["scripts/smoke-cli.sh"],
@@ -1717,20 +1730,29 @@ describe("the tri-state library is the one every caller uses", () => {
     ["scripts/smoke-cli.sh", 5],
     ["scripts/smoke-mcp.sh", 5],
   ])("%s branches on the unmeasured state at EVERY call site", (relative, atLeast) => {
-    const text = readFileSync(resolve(root, relative), "utf8");
-    // Round 13h: this row used to count probe calls in the WHOLE FILE and then
-    // look for the word "unmeasured" anywhere in the WHOLE FILE. Both halves
-    // are file-global, so a file with nine correct call sites and one that had
-    // lost its third branch passed — the other nine paid for it. The contract
-    // is per-caller ("every caller branches on all three"), so the assertion is
-    // per-caller: enumerate the sites, take the branch that consumes each one's
-    // answer, and judge that window on its own.
-    const sites = probeCallSites(text);
+    // Counting probe calls in the WHOLE FILE and then looking for the word
+    // "unmeasured" anywhere in the WHOLE FILE passes a file with nine correct
+    // call sites and one that has lost its third branch — the other nine pay
+    // for it. The contract is per-caller ("every caller branches on all
+    // three"), so enumerate the sites, take the branch that consumes each
+    // one's answer, and judge that window on its own.
+    //
+    // A caller is the script PLUS the libraries it sources, minus
+    // host-process.sh, which defines the probes rather than calling them: the
+    // smokes keep their shared scaffolding in lib/smoke-common.sh, and a site
+    // moved there is still a site this row has to judge. Each is reported
+    // against the file it is written in.
+    const sites = callerFiles(relative).flatMap((file) =>
+      probeCallSites(readFileSync(resolve(root, file), "utf8")).map((site) => ({
+        ...site,
+        file,
+      })),
+    );
     expect(sites.length, `${relative}: no probe call sites found`).toBeGreaterThanOrEqual(
       atLeast,
     );
     for (const site of sites) {
-      const where = `${relative}:${site.line} (${site.probe})`;
+      const where = `${site.file}:${site.line} (${site.probe})`;
       // A call whose answer nothing reads is the same defect one step earlier.
       expect(site.read, `${where}: nothing branches on ${site.state}`).toBe(true);
       expect(
