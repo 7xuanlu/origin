@@ -124,7 +124,7 @@ function Harness() {
       "general",
     ),
   );
-  const applyTheme = (next: string) => {
+  const applyTheme = (next: "dark" | "light") => {
     document.documentElement.setAttribute("data-theme", next);
     setTheme(next);
   };

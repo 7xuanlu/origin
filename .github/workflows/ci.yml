@@ -153,6 +153,7 @@ jobs:
               - 'pnpm-workspace.yaml'
               - 'index.html'
               - 'tsconfig.json'
+              - 'tsconfig.tools.json'
               - 'vite.config.ts'
               - 'vite.preview.config.ts'
               - 'vite.review.config.ts'
@@ -2389,6 +2390,8 @@ jobs:
         run: bash scripts/test-install-macos-app.sh
       - name: TypeScript check
         run: pnpm exec tsc -b
+      - name: TypeScript check (tools)
+        run: pnpm exec tsc -p tsconfig.tools.json
       - name: i18n gates
         run: pnpm test:i18n
       - name: Frontend unit tests

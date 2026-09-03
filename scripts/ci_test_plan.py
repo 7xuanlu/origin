@@ -138,6 +138,7 @@ APP_JOB_FILES = {
     "pnpm-workspace.yaml",
     "index.html",
     "tsconfig.json",
+    "tsconfig.tools.json",
     "vite.config.ts",
     "vite.preview.config.ts",
     "vite.review.config.ts",

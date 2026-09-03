@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "allowJs": true
+  },
+  "include": [
+    "e2e",
+    "preview",
+    "review",
+    "scripts/**/*.ts",
+    "vite.config.ts",
+    "vite.preview.config.ts",
+    "vite.review.config.ts",
+    "vitest.config.ts",
+    "playwright.config.ts",
+    "playwright.review.config.ts",
+    "src/vite-env.d.ts"
+  ]
+}
