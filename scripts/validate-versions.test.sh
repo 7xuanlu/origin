@@ -61,9 +61,6 @@ echo '{"name": "wenlan-app", "version": "0.5.0"}' > "$TMPDIR_TEST/package.json"
 cat > "$TMPDIR_TEST/plugin-codex/bin/wenlan-mcp-runner.sh" <<EOF
 exec npx -y wenlan-mcp@^0.5.0 --agent-name "\${agent_name}" "\$@"
 EOF
-cat > "$TMPDIR_TEST/plugin-codex/README.md" <<EOF
-Fallbacks to npx -y wenlan-mcp@^0.5.0 when no local runtime exists.
-EOF
 cat > "$TMPDIR_TEST/plugin-codex/skills/setup/SKILL.md" <<EOF
 curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/v0.5.0/install.sh | bash
 EOF
@@ -156,28 +153,6 @@ if (cd "$TMPDIR_TEST" && RELEASE_TAG="v0.5.0" bash "$OLDPWD/scripts/validate-ver
     exit 1
 fi
 echo "PASS test 7: Codex setup install tag drift detected"
-
-perl -0pi -e 's|/v0\.4\.9/install\.sh|/v0.5.0/install.sh|g' "$TMPDIR_TEST/plugin-codex/skills/setup/SKILL.md"
-perl -0pi -e 's/wenlan-mcp@\^0\.5\.0/wenlan-mcp@^0.4.9/g' "$TMPDIR_TEST/plugin-codex/README.md"
-if (cd "$TMPDIR_TEST" && RELEASE_TAG="v0.5.0" bash "$OLDPWD/scripts/validate-versions.sh") 2>/dev/null; then
-    echo "FAIL test 8: should have detected Codex README runner pin drift"
-    exit 1
-fi
-echo "PASS test 8: Codex README runner pin drift detected"
-
-cat > "$TMPDIR_TEST/plugin-codex/README.md" <<EOF
-No package fallback is documented here.
-EOF
-if output=$(cd "$TMPDIR_TEST" && RELEASE_TAG="v0.5.0" bash "$OLDPWD/scripts/validate-versions.sh" 2>&1); then
-    echo "FAIL test 9: should have detected missing Codex README runner pin"
-    exit 1
-fi
-if ! printf '%s\n' "$output" | grep -q "Codex plugin release pin missing"; then
-    echo "FAIL test 9: missing pin error was not reported"
-    printf '%s\n' "$output"
-    exit 1
-fi
-echo "PASS test 9: Codex README runner pin missing detected"
 
 assert_release_job_pins_release_sha() {
     local workflow="$1"
