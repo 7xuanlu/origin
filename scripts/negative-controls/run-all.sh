@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
 # Run every negative-control harness and produce ONE receipt.
 #
-# ROUND 3 (Codex Sol), FINDING N7. Before this there were ten harnesses, ten
-# hand-typed command lines in a README, and no aggregate result at all. The way
-# that fails is not exotic: someone runs eight of the ten, the two they skipped
-# are the two that would have gone red, and the summary they write says the
-# controls pass. A harness killed by a watchdog fails the same way from the
-# other side -- it prints its last scored control and stops, and the transcript
-# tail is indistinguishable from a harness that scored everything and found
-# nothing wrong.
+# Ten hand-typed command lines produce ten separate results and no aggregate:
+# run eight, skip the two that would have gone red, and the summary says the
+# controls pass. A harness killed by a watchdog fails from the other side --
+# it prints its last scored control and stops, and the transcript tail is
+# indistinguishable from one that scored everything.
 #
 # So this runner does not trust an exit status and does not trust a transcript
 # that merely looks finished. Each harness declares a COMPLETION CONTRACT: a
@@ -54,10 +51,8 @@ finish() {
     # landing after a successful command -- and a supervisor reading only the
     # status would call that a clean sweep.
     #
-    # ROUND 4: the number is settled BEFORE the line prints it, so the status
-    # the abort line reports is the status the process exits with. It used to
-    # be rewritten afterwards, which meant that on the single path where the
-    # rewrite fires, the transcript said `rc=0` and the process exited 1.
+    # The number is settled BEFORE the line prints it, so the status the abort
+    # line reports is the status the process exits with.
     local inherited=$rc
     (( rc )) || rc=1
     echo "NEGATIVE-CONTROL ABORTED $HARNESS rc=$rc elapsed=$((SECONDS - started))s"
@@ -93,6 +88,7 @@ REGISTRY=(
   "port-precheck|bash|port-precheck-controls.sh|marker|first-run/port-precheck.sh shared-port measurement + ledger row"
   "scan|bash|dev-runtime-scan-controls.sh|summary|dev-runtime.sh reap_staged_daemon scan/kill"
   "record|bash|dev-runtime-record-controls.sh|summary|dev-runtime.sh read_owned_pid tri-state ownership record"
+  "lock-race|bash|dev-runtime-lock-race-controls.sh|summary|dev-runtime.sh acquire_runtime_lock stale-break ABA, two real runs"
   "stage|bash|dev-runtime-stage-controls.sh|summary|dev-runtime.sh stage_windows_daemon copies + call site"
   "windows-probes|python3|windows-probes-negative-controls.py|summary|windows-zip.ps1 / windows-nsis.ps1 probes, extracted"
 )
@@ -137,44 +133,27 @@ registry_is_complete() {
 }
 
 # --- the receipt is bound to the revisions it ran ----------------------------
-# ROUND 4 (Codex Sol), NEW DEFECT 5. A sweep is about fifty minutes and the
-# registry was validated once, at the top. Everything after that was reported
-# as one result about one suite -- but any harness file can be edited while the
-# sweep is in flight, and six lanes work in this tree at once. Then the clean
-# line at the bottom is a statement about a set of files that never existed
-# together at any single instant: harness three as it was at 05:20, harness
-# nine as it was at 06:05. Nothing in the transcript would say so.
+# A sweep is about fifty minutes and six lanes work in this tree at once, so any
+# harness file can be edited while it is in flight. Then the clean line at the
+# bottom is a statement about a set of files that never existed together at any
+# instant -- harness three as it was at 05:20, harness nine as it was at 06:05 --
+# and nothing in the transcript says so. The snapshot is taken at registry
+# validation, re-checked at the end, and PRINTED, so the receipt names the
+# revisions it covers. The runner hashes itself too: it is the thing doing the
+# reporting, and bash reads a script by byte offset, so an edit under a running
+# sweep corrupts control flow silently.
 #
-# So the snapshot is taken at registry validation, re-checked at the end, and
-# PRINTED. A receipt that names the revisions it covers can be checked against
-# the tree later; one that does not is a claim about "the harnesses" with no
-# referent. The runner hashes itself too: it is the thing doing the reporting,
-# and bash reads a script by byte offset, so an edit under a running sweep
-# corrupts control flow silently.
+# THE RESIDUAL, conceded rather than hidden: this bounds the claim to "these
+# bytes at the start and the same bytes at the end". An edit made and reverted
+# between the two hashings is invisible, and closing that means watching the
+# filesystem for fifty minutes.
 #
-# What this does not do -- the same limit the per-harness guards carry -- is
-# prove the files were constant throughout. An edit made and reverted between
-# the two hashings is invisible. It bounds the claim to "these bytes at the
-# start and the same bytes at the end", which is what a receipt can honestly
-# say without watching the filesystem. That is a conceded residual, not a
-# defect being hidden: round 5 re-raised it and it stays stated here rather
-# than fixed, because closing it means watching the filesystem for fifty
-# minutes and this runner does not.
-#
-# ROUND 5 (Codex Sol), FINDING 3. What DID get fixed is the shape of a digest.
-# The only validation was `[ -z ... ]`, so anything nonempty was accepted as a
-# hash: a `sha256sum` shim, alias or broken PATH entry that consistently printed
-# `UNAVAILABLE` gave SNAPSHOT[x]="UNAVAILABLE" at both ends, the compare found
-# them equal, and the sweep certified a receipt bound to nothing. That is a
-# could-not-measure wearing a negative result's clothes, in the apparatus whose
-# whole job is to tell those apart. A digest is now required to LOOK like one --
-# 64 lowercase hex characters -- at capture and at comparison alike, and
-# anything else is could-not-measure, which never certifies.
-#
-# ROUND 6 found that fix half-built and the half that was missing is the half
-# that mattered: the shape was checked AFTER `cut -c1-64` had already
-# manufactured 64 characters, and nothing anywhere asked whether the tool
-# hashes. See the block above parse_sha256_line.
+# A digest must LOOK like one -- 64 lowercase hex characters -- at capture and
+# at comparison alike, or a `sha256sum` shim, alias or broken PATH entry that
+# consistently prints `UNAVAILABLE` compares equal to itself and the sweep
+# certifies a receipt bound to nothing. The shape must be checked BEFORE any
+# `cut -c1-64` manufactures 64 characters, and the shape alone does not ask
+# whether the tool hashes; see the block above parse_sha256_line.
 is_digest() {
   case "$1" in
     ""|*[!0-9a-f]*) return 1 ;;
@@ -182,22 +161,17 @@ is_digest() {
   [ "${#1}" -eq 64 ]
 }
 
-# ROUND 6 (Codex Sol), FINDING B6. THE ROUND-5 GUARD VALIDATED THE SHAPE OF A
-# TRUNCATION, NOT A HASH -- and it is the guard that binds every other verdict
-# in this file to a set of bytes.
-#
-# Both hash sites read `sha256sum "$here/$base" | cut -c1-64`. `cut` runs FIRST
-# and `is_digest` sees only what survives it, so a `sha256sum` on PATH that
-# prints
+# A SHAPE CHECK AFTER A TRUNCATION VALIDATES THE TRUNCATION, NOT A HASH -- and
+# this is the guard that binds every other verdict in this file to a set of
+# bytes. Under `sha256sum "$here/$base" | cut -c1-64`, `cut` runs FIRST, so a
+# `sha256sum` on PATH that prints
 #
 #     0000000000000000000000000000000000000000000000000000000000000000 BROKEN
 #
-# is converted by `cut` into 64 perfectly valid hex characters. is_digest
-# accepts them, the same constant is captured at the start and compared at the
-# end, they are equal, and the receipt certifies every file unchanged -- which
-# is round 5's defect exactly, wearing the shape round 5 added. Worse,
-# `is_digest_can_fail` used 64 zeros as its POSITIVE example, so the one guard
-# watching this could not have told a fixed-output hasher from a real one.
+# becomes 64 perfectly valid hex characters, the same constant is captured at
+# the start and compared at the end, and the receipt certifies every file
+# unchanged. (64 zeros is also why `is_digest_can_fail` must not use them as its
+# POSITIVE example: that is exactly what a stubbed hasher prints.)
 #
 # Two things are needed and only one of them is obvious.
 #
@@ -340,17 +314,11 @@ snapshot_print() {
 }
 
 # The digest-shape guard, made to fire, in the transcript rather than in a
-# comment. `UNAVAILABLE` is the literal round-5 counterexample: a shim printing
-# it at both hashings compared equal to itself and certified a receipt bound to
-# nothing. A guard that is only ever shown accepting is a guard nobody has
-# watched refuse.
-#
-# ROUND 6: THE POSITIVE EXAMPLE USED TO BE 64 ZEROS, and that was the wrong
-# constant to choose. `printf '%064d' 0` is precisely what a fixed-output or
-# stubbed hasher prints, so the one demonstration watching this guard used the
-# counterexample as its proof of correctness. is_digest is a SHAPE test and
-# must still accept 64 zeros -- they are a legal digest -- so what changed is
-# the example: a real SHA-256, the one the known-answer test above is built on.
+# comment: a guard that is only ever shown accepting is a guard nobody has
+# watched refuse. The POSITIVE example is a real SHA-256, not 64 zeros --
+# `printf '%064d' 0` is what a fixed-output hasher prints, so using it as the
+# proof of correctness would be using the counterexample. is_digest is a SHAPE
+# test and must still ACCEPT 64 zeros; they are a legal digest.
 is_digest_can_fail() {
   local rejected=0 v
   for v in "UNAVAILABLE" "" "sha256sum: command not found" "abc"; do
@@ -366,11 +334,10 @@ is_digest_can_fail() {
   return 1
 }
 
-# THE LINE PARSER, made to fire, and the first fixture is round 6's finding as
-# filed: under `sha256sum | cut -c1-64` that line becomes 64 valid hex
-# characters, is_digest accepts them, and the same constant at both ends
-# certifies every harness unchanged. It is refused here BEFORE anything is
-# truncated. A guard nobody has watched refuse is a guard nobody has watched.
+# THE LINE PARSER, made to fire. The first fixture is the one that matters:
+# under `sha256sum | cut -c1-64` that line becomes 64 valid hex characters and
+# the same constant at both ends certifies every harness unchanged. It is
+# refused here BEFORE anything is truncated.
 sha256_line_can_fail() {
   local bad=0 got rc want fx rest
   # (expected status | line | path asked about)
@@ -410,111 +377,42 @@ sha256_line_can_fail() {
 }
 
 # --- why there is NO UNCONDITIONAL CRLF guard here ---------------------------
-# ROUND 6 (Codex Sol), FINDING B7 narrowed what this section may claim, and the
-# finding is right: the reasoning below is sound for the interpreters named,
-# and NOTHING IN THIS FILE EXERCISED IT. It was an empirical assertion about a
-# host, written once, carried forward in a comment -- which is the same shape as
-# a guard that has never been watched fire, and this file exists to refuse that.
-# In particular a full-CRLF script under a bash that RETAINED the CR would read
-# `set -o pipefail\r` as an invalid option, and the premise would be false in
-# exactly the place it is being relied on.
+# The premise is that this bash strips CR from a CRLF script and leaks none into
+# what the script writes, so harness-file line endings are not a measurement.
+# That is a claim about a host, so it is measured every run by
+# `crlf_premise_holds` below; when the premise is false or unmeasured, the guard
+# applies instead and a CRLF harness is refused. Where line endings ARE the
+# measurement is the SUBJECT side, handled at each site that needs it:
+# posix-probes reads its subjects with newline='' and diagnoses a CRLF-only
+# anchor miss; authenticode-step-receipt.py compares with read_bytes;
+# windows-probes keeps a CRLF fixture in its own self-check.
 #
-# So the premise is now MEASURED, here, every run, by `crlf_premise_holds`
-# below, and the claim is bounded by what that measurement returns:
-#
-#   * premise holds     -- this bash strips CR from a CRLF script and leaks
-#                          none into what the script writes. Harness-file line
-#                          endings are then not a measurement, and there is no
-#                          guard, which is the state below.
-#   * premise is false  -- CR survives. The reasoning is void, so the guard the
-#                          round-4 note deleted is applied instead: every
-#                          registered harness is checked for CRLF and a CRLF one
-#                          is refused.
-#   * could not measure -- the probe did not run. That is not the premise
-#                          holding, so the guard is applied for the same reason.
-#
-# Below is the round-4 measurement, kept because it is still the reasoning; it
-# is no longer the evidence, because the run produces its own.
-#
-# What was measured, with fixtures whose bytes were written and read back in
-# binary:
-#
-#   * a-drift-guard-replica.py converted end to end to CRLF (937 CRs): runs,
-#     17 controls fire, `failures=0`, exit 0. Python's tokenizer normalises
-#     source line endings, so a string literal spelled across lines still holds
-#     "\n" and every anchor still matches.
-#   * port-precheck-controls.sh converted end to end to CRLF (384 CRs): runs,
-#     `CONTROL FAILURES: 0`, exit 0.
-#   * a probe script asking the sharper question -- does a CRLF-encoded bash
-#     script leak CR into what it writes? -- produced pure-LF output from a
-#     quoted heredoc, from $'...' and from a "..." literal alike. This bash
-#     (MSYS2 4.4.23) strips the CRs before the script ever runs.
-#
-# So harness-file line endings are not a measurement here. Where line endings
-# ARE the measurement is the SUBJECT side, and that is already handled at each
-# site that needs it and nowhere else: posix-probes reads scripts/lib/
-# host-process.sh and host-process.test.ts with newline='' and prints a CRLF
-# diagnosis when an anchor is missing but matches after normalisation;
-# authenticode-step-receipt.py compares its two subjects with read_bytes and
-# says so when only the endings moved; windows-probes keeps a CRLF fixture in
-# its own self-check to prove its guard reads bytes rather than text.
-#
-# If you come here to add one anyway, the detection is the trap. Measured on
+# If you come here to add one anyway, the DETECTION is the trap. Measured on
 # this host against files of known bytes:
 #
-#   grep -c '\r' file      -- WRONG. In a BRE, \r is an escaped literal `r`. It
-#                             reports 0 on a file that is 100% CRLF, and counts
-#                             every line containing the letter r on one that is
-#                             100% LF -- which is what "every line is CRLF" in a
-#                             bug report usually turns out to be.
+#   grep -c '\r' file      -- WRONG. In a BRE, \r is an escaped literal `r`: 0
+#                             on a 100%-CRLF file, and every line containing the
+#                             letter r on a 100%-LF one.
 #   awk '/\r/{n++}' file   -- WRONG. Reports 0 on a 100%-CRLF file; the CR is
-#                             stripped before the pattern ever sees it.
-#   sed -n p file | cat -A -- WRONG. Prints a clean `$` on every line of a
-#                             100%-CRLF file. (`cat -A` alone is right: `^M$`.)
-#   grep -q $'\r' file     -- RIGHT STANDALONE, WRONG INSIDE "$( ... )" ON THIS
-#                             HOST. Read that as a measurement, not as a rule
-#                             about Bash.
-#                             ROUND 5 (Codex Sol) refuted the MECHANISM this
-#                             entry used to assert -- "$'...' is expanded BEFORE
-#                             the text inside a command substitution is
-#                             re-parsed" -- and the refutation is correct. That
-#                             is not what the Bash manual describes, and the
-#                             entry had promoted one host's behaviour into a
-#                             language rule. The sentence is gone. The
-#                             OBSERVATION survives it, and was re-measured to
-#                             check: from a PLAIN SCRIPT FILE, no eval, no outer
-#                             `bash -c`, on MSYS2 bash 4.4.23(1)-release, over a
-#                             3-line pure-LF fixture written and read back in
-#                             binary:
-#                               grep -c $'\r' pure-lf.txt        -> 0  (right)
-#                               n="$(grep -c $'\r' pure-lf.txt)" -> 3  (WRONG: 3
-#                                 is the LINE COUNT -- every line matched, which
-#                                 is exactly the "every line is CRLF" report that
-#                                 starts this hunt)
-#                               "$(grep -q $'\r' pure-lf.txt)"   -> MATCHES a
-#                                 file that contains no CR at all
-#                               f=`grep -c $'\r' pure-lf.txt`    -> 0: backticks
-#                                 do NOT show it, so this is $( ) specifically
-#                                 and not capture in general
-#                             Bash's own xtrace names what grep received, and is
-#                             the evidence for the entry:
-#                               + grep -c $'\r' pure-lf.txt
-#                               ++ grep -c '' pure-lf.txt
-#                             The second line is `set -x` reporting the command
-#                             it ran inside $( ): the pattern arrives EMPTY, and
-#                             an empty BRE matches every line. WHY this host does
-#                             that is not claimed here. MSYS2 patches CR handling
-#                             in bash's input path, which is a lead and not a
-#                             finding; anyone porting this warning to another
-#                             bash should re-measure before repeating it.
-#                             Assigning first is right in both contexts, and is
-#                             what to write:
-#                               CR=$'\r'; grep -c "$CR" file     -> 0 / 3
-#   git ls-files --eol     -- RIGHT, and the one to reach for by hand, but it
-#                             says nothing about a file git is not tracking, and
-#                             four of the files below are untracked today.
+#                             stripped before the pattern sees it.
+#   sed -n p file | cat -A -- WRONG. Clean `$` on every line of a 100%-CRLF
+#                             file. (`cat -A` alone is right: `^M$`.)
+#   grep -c $'\r' file     -- RIGHT STANDALONE, WRONG INSIDE "$( ... )" ON THIS
+#                             HOST (MSYS2 bash 4.4.23(1)-release). Over a 3-line
+#                             pure-LF fixture: standalone -> 0; inside "$( )" ->
+#                             3, the LINE COUNT, because xtrace shows the pattern
+#                             arriving EMPTY (`++ grep -c '' pure-lf.txt`) and an
+#                             empty BRE matches every line. Backticks do NOT show
+#                             it, so it is $( ) specifically. This is a
+#                             measurement on this host, not a rule about Bash;
+#                             re-measure before repeating it elsewhere. Assigning
+#                             first is right in both contexts and is what to
+#                             write: CR=$'\r'; grep -c "$CR" file
+#   git ls-files --eol     -- RIGHT, and the one to reach for by hand, but says
+#                             nothing about a file git is not tracking, and four
+#                             of the files below are untracked today.
 #   python read_bytes()    -- RIGHT everywhere, context-free, and what every
-#                             .count(b'\r\n')      guard in this directory actually uses.
+#                             .count(b'\r\n') guard in this directory uses.
 
 # The premise the section above rests on, measured rather than asserted.
 #   0  a fully-CRLF script runs under this bash AND leaks no CR into its output
@@ -539,11 +437,10 @@ crlf_premise_holds() {
   return 0
 }
 
-# The guard the round-4 note deleted, kept for the two branches where the
-# premise does NOT hold. Names every registered harness whose bytes are CRLF.
-# `CR=$'\r'` is assigned first and the VARIABLE is passed to grep: measured on
-# this host, `grep -c $'\r' file` inside "$( )" reports the LINE COUNT of a
-# pure-LF file, which is the trap the section above documents at length.
+# The guard for the two branches where the premise does NOT hold. Names every
+# registered harness whose bytes are CRLF. `CR=$'\r'` is assigned first and the
+# VARIABLE is passed to grep: measured on this host, `grep -c $'\r' file` inside
+# "$( )" reports the LINE COUNT of a pure-LF file (see the trap table above).
 crlf_harness_files() {
   local row base n hits=0
   for row in "${REGISTRY[@]}"; do
@@ -814,20 +711,17 @@ echo
 total=${#REGISTRY[@]}
 echo "registered=$total ran=$ran ok=$ok controls-failed=$failed did-not-complete=$incomplete skipped=$skipped"
 
-# NEW DEFECT 5, the closing half. Re-hash before any verdict is printed, and
-# let drift override a clean one: if the files moved under the sweep, the rows
-# above are results about different revisions and the aggregate is not a result
-# about anything. This is checked BEFORE the verdict rather than after it so
-# there is no window in which a clean line has already been printed.
+# Re-hash before any verdict is printed, and let drift override a clean one: if
+# the files moved under the sweep, the rows above are results about different
+# revisions. Checked BEFORE the verdict so there is no window in which a clean
+# line has already been printed.
 #
-# ROUND 6 (Codex Sol), B6's other half. The known-answer test at the top proved
-# the hasher was hashing AT THE START. A sweep is about fifty minutes and the
-# threat model this guard exists for is a shim, an alias or a PATH entry -- all
-# of which can appear during one, and a hasher that starts printing a constant
-# halfway through makes every remaining compare come out equal. So the tool is
-# asked the known question AGAIN before the drift compare, and a hasher that has
-# stopped answering it leaves every file's end state UNKNOWN, which is not the
-# same as unchanged.
+# The known-answer test at the top proved the hasher was hashing AT THE START.
+# The threat model is a shim, an alias or a PATH entry, all of which can appear
+# during a fifty-minute sweep, and a hasher that starts printing a constant
+# halfway through makes every remaining compare come out equal. So it is asked
+# the known question AGAIN before the drift compare, and one that has stopped
+# answering leaves every file's end state UNKNOWN, not unchanged.
 drifted=0
 drift_lines=""
 if hasher_answers_a_known_question; then
