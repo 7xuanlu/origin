@@ -565,6 +565,9 @@ build_lock_subject() { # release_runtime_lock, on_runtime_exit -> driver
     # the trap -- the one place this contract cannot express a failure.
     printf 'RESULT_KIND=ok\nRESULT_EMITTED=0\n'
     printf 'RUNTIME_LOCK_HELD=0\nRUNTIME_LOCK_STOLEN=0\nRUNTIME_EXIT_RAN=0\n'
+    # The release compares the owner file against this run's ACQUISITION token,
+    # not against `$$`, and the driver runs under `set -u`.
+    printf 'RUNTIME_LOCK_TOKEN=""\n'
     printf '%s\n' "$NAMER"
     printf '%s\n' "$LISTER"
     printf '%s\n' "$EMITTER"
@@ -610,7 +613,7 @@ lock_signature() { # stderr-text, status, dir-state
   esac
   case "$err" in
     *"lock this run took is gone"*)         diag=gone ;;
-    *"is recorded to PID"*)                 diag=retaken ;;
+    *"recorded to another acquisition"*)    diag=retaken ;;
     *"outlived its owner file"*)            diag=outlived ;;
     *"owner file could not be read at release"*) diag=unread ;;
     *"could not be examined at release"*)   diag=unexam ;;
@@ -620,7 +623,11 @@ lock_signature() { # stderr-text, status, dir-state
   printf '%s|%s|%s|%s|%s' "$status" "${kind:-<no marker>}" "$wording" "$diag" "$dir"
 }
 
-LOCK_FIX_OWNED='mkdir -p "$LOCK_DIR"; printf "%s\n" "$$" >"$LOCK_OWNER_FILE"'
+# The owner file carries this run's acquisition token, which is what the release
+# compares against. A bare `$$` is now somebody else's record, so writing one
+# here would turn the boundary case into another retaken-lock case.
+LOCK_FIX_OWNED='mkdir -p "$LOCK_DIR"; RUNTIME_LOCK_TOKEN="$$ 1.1.1"
+printf "%s\n" "$RUNTIME_LOCK_TOKEN" >"$LOCK_OWNER_FILE"'
 LOCK_FIX_DIR_ONLY='mkdir -p "$LOCK_DIR"'
 LOCK_FIX_OTHER='mkdir -p "$LOCK_DIR"; printf "999999\n" >"$LOCK_OWNER_FILE"'
 LOCK_FIX_UNREMOVABLE='mkdir -p "$LOCK_DIR/squatter"'
@@ -770,8 +777,8 @@ lock_control nc-lock-vanished-is-a-clean-release \
 lock_control nc-lock-retaken-is-not-marked-stolen \
   'a lock retaken by another run is described as one that failed to come off' release \
   '    RUNTIME_LOCK_STOLEN=1
-    echo "error: the dev runtime lock is recorded to PID $owner, not to this run ($$)" >&2' \
-  '    echo "error: the dev runtime lock is recorded to PID $owner, not to this run ($$)" >&2' \
+    echo "error: the dev runtime lock is recorded to another acquisition, not" >&2' \
+  '    echo "error: the dev runtime lock is recorded to another acquisition, not" >&2' \
   lock-retaken-by-another
 
 # And the branch at the caller, which is where both shapes are put into words.
