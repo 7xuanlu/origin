@@ -588,6 +588,48 @@ PY
 run_control nc15-declaration-window-is-only-a-count "$work/nc15.py" \
     declared-prefix-rewritten
 
+# --- nc16: any carried PASS is read as this run's ----------------------------
+# The workflow records `port-7878-precheck` in its own step, BEFORE the channel
+# script dot-sources lib.ps1, so the row lands above the mark and
+# Record-CarriedRow restates its verdict inside this run's window. GAUNTLET_OUT
+# is reused and both ledgers are append-only, so that carried region is the
+# union of every earlier run into the directory: one PASS row left by an EARLIER
+# run is exactly one hit, and was carried into every later run of the same
+# channel -- no precheck taken this time, the shared port possibly busy since,
+# and `port-7878-precheck-carried` recorded PASS regardless. The row now carries
+# `run=<token>` and this comparison is the whole of what makes it this run's.
+cat > "$work/nc16.py" <<'PY'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding='utf-8', newline='').read()
+old = '    if ($rowToken -cne $runToken) {\n'
+new = '    if ($false) {   # INJECTED nc16: any carried PASS counts as this run\n'
+if s.count(old) != 1:
+    sys.exit('nc16 anchor matched %d times' % s.count(old))
+io.open(p, 'w', encoding='utf-8', newline='').write(s.replace(old, new))
+PY
+run_control nc16-carried-row-need-not-name-this-run "$work/nc16.py" \
+    carried-row-token-mismatch
+
+# --- nc17: a carried row with nothing to compare against is accepted ---------
+# The other half of the same remedy, and the one that is a REFUSAL rather than a
+# comparison: with no GAUNTLET_RUN_TOKEN in this process the binding cannot be
+# made at all, and an unverifiable carried row is unchecked, never a pass. Only
+# the guard is reverted -- the comparison below it stays -- so the blast radius
+# is the one case whose subject runs with no token at all.
+cat > "$work/nc17.py" <<'PY'
+import io, sys
+p = sys.argv[1]
+s = io.open(p, encoding='utf-8', newline='').read()
+old = '    if ([string]::IsNullOrWhiteSpace($runToken)) {\n'
+new = '    if ($false) {   # INJECTED nc17: an unbindable carried row is accepted\n'
+if s.count(old) != 1:
+    sys.exit('nc17 anchor matched %d times' % s.count(old))
+io.open(p, 'w', encoding='utf-8', newline='').write(s.replace(old, new))
+PY
+run_control nc17-carried-row-without-a-token "$work/nc17.py" \
+    carried-row-token-missing
+
 # ---------------------------------------------------------------------------
 assert_subject_unchanged
 if [ "$failures" -gt 0 ]; then
