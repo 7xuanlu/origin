@@ -170,9 +170,16 @@ part of packaging behavior, not generic local helpers.
   pid 4 (the System process exists on every Windows NT kernel) and at least ten
   rows, and stderr is merged into the snapshot so a warning riding alongside a
   truncated table is a refusal rather than an unnoticed gap. `netstat` has no
-  equivalent — no socket must appear in every listener table — so a well-formed
-  but truncated `netstat` is the one residual here, and it is stated in the code
-  rather than papered over.
+  must-appear socket, so its completeness rule is structural instead: both
+  parses — the bash one in `lib/host-process.sh` and the PowerShell one in
+  `first-run/windows-zip.ps1`'s `Get-PortListenerWitness` — require every
+  non-blank line to BE a row, and require a UDP row as the END WITNESS, because
+  `netstat -ano` prints the whole TCP table and then the whole UDP table, so a
+  UDP row is evidence the stream got past the end of TCP. The ordering that
+  rests on is checked rather than assumed (a TCP row after a UDP row is a
+  refusal), and a table neither parse can account for is refused rather than
+  read as "no listener". What remains is a hole in the MIDDLE of the TCP
+  section, which the end witness cannot see; it is stated in both parses.
 
 ## COMMANDS
 
