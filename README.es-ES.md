@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=60ff19e3c08b15f0a823f138a73bc8b1eb94a59c6940f3e924853ecfc8985146 -->
+<!-- README_SYNC: source=README.md sha256=abd449a0aa5ce5325c272e35ef486a6a8b7295bd5009c620aaf50f317f805fe9 -->
 
 <p align="center">
   <picture>
@@ -51,17 +51,13 @@ Wenlan funciona como un único daemon local. La aplicación de escritorio lo lle
 
 ### Aplicación de escritorio
 
-**[Descarga Wenlan para macOS](https://github.com/7xuanlu/wenlan/releases/latest)** (Apple Silicon), abre el `.dmg` y arrastra la aplicación a Aplicaciones. Para actualizar, arrastra la aplicación nueva sobre la antigua y ábrela: si Wenlan está en ejecución se cierra y arranca la versión nueva (Wenlan 0.17.0 y anteriores hay que cerrarlos a mano antes).
+Descarga desde la [página de Releases](https://github.com/7xuanlu/wenlan/releases/latest):
 
-No hay nada más que instalar. La aplicación incluye el daemon, la CLI y el conector MCP, arranca el daemon al abrirse y ofrece conectar los clientes de IA que detecta: el plugin para Claude Code y Codex, una entrada MCP para el resto. A partir de ahí lees Páginas, inspeccionas la Fuente detrás de cualquier cita y gestionas el sistema de conocimiento.
+- **macOS (Apple Silicon):** abre el `.dmg` y arrastra Wenlan a Aplicaciones. La aplicación está firmada y notarizada, así que no hay ningún aviso en el primer arranque. Desde el terminal en su lugar: `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"` (descarga, comprueba el SHA-256, la mueve a Aplicaciones).
+- **Windows x64:** ejecuta el `-setup.exe`. Todavía no está firmado, así que cuando SmartScreen muestre "Windows protegió su PC", elige "Más información" y luego "Ejecutar de todas formas".
+- **Linux:** todavía no tiene versión de escritorio; usa el entorno de ejecución sin interfaz de abajo.
 
-La aplicación está firmada con un certificado Apple Developer ID y notarizada por Apple, así que macOS la abre en el primer arranque sin ningún aviso. Si prefieres instalarla desde el terminal, un comando la descarga, la comprueba contra el SHA-256 publicado en GitHub y la mueve a Aplicaciones.
-
-```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
-```
-
-En Windows x64, ejecuta el `-setup.exe` de la misma página de [Releases](https://github.com/7xuanlu/wenlan/releases/latest). Instala el daemon, la CLI y el conector MCP junto con las bibliotecas que necesitan en tiempo de ejecución, así que no hay nada más que instalar. El instalador todavía no está firmado, así que SmartScreen muestra "Windows protegió su PC": elige "Más información" y luego "Ejecutar de todas formas". Linux todavía no tiene versión de escritorio; usa el entorno de ejecución sin interfaz de abajo.
+La aplicación incluye el daemon, la CLI y el conector MCP, arranca el daemon al abrirse y ofrece conectar los clientes de IA que detecta: el plugin para Claude Code y Codex, una entrada MCP para el resto. Para actualizar, arrastra la aplicación nueva sobre la antigua y ábrela (Wenlan 0.17.0 y anteriores hay que cerrarlos a mano antes).
 
 <a id="claude-code-in-30-seconds"></a>
 
@@ -328,6 +324,7 @@ Documentación más detallada, conceptos y comparaciones:
 - [Crear una base de conocimiento para investigación de inversiones](https://wenlan.app/learn/build-investment-research-knowledge-base)
 - [Crear una base de conocimiento de investigación de producto antes de redactar un PRD](https://wenlan.app/learn/build-product-research-knowledge-base-for-prd)
 - [Crear una base de conocimiento de incidentes SRE](https://wenlan.app/learn/build-sre-incident-knowledge-base)
+- [Crear una base de conocimiento de definiciones de métricas de negocio](https://wenlan.app/learn/build-business-metric-definition-knowledge-base): convierte especificaciones de KPI aprobadas en un diccionario de datos respaldado por fuentes, con texto de fórmula, granularidad, exclusiones, propietarios, revisiones y estado de revisión.
 
 ### Conceptos
 

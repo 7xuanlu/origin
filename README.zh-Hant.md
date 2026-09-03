@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=60ff19e3c08b15f0a823f138a73bc8b1eb94a59c6940f3e924853ecfc8985146 -->
+<!-- README_SYNC: source=README.md sha256=abd449a0aa5ce5325c272e35ef486a6a8b7295bd5009c620aaf50f317f805fe9 -->
 
 <p align="center">
   <picture>
@@ -51,17 +51,13 @@ Wenlan 以單一本地 daemon 運行。桌面 app 內建這個 daemon；無 GUI 
 
 ### 桌面 app
 
-**[下載 macOS 版 Wenlan](https://github.com/7xuanlu/wenlan/releases/latest)**（Apple Silicon），打開 `.dmg`，把 app 拖進「應用程式」。升級時把新 app 拖到舊 app 上覆蓋，再打開它：正在執行的 Wenlan 會自動結束，新版本隨即啟動（Wenlan 0.17.0 及更早的版本需要先手動結束）。
+從 [Releases 頁面](https://github.com/7xuanlu/wenlan/releases/latest)下載：
 
-不需要再安裝其他東西。App 內已打包 daemon、CLI 與 MCP 連接器，啟動時會自動執行 daemon，並會為偵測到的 AI 用戶端提供接入：Claude Code 與 Codex 安裝 plugin，其餘用戶端寫入 MCP 設定。之後你就可以閱讀 Page、檢查任一引用背後的 Source，並整理整個知識體系。
+- **macOS（Apple Silicon）：** 打開 `.dmg`，把 Wenlan 拖進「應用程式」。App 已簽署並通過公證，首次啟動不會有警告。也可以改用終端機安裝：`/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"`（下載、核對 SHA-256、放進「應用程式」）。
+- **Windows x64：** 執行 `-setup.exe`。安裝包尚未簽署，SmartScreen 顯示「Windows 已保護您的電腦」時，點選「其他資訊」，再點「仍要執行」。
+- **Linux：** 暫時沒有桌面版，請使用下面的無 GUI runtime。
 
-這個版本使用 Apple Developer ID 憑證簽署，並通過了 Apple 的 notarization（公證），首次啟動不會再被 macOS 擋下，也不需要額外點擊確認。如果你更習慣用指令列安裝，一條指令會下載它、用 GitHub 發布的 SHA-256 核對下載檔案，並把它放進「應用程式」。
-
-```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/scripts/install-macos-app.sh)"
-```
-
-Windows x64 請在同一個 [Releases](https://github.com/7xuanlu/wenlan/releases/latest) 頁面下載 `-setup.exe` 並執行。安裝包內含 daemon、CLI 與 MCP 連接器，以及它們執行時要載入的函式庫，不需要再裝別的東西。安裝包尚未簽署，SmartScreen 會顯示「Windows 已保護您的電腦」：點選「其他資訊」，再點「仍要執行」。Linux 暫時沒有桌面版，請使用下面的無 GUI runtime。
+App 內已打包 daemon、CLI 與 MCP 連接器，啟動時會自動執行 daemon，並會為偵測到的 AI 用戶端提供接入：Claude Code 與 Codex 安裝 plugin，其餘用戶端寫入 MCP 設定。升級時把新 app 拖到舊 app 上覆蓋並開啟（Wenlan 0.17.0 及更早的版本需要先手動結束）。
 
 <a id="claude-code-in-30-seconds"></a>
 
@@ -270,8 +266,8 @@ a1b2c3d distill: 4 pages
 
 這個循環分成四步：
 
-1. **找到最新知識。** 開啟相關 Page、搜尋，或使用 `/recall <query>`；`/brief [topic]` 讀取目前的 Space Brief；提供 topic 時，會另外附上同一 Space 的相關上下文。其他 AI 工具可使用等價的 page、search、recall 與 brief 工具。
-2. **工作時隨手保存與查找。** `/capture <thing>` 保存決策、經驗、踩坑或事實，並記錄來源。`/recall <query>` 只取回相關內容，不載入全部歷史。
+1. **工作時隨手保存與查找。** `/capture <thing>` 保存決策、經驗、踩坑或事實，並記錄來源。`/recall <query>` 只取回相關內容，不載入全部歷史。
+2. **找到最新知識。** 開啟相關 Page、搜尋，或使用 `/recall <query>`；`/brief [topic]` 讀取 Brief（Space 的滾動專案摘要，由 `/handoff` 首次寫入）；提供 topic 時，會另外附上同一 Space 的相關上下文。其他 AI 工具可使用等價的 page、search、recall 與 brief 工具。
 3. **閉合循環。** `/handoff` 記錄本次改動，並把類型化的逐項更新套用到目前的 Space Brief。
 4. **讓 wiki 保持最新。** `/distill` 主動建立或刷新頁面。可選的模型流程會在兩次工作之間補充已保存內容、連結相關知識，並刷新符合條件的頁面。`/lint` 檢查知識庫健康狀態；`/curate` 讓你審核頁面更新提案，以及可選 Reconcile 流程產生的衝突項目。
 

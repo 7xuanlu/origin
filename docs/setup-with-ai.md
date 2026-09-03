@@ -12,13 +12,15 @@ Setup is complete only when:
 
 Do not report success after editing configuration alone. A live round trip is the proof.
 
+On the Claude Code plugin path, `/wenlan:setup` already proves the round trip with a read-only `brief` call, which satisfies step 3.
+
 ## Install the runtime
 
 Detect the host before choosing the runtime install path:
 
 | Host | Install path |
 |---|---|
-| macOS Apple Silicon | Run `npx -y wenlan setup`. |
+| macOS Apple Silicon | Run `npx -y wenlan setup` (requires Node.js). Without Node.js, run `curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/main/install.sh \| bash` then `wenlan setup --basic`. |
 | Linux x64 or ARM64 | Run the shell installer below. |
 | Windows x64 | Download `wenlan-windows-x64.zip` from [Releases](https://github.com/7xuanlu/wenlan/releases/latest). |
 | macOS Intel | No supported complete-runtime install; see the [platform note](../crates/wenlan-cli/README.md#macos-intel). |
