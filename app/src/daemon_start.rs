@@ -316,6 +316,14 @@ pub fn sidecar_job_binding() -> Option<JobBinding> {
 /// Record what `job::bind` reported. Pure, so the mapping is testable without
 /// a job object: an error must land on `Unbound` carrying its reason, never
 /// on a silent success.
+///
+/// Compiled on every platform rather than put behind `cfg(windows)` with its
+/// caller, because the unit tests below are the only thing holding this
+/// mapping to that rule and they should run in every lane -- not just the one
+/// lane that happens to be Windows. Only the call site in
+/// `spawn_daemon_sidecar` is Windows-only, which is what makes this dead code
+/// on the Linux clippy lane and nowhere else.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn job_binding_for(bind_result: Result<(), String>) -> JobBinding {
     match bind_result {
         Ok(()) => JobBinding::Bound,
