@@ -41,15 +41,10 @@ if [ "$#" -eq 0 ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
 fi
 
 # JSON string escaping. Backslash and quote first, so the escapes introduced
-# afterwards are not themselves re-escaped, then EVERY control character.
-#
-# The first version escaped only \\ \" \n \r \t on the reasoning that nothing
-# else can appear in a command line or a path. That is wrong: an argument can
-# carry any byte, and JSON forbids every raw U+0000-U+001F. A backspace in an
-# argument produced a row that appended fine, exited 0, and then failed
-# JSON.parse -- a run recorded as evidence that no reader can read, which is the
-# unrecorded case wearing a green badge. `LC_ALL=C tr` maps the remaining
-# controls to \uXXXX one byte at a time; the named five are already gone by then.
+# afterwards are not themselves re-escaped, then EVERY control character: an
+# argument can carry any byte, and JSON forbids every raw U+0000-U+001F. A row
+# that appends fine, exits 0 and then fails JSON.parse is the unrecorded case
+# wearing a green badge.
 json_escape() {
     local s="$1"
     s="${s//\\/\\\\}"
@@ -108,40 +103,24 @@ START_EPOCH="$(date +%s 2>/dev/null || printf '')"
 # No pipe and no capture: the command owns the terminal, and its status arrives
 # here intact.
 #
-# It DOES run in a subshell, and that parenthesis is the whole of the fix. Run
-# bare, the arguments are executed by THIS shell, so any argument that is a
-# shell builtin capable of ending the shell ends the wrapper instead of the
-# command:
-#
-#   bash scripts/attest.sh exit 0    -- `exit` returns from the wrapper here,
-#                                       at this line, with no ledger row
-#   bash scripts/attest.sh exec true -- `exec` REPLACES the wrapper with true,
-#                                       which exits 0, also with no ledger row
-#
-# Both exited 0 having recorded nothing. That is the one outcome this file
-# exists to make impossible: `/prove`'s weekly sweep reads a missing ledger
-# entry as "the smoke never ran" and calls it a finding, so silence is the
-# unacceptable answer, and these two spellings produced silence behind a green
-# exit status. Neither is exotic -- `exec` is how a caller avoids a process, and
-# `exit` is what a generated command list ends with.
-#
-# The subshell confines both. `( exit 0 )` ends the subshell and yields status
-# 0 here; `( exec true )` replaces the subshell and yields true's status here.
-# Everything after this line still runs, and the row is still written. The
-# command keeps the terminal because nothing is redirected -- a subshell is not
-# a capture.
+# The parenthesis is load-bearing. Run bare, the arguments are executed by THIS
+# shell, so an argument that is a shell builtin capable of ending the shell ends
+# the WRAPPER, with no ledger row: `attest.sh exit 0` returns from here, and
+# `attest.sh exec true` replaces the wrapper with true. Both exit 0 having
+# recorded nothing, which the weekly sweep reads as "the smoke never ran". The
+# subshell confines both, everything after this line still runs, and a subshell
+# is not a capture, so the command keeps the terminal.
 status=0
 ( "$@" ) || status=$?
 
 END_EPOCH="$(date +%s 2>/dev/null || printf '')"
 DURATION_S=""
-# `-n` is not "is a number", and the difference is not cosmetic. A clock that
-# answers something non-numeric passes the old emptiness test, and the
-# arithmetic below then evaluates that word as a NAME: under `set -u` that ends
-# the wrapper HERE -- after the command has run, before the row is written --
-# announcing an unrecorded run as `not: unbound variable`. Found by the stubbed
-# clock in scripts/attest.test.ts. A duration nobody could compute is null in
-# the row; the row itself is never the thing that goes missing.
+# `-n` is not "is a number". A clock that answers something non-numeric passes
+# an emptiness test, and the arithmetic below then evaluates that word as a
+# NAME: under `set -u` that ends the wrapper HERE -- after the command has run,
+# before the row is written -- announcing an unrecorded run as `not: unbound
+# variable`. A duration nobody could compute is null in the row; the row itself
+# is never the thing that goes missing.
 if [[ "$START_EPOCH" =~ ^[0-9]+$ ]] && [[ "$END_EPOCH" =~ ^[0-9]+$ ]]; then
     DURATION_S=$(( END_EPOCH - START_EPOCH ))
 fi
@@ -160,19 +139,16 @@ row="$row}"
 
 # --- the append is a critical section ---------------------------------------
 #
-# Two attest runs against one ledger are ordinary, not exotic: `/verify` drives
-# the CLI and MCP smokes side by side, and the sweep re-runs surfaces in
-# parallel. The append below is not one operation but three -- write, read the
-# last line back, compare -- and unlocked, every damaging interleaving is
-# reachable. Measured on this host with twelve concurrent `attest.sh true`
-# invocations: all twelve rows landed, and THREE workers exited 1 reporting
-# "the append was truncated or interleaved", because another writer's row
-# became the last line between their write and their `tail`. A passing command
-# turned red, and its evidence declared lost, by a neighbour doing nothing
-# wrong. The other two directions are worse and quieter: a partial write from
-# one process interleaved inside another's line leaves a row nothing can parse,
-# and a row verified by one writer can be appended to by another a microsecond
-# later, so what was verified is not what is on disk.
+# Two attest runs against one ledger are ordinary: `/verify` drives the CLI and
+# MCP smokes side by side and the sweep re-runs surfaces in parallel. The append
+# below is three operations -- write, read the last line back, compare -- and
+# unlocked, every damaging interleaving is reachable. Measured on this host with
+# twelve concurrent `attest.sh true` invocations: all twelve rows landed and
+# THREE workers exited 1 reporting "the append was truncated or interleaved",
+# because another writer's row became the last line between their write and
+# their `tail`. The other two directions are quieter: a partial write
+# interleaved inside another's line leaves an unparseable row, and a row
+# verified by one writer can be appended to by another a microsecond later.
 #
 # `flock` is absent from Git Bash on Windows, which is where the surfaces this
 # wrapper exists for are run, so the lock is an atomic `mkdir`: the one
@@ -191,27 +167,23 @@ LOCK_HELD=0
 LOCK_WAIT_S="${WENLAN_ATTEST_LOCK_WAIT_S:-30}"
 LOCK_STALE_S="${WENLAN_ATTEST_LOCK_STALE_S:-300}"
 
-# ROUND 6. THE OWNER TOKEN NAMES A GENERATION, NOT A PROCESS.
-#
-# It used to be `$$ $stamp`: a pid and a second. Neither is a name for the
-# DIRECTORY that was created, and two ABA races followed from that.
+# THE OWNER TOKEN NAMES A GENERATION, NOT A PROCESS. A `<pid> <stamp>` token
+# names neither the DIRECTORY that was created nor a unique run, and two ABA
+# races follow:
 #
 #   CREATION. H runs `mkdir` and is descheduled before it can stamp. A waiter
-#   reaches the unstamped-lock breaker and removes the empty directory. N
-#   creates it again, stamps it, verifies its own text and believes it holds
-#   the lock. H resumes, writes ITS owner through the same pathname -- over
-#   N's -- reads back its own text, and believes the same thing. Two writers,
-#   one lock, both appending.
+#   removes the unstamped directory; N creates it again, stamps it and believes
+#   it holds the lock; H resumes, writes ITS owner through the same pathname,
+#   reads back its own text and believes the same thing.
 #
-#   PID REUSE. Inside one stale window `$$ $stamp` can repeat, so a re-read
-#   that is supposed to prove "the holder I measured is still the holder" can
-#   be satisfied by a different run.
+#   PID REUSE. Inside one stale window `<pid> <stamp>` can repeat, so a re-read
+#   meant to prove "the holder I measured is still the holder" can be satisfied
+#   by a different run.
 #
-# Two things close them. The token carries a per-acquisition NONCE, so no two
-# generations of the directory can ever compare equal; and the owner file is
-# created under `set -C` (noclobber), so writing the stamp is a create-or-fail
-# act and a holder that finds an owner already there knows the directory is not
-# the one it made. See `acquire_lock`.
+# So the token carries a per-acquisition NONCE, and the owner file is created
+# under `set -C` (noclobber), which makes the stamp a create-or-fail act: a
+# holder that finds an owner already there knows the directory is not the one
+# it made. See `acquire_lock`.
 #
 # What no `mkdir` lock can offer is a removal that tests and destroys in one
 # step, so a waiter breaking a stale lock can still, in a microsecond-wide
@@ -255,26 +227,21 @@ lock_generation_state() {
 
 # 0 released, 1 the lock could NOT be shown to be gone.
 #
-# ROUND 5. Both removals ran with their statuses dropped and `LOCK_HELD=0` set
-# unconditionally underneath them, so a lock that could not be removed -- an ACL
-# change, an antivirus holding the directory open, an unexpected entry inside it
-# that `rmdir` refuses -- was spelled exactly like one that was: the wrapper
-# exited 0 announcing a released lock that is still on disk. Every later writer
-# then waits LOCK_WAIT_S for it and refuses to record ITS run, and nothing in
-# this run's output says why.
+# A lock that could not be removed -- an ACL change, an antivirus holding the
+# directory open, an unexpected entry `rmdir` refuses -- must not be spelled
+# like one that was, or the wrapper exits 0 announcing a released lock that is
+# still on disk and every later writer waits LOCK_WAIT_S for it.
 #
-# `rmdir` returning 0 IS the measurement that the directory is gone. A `[ ! -d
-# "$LOCK_DIR" ]` afterwards would be the weaker question, because a parent that
-# cannot be searched answers it "absent" too -- the two-answer test standing in
-# for a three-answer question, which is this file's whole subject.
+# `rmdir` returning 0 IS the measurement that the directory is gone. A
+# `[ ! -d "$LOCK_DIR" ]` afterwards is the weaker question, because a parent
+# that cannot be searched answers it "absent" too.
 #
-# ROUND 6 adds the question that has to come FIRST: is this still our lock?
-# Removing a directory that was broken under us and retaken destroys a lock we
-# do not hold -- the same destruction the stale-breaker must not do, committed
-# by the other party -- and reporting a clean release for a generation that is
-# gone hides the fact that the append it guarded may have interleaved. So the
-# three states are all spelled: ours (remove it), not ours (remove NOTHING and
-# say the hold was lost), unknown (remove nothing and say it could not be told).
+# The question that comes FIRST is: is this still our lock? Removing a directory
+# that was broken under us and retaken destroys a lock we do not hold, and
+# reporting a clean release for a generation that is gone hides that the append
+# it guarded may have interleaved. So three states: ours (remove it), not ours
+# (remove NOTHING and say the hold was lost), unknown (remove nothing and say it
+# could not be told).
 LOCK_RELEASE_REPORTED=0
 release_lock() {
     [ "$LOCK_HELD" -eq 1 ] || return 0
@@ -351,11 +318,10 @@ trap on_exit EXIT
 # hold on to the exact bytes the age was computed from: a stale lock is only
 # breakable if the holder that was measured is still the holder at the moment of
 # the removal. See the re-read in `acquire_lock`.
-# The stamp is FIELD TWO of `<pid> <stamp>[ <nonce>]`, not the last field: the
-# token grew a third component in round 6 and `${1##* }` would have started
-# reading the nonce as a time. A two-field owner written by an older run, or by
-# a test fixture, still parses -- `${1#* }` is the whole tail and `%% *` is a
-# no-op on it.
+# The stamp is FIELD TWO of `<pid> <stamp>[ <nonce>]`, not the last field:
+# `${1##* }` would read the nonce as a time. A two-field owner written by an
+# older run or a test fixture still parses -- `${1#* }` is the whole tail and
+# `%% *` is a no-op on it.
 lock_age_s() {
     local stamp now
     stamp="${1#* }"
@@ -377,23 +343,18 @@ acquire_lock() {
             # missing, unreadable or nonsense is indistinguishable from a
             # crashed one, and the unstamped-lock breaker below removes such a
             # lock after about two seconds. So a holder that cannot stamp does
-            # not hold anything, and setting LOCK_HELD=1 anyway is this file's
-            # own defect wearing the lock's name: the append goes ahead
-            # believing it is serialised while a second writer is free to take
-            # the same lock and interleave with it.
+            # not hold anything, and setting LOCK_HELD=1 anyway lets the append
+            # go ahead believing it is serialised while a second writer takes
+            # the same lock.
             #
-            # Round 15 measured two ways in:
-            #   * the owner write's status was DROPPED (`>"$LOCK_DIR/owner"
-            #     2>/dev/null` followed unconditionally by LOCK_HELD=1), so a
-            #     failed write left a live holder permanently unstamped;
-            #   * the stamp was `$(date +%s || printf 0)`, so a clock that
-            #     could not be read wrote 0 -- and `now - 0` is about 1.7
-            #     billion seconds, older than any stale threshold, which makes
-            #     a LIVE holder's lock immediately reclaimable by anyone.
-            # Both restore concurrent appends while the first holder still
-            # believes it owns the lock. The clock is read and checked BEFORE
-            # the directory is claimed as held, and the write is checked and
-            # read back, exactly as the ledger append itself is.
+            # Two ways in, both closed here: the owner write's status must not
+            # be dropped, or a failed write leaves a live holder permanently
+            # unstamped; and the stamp must not fall back to 0 on an unreadable
+            # clock, because `now - 0` is ~1.7 billion seconds, older than any
+            # stale threshold, which makes a LIVE holder's lock immediately
+            # reclaimable by anyone. So the clock is read and checked BEFORE the
+            # directory is claimed as held, and the write is checked and read
+            # back, exactly as the ledger append is.
             if ! stamp="$(date +%s 2>/dev/null)" || [[ ! "$stamp" =~ ^[0-9]+$ ]]; then
                 rmdir "$LOCK_DIR" 2>/dev/null
                 echo "attest: cannot read a usable clock, so the lock cannot be stamped" >&2
@@ -401,18 +362,16 @@ acquire_lock() {
                 return 1
             fi
             token="$(lock_new_token "$stamp")"
-            # NOCLOBBER, and this subshell is the whole of the creation-ABA fix.
-            # `set -C` makes `>` a CREATE-OR-FAIL act, so the stamp cannot land
-            # in a directory that already carries somebody else's owner file --
-            # which is exactly the state left behind when this run's `mkdir`
-            # was broken by a waiter and the directory recreated and claimed by
-            # a third writer. Under the old plain `>` that write SUCCEEDED, over
-            # the new holder's stamp, and the read-back below then confirmed the
-            # writer's own text and returned "acquired" to both of them.
+            # NOCLOBBER, and this subshell is the creation-ABA fix. `set -C`
+            # makes `>` a CREATE-OR-FAIL act, so the stamp cannot land in a
+            # directory that already carries somebody else's owner file -- the
+            # state left behind when this run's `mkdir` was broken by a waiter
+            # and the directory recreated by a third writer. A plain `>` would
+            # succeed over the new holder's stamp, and the read-back below would
+            # confirm the writer's own text for both of them.
             #
-            # `set -C` is scoped to the subshell so nothing else in this file
-            # acquires noclobber semantics; the redirection's status is the
-            # subshell's status, so it is still read the same way.
+            # `set -C` is scoped to the subshell so nothing else here acquires
+            # noclobber semantics; the redirection's status is the subshell's.
             if ! ( set -C; printf '%s\n' "$token" >"$LOCK_DIR/owner" ) 2>/dev/null; then
                 # Two different failures wear this status, and only one of them
                 # is ours to clean up after.
@@ -444,16 +403,12 @@ acquire_lock() {
                 echo "attest: an unstamped lock is one any other writer may break" >&2
                 return 1
             fi
-            # ROUND 5. The read-back is a MEASUREMENT and its STATUS is half of
-            # it. This was one `[ "$(cat …)" != "$$ $stamp" ]`, which compares
-            # the TEXT and throws the status away: a `cat` that prints the
-            # expected `PID timestamp` and then exits non-zero -- a read error
-            # after the buffer was already flushed, a shim, a filesystem that
-            # failed on the way out -- satisfies "not unequal", and LOCK_HELD
-            # becomes 1 on the strength of a read that failed. The whole point
-            # of reading the stamp back is to distinguish a stamp that is on
-            # disk from one that only appeared to be written, and a discarded
-            # status is exactly the half of that question that was not asked.
+            # The read-back is a MEASUREMENT and its STATUS is half of it.
+            # `[ "$(cat …)" != "$token" ]` compares the TEXT and throws the
+            # status away: a `cat` that prints the expected text and then exits
+            # non-zero satisfies "not unequal", and LOCK_HELD becomes 1 on the
+            # strength of a read that failed -- which is the half of the
+            # question the read-back exists to ask.
             read_rc=0
             back="$(cat "$LOCK_DIR/owner" 2>/dev/null)" || read_rc=$?
             if [ "$read_rc" -ne 0 ] || [ "$back" != "$token" ]; then
@@ -478,39 +433,30 @@ acquire_lock() {
         if [ "$owner_rc" -eq 0 ] && age="$(lock_age_s "$owner")"; then
             unstamped=0
             if [ "$age" -gt "$LOCK_STALE_S" ]; then
-                # ROUND 5. THE AGE IS A PRE-STATE, AND A PRE-STATE IS NOT A
-                # LICENCE TO DESTROY. The age above was measured from the owner
-                # value read at the top of this iteration; between that read and
-                # these removals the old holder can release normally and a NEW
-                # one can take the lock -- `mkdir` succeeds the moment the
-                # directory is gone. This waiter would then delete a lock that
-                # is seconds old and being held right now, and both writers
-                # would append to the ledger at once, which is the interleaving
-                # the whole lock exists to remove.
+                # THE AGE IS A PRE-STATE, AND A PRE-STATE IS NOT A LICENCE TO
+                # DESTROY. The age was measured from the owner read at the top
+                # of this iteration; between that read and these removals the
+                # old holder can release normally and a NEW one can take the
+                # lock, since `mkdir` succeeds the moment the directory is gone.
+                # This waiter would then delete a lock seconds old and held
+                # right now, and both writers would append at once.
                 #
-                # So the owner is read AGAIN, immediately before the removal,
-                # and must still be the exact value whose age was measured. A
-                # re-read that fails is not a match either. Since round 6 that
-                # value carries a per-generation nonce, so "the same owner" is
-                # a statement about the same generation of the directory and no
-                # longer merely about the same pid in the same second.
+                # So the owner is read AGAIN immediately before the removal and
+                # must still be the exact value whose age was measured; a
+                # re-read that fails is not a match. That value carries a
+                # per-generation nonce, so "the same owner" is about the same
+                # generation of the directory, not the same pid in the same
+                # second.
                 #
-                # THE RESIDUAL, stated exactly, and ROUND 6 corrected the
-                # previous wording, which claimed the window was "the two lines
-                # below" while an `echo` sat inside it as well. The window is
-                # the two removals below and the scheduling boundaries around
-                # them: the diagnostic has been moved out, after the removal, so
-                # nothing but `rm` and `rmdir` runs between the comparison and
-                # the destruction. It is NOT closed -- `mkdir` offers no
-                # primitive that tests and removes in one step, so a holder that
-                # releases and is replaced inside that window still has its lock
-                # broken. What round 6 adds is that the victim FINDS OUT:
-                # `release_lock` asks `lock_generation_state` before it removes
-                # anything, so the writer whose lock was broken here reports it
-                # (LOCK_STOLEN) instead of finishing green over an append that
-                # may have interleaved. What is gone from round 5 is the
-                # SECONDS-wide window, which is the one an ordinary release
-                # lands in.
+                # THE RESIDUAL, stated exactly: the window is the two removals
+                # below and the scheduling boundaries around them -- the
+                # diagnostic sits after the removal so nothing but `rm` and
+                # `rmdir` runs between the comparison and the destruction. It is
+                # NOT closed: `mkdir` offers no primitive that tests and removes
+                # in one step. What the victim gets is notice -- `release_lock`
+                # asks `lock_generation_state` before removing anything, so a
+                # writer whose lock was broken here reports LOCK_STOLEN rather
+                # than finishing green over an append that may have interleaved.
                 recheck=0
                 owner_again="$(cat "$LOCK_DIR/owner" 2>/dev/null)" || recheck=$?
                 if [ "$recheck" -eq 0 ] && [ "$owner_again" = "$owner" ]; then
