@@ -571,7 +571,7 @@ def _release_version_policy(config_text: str, old_version: str, new_version: str
             raise CandidateError(
                 f"release-as override {release_as!r} is stale: it does not advance"
                 f" past the released base version {old_version!r}; remove it from"
-                " release-please-config.json (RELEASING.md, version-steering policy)"
+                " release-please-config.json (docs/RELEASING.md, version-steering policy)"
             )
         if new_version != release_as:
             raise CandidateError("candidate version does not exactly match release-as")

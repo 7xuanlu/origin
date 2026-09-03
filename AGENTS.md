@@ -21,7 +21,7 @@ are read only when the task needs them.
 | Eval fixtures and artifacts | `app/eval/AGENTS.md` |
 | Rust eval runners and experiment design | `crates/wenlan-core/src/eval/AGENTS.md` |
 | Test routing and CI layers | `docs/test-layers.md` |
-| Platform and release work | `docs/cross-platform.md`, `RELEASING.md` |
+| Platform and release work | `docs/cross-platform.md`, `docs/RELEASING.md` |
 | Live daemon/app verification | `.claude/skills/run-wenlan/SKILL.md`, then the relevant verify/prove skill |
 
 ## Build and verification

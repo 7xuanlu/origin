@@ -2410,7 +2410,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Open the release-as override cleanup PR
         # A deliberate minor/major is steered by a one-shot `release-as`
-        # override in release-please-config.json (RELEASING.md,
+        # override in release-please-config.json (docs/RELEASING.md,
         # version-steering policy), but release-please never consumes it: its
         # docs warn that later runs "will continue to use this version". Once
         # the overridden version is released, open the removal PR here so
@@ -2476,7 +2476,7 @@ jobs:
           jq -n \
             --arg title "chore: drop the release-as override now that $version is cut" \
             --arg head "$branch" \
-            --arg body "Automated follow-up from the v$version release: the one-shot release-as override has been consumed, and release-please would otherwise keep proposing $version (see RELEASING.md, version-steering policy). The candidate validator rejects a stale override, so merging this unblocks the next release." \
+            --arg body "Automated follow-up from the v$version release: the one-shot release-as override has been consumed, and release-please would otherwise keep proposing $version (see docs/RELEASING.md, version-steering policy). The candidate validator rejects a stale override, so merging this unblocks the next release." \
             '{title: $title, head: $head, base: "main", body: $body}' \
           | gh api --method POST \
             -H 'Accept: application/vnd.github+json' \
