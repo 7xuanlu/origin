@@ -441,6 +441,10 @@ jobs:
               - 'scripts/smoke-windows-llm.test.ps1'
               - 'scripts/first-run/lib.ps1'
               - 'scripts/first-run/lib.test.ps1'
+              # The Windows-probe negative controls read the shipped channel
+              # scripts and lib.ps1 and assert their rules, so a change here
+              # changes what those rules are held to.
+              - 'scripts/negative-controls/windows-probes-negative-controls.py'
               - 'scripts/first-run/cli-roundtrip.ps1'
               - 'scripts/first-run/npx-mcp.ps1'
               - 'scripts/first-run/windows-zip.ps1'
