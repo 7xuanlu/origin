@@ -6,8 +6,12 @@ description: Per-surface verification loops for wenlan — daemon, cli, mcp, plu
 # /prove [surface] — wenlan verification loops
 
 Run every check through the evidence wrapper (records to `.claude/attest.jsonl`,
-which the weekly sweep audits): `~/.claude/bin/attest.sh <command>`.
-Sandboxed local runs need `TMPDIR=/tmp/claude` prefixed (macOS mktemp gotcha).
+which the weekly sweep audits): `bash scripts/attest.sh <command>`. That wrapper
+ships in the repo and runs on macOS, Linux and Windows (Git Bash); the older
+`~/.claude/bin/attest.sh` is a personal copy that does not exist on every
+machine, and a missing wrapper means the run is unrecorded, which the sweep
+reads as "the smoke never ran". Sandboxed local runs need `TMPDIR=/tmp/claude`
+prefixed (macOS mktemp gotcha).
 
 | Surface | Command | Proves |
 |---|---|---|

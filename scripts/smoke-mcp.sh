@@ -1,90 +1,109 @@
 #!/usr/bin/env bash
 # Smoke test: the shipped `wenlan-mcp` binary bridges a real MCP client to a
 # real daemon. Black-box per-surface loop over stdio JSON-RPC: initialize ->
-# tools/list -> capture tool call -> recall tool call. Isolated port + data
-# dir per repo smoke-test policy — never touches prod data.
+# tools/list -> capture tool call -> recall tool call. Isolated port + data dir
+# + pages dir per repo smoke-test policy — never touches prod data.
+#
+# The isolated scratch, the asserted teardown, the ownership and isolation
+# readbacks and the ledger multiset are shared with `smoke-cli.sh` and live in
+# `lib/smoke-common.sh`.
+#
+# Windows note specific to this surface: `mcp-roundtrip.py` runs as a NATIVE
+# Windows Python process and `subprocess.Popen`s MCP_BIN itself, so MCP_BIN,
+# GAUNTLET_OUT, WENLAN_MCP_CACHE_DIR and the driver's own path all have to be
+# native spellings — not just WENLAN_DATA_DIR. The shell keeps the MSYS forms
+# for its own `rm -rf` and `cut`.
 set -euo pipefail
 
 PORT="${PORT:-17882}"
 HOST="http://127.0.0.1:${PORT}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=scripts/lib/host-process.sh
+. "$ROOT/scripts/lib/host-process.sh"
+
 # BIN preset (e.g. a release-archive extract) skips the cargo build below.
 BIN_PRESET="${BIN:-}"
 BIN="${BIN:-$ROOT/target/debug}"
+SERVER_BIN="$BIN/wenlan-server"
+MCP_BIN_PATH="$BIN/wenlan-mcp"
+if (( HOST_IS_WINDOWS == 1 )); then
+    SERVER_BIN="${SERVER_BIN}.exe"
+    MCP_BIN_PATH="${MCP_BIN_PATH}.exe"
+fi
 
-# Explicit template: macOS mktemp ignores TMPDIR without one, and the
-# sandboxed dev loop can only write under TMPDIR.
-DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/smoke-mcp.XXXXXX")"
-DAEMON_PID=""
+SMOKE_NAME=smoke-mcp
+SMOKE_PASS_MESSAGE="PASS: MCP surface smoke (initialize, tools/list, capture, recall) against isolated daemon"
+# shellcheck source=scripts/lib/smoke-common.sh
+. "$ROOT/scripts/lib/smoke-common.sh"
+trap smoke_cleanup EXIT
 
-cleanup() {
-    if [ -n "$DAEMON_PID" ]; then
-        kill -9 "$DAEMON_PID" >/dev/null 2>&1 || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
-    for _ in $(seq 1 10); do
-        if ! lsof -ti ":${PORT}" >/dev/null 2>&1; then
+smoke_preflight
+
+# `python3` is not the name the interpreter carries everywhere — the repo's own
+# Windows gauntlet uses `python`. Resolve it rather than hardcoding.
+PYTHON="${PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            PYTHON="$candidate"
             break
         fi
-        sleep 1
     done
-    rm -rf "$DATA_DIR"
-}
-trap cleanup EXIT
-
-fail() {
-    echo "FAIL: $1" >&2
-    echo "--- daemon log tail ---" >&2
-    tail -40 "$DATA_DIR/daemon.log" >&2 || true
-    exit 1
-}
+fi
+[ -n "$PYTHON" ] || fail "python3 (or python) is required to drive the MCP round-trip"
 
 if [ -z "$BIN_PRESET" ]; then
     echo "==> Building wenlan-server + wenlan-mcp"
     (cd "$ROOT" && cargo build -p wenlan-server -p wenlan-mcp)
 fi
+[ -x "$SERVER_BIN" ] || fail "no daemon binary at $SERVER_BIN"
+[ -x "$MCP_BIN_PATH" ] || fail "no MCP binary at $MCP_BIN_PATH"
 
-# Without lsof a failed port check reads as "port free" — fail loud instead.
-command -v lsof >/dev/null 2>&1 || fail "lsof is required (port check + cleanup)"
+smoke_scratch
 
-if lsof -ti ":${PORT}" >/dev/null 2>&1; then
-    fail "port ${PORT} already in use; set PORT= to another free port"
-fi
+NATIVE_MCP_BIN="$(native_path "$MCP_BIN_PATH")" || fail "could not spell $MCP_BIN_PATH for the driver"
+NATIVE_GAUNTLET_OUT="$(native_path "$DATA_DIR/gauntlet")" || fail "could not spell the gauntlet output directory"
+NATIVE_MCP_CACHE="$(native_path "$DATA_DIR/mcp-cache")" || fail "could not spell the MCP cache directory"
+NATIVE_DRIVER="$(native_path "$ROOT/scripts/first-run/mcp-roundtrip.py")" ||
+    fail "could not spell the MCP driver path"
 
-echo "==> Starting daemon on port ${PORT} (data dir ${DATA_DIR})"
-(cd "$ROOT" && WENLAN_PORT="$PORT" WENLAN_DATA_DIR="$DATA_DIR" \
-    exec "$BIN/wenlan-server" >"$DATA_DIR/daemon.log" 2>&1) &
-DAEMON_PID=$!
+smoke_start_daemon
+smoke_assert_ownership
+smoke_assert_isolation
 
-echo "==> Waiting for /api/health"
-healthy=""
-for i in $(seq 1 120); do
-    if curl -sf --max-time 2 "$HOST/api/health" >/dev/null 2>&1; then
-        echo "    healthy after ${i}s"
-        healthy=1
-        break
-    fi
-    kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon exited during startup"
-    sleep 1
-done
-[ -n "$healthy" ] || fail "daemon did not become healthy within 120s"
-
+# --- drive the surface --------------------------------------------------------
 echo "==> Driving wenlan-mcp over stdio JSON-RPC"
 # The JSON-RPC driver lives in the first-run gauntlet helper (shared with the
 # release-artifact workflow); it records every step and never exits early.
 # WENLAN_MCP_CACHE_DIR keeps the self-update probe out of the user cache (the
 # empty temp cache still forces one GET to github.com; its 3s timeout is
 # fail-soft).
-GAUNTLET_OUT="$DATA_DIR/gauntlet" GAUNTLET_CHANNEL=smoke-mcp \
-WENLAN_MCP_CACHE_DIR="$DATA_DIR/mcp-cache" \
-MCP_BIN="$BIN/wenlan-mcp" \
+#
+# MCP_TOOLS is exported here rather than left to the driver's own default, so
+# the expectation below is computed from the SAME value the driver reads. The
+# row set is a function of that value, so a pasted literal would be wrong for
+# any caller that changes it.
+MCP_TOOLS="${MCP_TOOLS:-capture,recall}"
+export MCP_TOOLS
+GAUNTLET_OUT="$NATIVE_GAUNTLET_OUT" GAUNTLET_CHANNEL=smoke-mcp \
+WENLAN_NO_AUTOSTART=1 \
+WENLAN_MCP_CACHE_DIR="$NATIVE_MCP_CACHE" \
+MCP_BIN="$NATIVE_MCP_BIN" \
 MCP_ARGS='["--origin-url","'"$HOST"'","--agent-name","smoke-mcp"]' \
-    python3 "$ROOT/scripts/first-run/mcp-roundtrip.py"
-[ -s "$DATA_DIR/gauntlet/findings.tsv" ] || fail "MCP round-trip recorded nothing"
-if grep -q $'\tFAIL\t' "$DATA_DIR/gauntlet/findings.tsv"; then
-    echo "--- findings.tsv ---" >&2
-    cat "$DATA_DIR/gauntlet/findings.tsv" >&2
-    fail "MCP stdio round-trip recorded FAIL rows"
-fi
+    "$PYTHON" "$NATIVE_DRIVER"
 
-echo "PASS: MCP surface smoke (initialize, tools/list, capture, recall) against isolated daemon"
+# mcp-roundtrip.py always records initialize / tools-list / tool-count(INFO) /
+# capture / recall, and emits an `mcp-brief` row only when `brief` is in
+# MCP_TOOLS, so the expectation is derived rather than observed.
+EXPECTED_ROWS="mcp-capture=PASS
+mcp-initialize=PASS
+mcp-recall=PASS
+mcp-tool-count=INFO
+mcp-tools-list=PASS"
+case ",$MCP_TOOLS," in
+    *,brief,*) EXPECTED_ROWS="$EXPECTED_ROWS
+mcp-brief=PASS" ;;
+esac
+smoke_assert_ledger "$DATA_DIR/gauntlet/findings.tsv" "$EXPECTED_ROWS" MCP
+
+BODY_OK=1

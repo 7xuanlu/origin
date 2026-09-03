@@ -184,6 +184,14 @@ jobs:
               # or hook installation reports green.
               - 'scripts/dev-all.sh'
               - 'scripts/dev-runtime.sh'
+              # host-process.sh is the shared port/liveness/image probe library
+              # dev-runtime.sh and the smokes stand on, and host-process.test.ts
+              # is its only suite. Without this line a PR touching ONLY the
+              # library matches `scripts/**` in the rust filter, which runs
+              # cargo and not Vitest -- so app-check is never scheduled and
+              # none of its cases run. The library every probe depends on was
+              # the one file whose own changes were unguarded.
+              - 'scripts/lib/host-process.sh'
               - 'scripts/install-git-hooks.mjs'
               - 'scripts/run-bash.mjs'
               - '.github/workflows/ci.yml'

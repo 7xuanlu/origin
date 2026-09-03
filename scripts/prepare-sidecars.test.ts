@@ -31,6 +31,10 @@ const scriptPath = resolve(root, "scripts/prepare-sidecars.sh");
 const tauriBuildScriptPath = resolve(root, "scripts/prepare-tauri-build-sidecars.sh");
 const resolverScriptPath = resolve(root, "scripts/resolve-backend-dir.sh");
 const devRuntimeScriptPath = resolve(root, "scripts/dev-runtime.sh");
+// dev-runtime.sh sources its host-process primitives from scripts/lib/, so a
+// fixture app root that copies the script without the library cannot run
+// `dev:daemon` at all.
+const hostProcessLibPath = resolve(root, "scripts/lib/host-process.sh");
 const runBashScriptPath = resolve(root, "scripts/run-bash.mjs");
 const tempRoots: string[] = [];
 const pathOverrideEnvKeys = new Set([
@@ -70,6 +74,10 @@ function writeAppScripts(appRoot: string): void {
   copyFileSync(tauriBuildScriptPath, resolve(appRoot, "scripts/prepare-tauri-build-sidecars.sh"));
   copyFileSync(resolverScriptPath, resolve(appRoot, "scripts/resolve-backend-dir.sh"));
   copyFileSync(devRuntimeScriptPath, resolve(appRoot, "scripts/dev-runtime.sh"));
+  // dev-runtime.sh sources this on its first executable line; without it the
+  // copied script dies before it reads a single variable.
+  mkdirSync(resolve(appRoot, "scripts/lib"), { recursive: true });
+  copyFileSync(hostProcessLibPath, resolve(appRoot, "scripts/lib/host-process.sh"));
   // The package.json scripts invoke the shell scripts through this launcher, so
   // a fixture root that omits it cannot run them at all.
   copyFileSync(runBashScriptPath, resolve(appRoot, "scripts/run-bash.mjs"));
