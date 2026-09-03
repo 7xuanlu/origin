@@ -253,22 +253,12 @@ fn server_plist_data_dir_match() -> ServerPlistMatch {
     }
 }
 
-// DELETED (round 4, defect C): `current_server_plist_matches_selected_data_dir`
-// -> bool. It mapped `ServerPlistMatch::Unknown` to `false`, so a `pub`
-// compatibility surface could not tell "the plist does not target this data
-// root" from "the plist could not be read". It had NO production callers left
-// — only tests, which is exactly the shape of a trap: the next caller to reach
-// for it inherits the collapse for free. `server_plist_data_dir_match()` is the
-// answer, and it keeps all three values. Callers that genuinely only want the
-// positive case write `== ServerPlistMatch::Matches` at their own site, where
-// the discarded third value is visible in the diff.
-
 /// Whether launchd owns the daemon, as far as it could be measured.
 ///
-/// Round 3: this was a `bool`, and the `Unknown` arm below logged itself and
-/// returned `false`. A log inside a probe does not preserve tri-state — every
-/// caller still saw "measured not owned" and could not tell that nothing had
-/// been measured at all. The distinction now leaves the function.
+/// Tri-state on purpose: a log line inside a probe does not preserve
+/// tri-state, so the `Unknown` arm has to leave the function. Callers that
+/// genuinely only want the positive case write `== ServerPlistMatch::Matches`
+/// at their own site, where the discarded third value is visible in the diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchdOwnership {
     /// Measured: the server LaunchAgent targets the selected data root *and*
@@ -299,12 +289,10 @@ pub fn launchd_owns_server_daemon(launchctl: &dyn LaunchctlExec) -> LaunchdOwner
         ServerPlistMatch::Unknown => return LaunchdOwnership::Unknown,
         ServerPlistMatch::Matches => {}
     }
-    // `LaunchctlReading::label_state`, never a bare table lookup. A table cut
-    // at a row boundary before `com.wenlan.server` used to land here as
-    // `NotLoaded` -> `DoesNot`, and `daemon_start` then took the CLEAN spawn
-    // branch -- a second daemon started against a job that was in fact loaded,
-    // with no `spawned_on_unknown_owner` latch to show for it, because as far
-    // as this function was concerned nothing had been unmeasurable.
+    // `LaunchctlReading::label_state`, never a bare table lookup: a table cut
+    // at a row boundary before `com.wenlan.server` would land here as
+    // `NotLoaded` -> `DoesNot`, sending `daemon_start` down the CLEAN spawn
+    // branch against a job that is in fact loaded.
     match LaunchctlReading::take(launchctl).label_state(SERVER_PLIST_LABEL) {
         LabelState::Loaded => LaunchdOwnership::Owns,
         LabelState::NotLoaded => LaunchdOwnership::DoesNot,
@@ -713,16 +701,9 @@ pub fn install_server_plist_via_subprocess(launchctl: &dyn LaunchctlExec) -> Res
 /// a still-loaded `KeepAlive` daemon left with no registration file to unload
 /// it by, and Run at Login reading "off" while it is on.
 ///
-/// Round 4 and its follow-up (defect A): the `NotLoaded` this acts on comes
-/// from [`LaunchctlReading::label_state`], and there is no longer any weaker
-/// negative in this file for it to come from. The intermediate design routed
-/// this one caller through a separate "strong enough to delete by" function
-/// while `label_state` itself still returned a bulk-table `NotLoaded`; that
-/// left the unsound reading alive for every other caller, and the separate
-/// function's rule was itself wrong (it counted a targeted SPAWN FAILURE as
-/// half of an agreeing absence). Both are gone. A wrong `NotLoaded` cannot
-/// reach here because a wrong `NotLoaded` is no longer constructible: absence
-/// is produced by exactly one thing, a targeted probe with a working control.
+/// The `NotLoaded` this acts on can only come from
+/// [`LaunchctlReading::label_state`]: absence is produced by exactly one
+/// thing, a targeted probe with a working control.
 fn unload_plist_or_verify_absent(
     launchctl: &dyn LaunchctlExec,
     plist: &Path,
@@ -818,8 +799,7 @@ const LAUNCHD_SYSTEM_JOB_PREFIX: &str = "com.apple.";
 
 /// The labels in a `launchctl list` table, or `None` when the text is not one.
 ///
-/// WHAT THESE CHECKS ESTABLISH, stated exactly, because the previous round's
-/// comment claimed more than it delivered:
+/// WHAT THESE CHECKS ESTABLISH, stated exactly:
 ///
 /// * header / row shape / row floor / `com.apple.*` job — PROVENANCE. Something
 ///   that speaks launchd's table dialect answered. A stub, an error message, or
@@ -939,9 +919,7 @@ fn launchctl_snapshot(launchctl: &dyn LaunchctlExec) -> LaunchctlSnapshot {
 
 /// What a BULK `launchctl list` table establishes about ONE label.
 ///
-/// ROUND 4 FOLLOW-UP, and the correction of a claim made here last round. This
-/// used to be a `LabelState`, i.e. a label missing from the table was reported
-/// as `NotLoaded` -- a measured negative. IT IS NOT ONE.
+/// A label missing from the table is NOT a measured negative.
 ///
 /// A table cut at a ROW BOUNDARY -- the process died between rows, a pipe
 /// filled and the tail was dropped, launchd stopped enumerating -- is
@@ -1033,16 +1011,12 @@ fn targeted_label_probe(launchctl: &dyn LaunchctlExec, label: &str) -> TargetedL
 /// Whether `launchctl list <label>` is answering questions on this host right
 /// now -- established by asking it one whose answer is already known.
 ///
-/// WHY THIS EXISTS. Last round's rule said a plist could be deleted when the
-/// targeted probe returned `NotPresentOrFailed` AND the bulk table did not
-/// carry the label, and called that two agreeing witnesses. It was not.
-/// `NotPresentOrFailed` includes a spawn failure, so witness 2 could be a
-/// failed measurement; and the bulk table's silence is not an absence at all
-/// (see [`BulkLabelReading`]), so witness 1 could be a truncation. Two
-/// non-measurements do not add up to a measurement, and a transient targeted
-/// failure beside a row-boundary-truncated table would have deleted the plist
-/// of a loaded job. The repair is not to make the probe dishonest -- it is to
-/// give it a control.
+/// WHY THIS EXISTS. `NotPresentOrFailed` includes a spawn failure, and the
+/// bulk table's silence is not an absence at all (see [`BulkLabelReading`]).
+/// Two non-measurements do not add up to a measurement, so a transient
+/// targeted failure beside a row-boundary-truncated table must not be read as
+/// two agreeing witnesses. The repair is not to make the probe dishonest -- it
+/// is to give it a control.
 ///
 /// A POSITIVE CONTROL settles it without needing to know a single macOS exit
 /// code. The bulk table just taken names jobs that ARE loaded: its
@@ -1161,16 +1135,6 @@ impl<'a> LaunchctlReading<'a> {
     /// Whether `label` is loaded. THE answer -- there is no weaker one left in
     /// this file to reach for by mistake.
     ///
-    /// Round 4 shipped a `label_state` that returned `NotLoaded` straight off
-    /// the bulk table, hardened only the plist-deleting caller against it, and
-    /// left `launchd_owns_server_daemon` and `run_at_login_state` spending the
-    /// same unsound negative: a row-boundary-truncated table made launchd
-    /// ownership read `DoesNot` (so the app spawned a second daemon as a
-    /// *clean* start, with no unknown-owner latch to show for it) and painted
-    /// Run at Login "off" while launchd was still starting Wenlan every boot.
-    /// The repair is to delete the unsound reading rather than route around it,
-    /// so every caller now gets this one and there is nothing else to get.
-    ///
     /// PRESENCE from either instrument is presence. ABSENCE comes only from the
     /// targeted probe backed by a working control.
     fn label_state(&self, label: &str) -> LabelState {
@@ -1196,21 +1160,16 @@ impl<'a> LaunchctlReading<'a> {
 /// "off" — the user would then see "Run at Login" disabled while launchd is
 /// in fact still starting Wenlan every boot.
 ///
-/// ONE bulk snapshot answers both labels (round 4, defect B). This used to
-/// call `label_state` twice, i.e. run `launchctl list` twice, and combine two
-/// readings taken at two different instants. launchd loading the second label
-/// in between made the pair report `NotLoaded` while both were loaded; the
-/// mirror case let it report `Loaded` for a pair that was never simultaneously
-/// loaded at all. A pair state assembled from two tables is not a state of
-/// anything.
+/// ONE bulk snapshot answers both labels: a pair assembled from two tables
+/// taken at two instants is not a state of anything — launchd loading the
+/// second label in between reports `NotLoaded` while both are loaded.
 ///
 /// THE TRADE, stated rather than hidden: a label the snapshot does not carry is
 /// escalated to its own `launchctl list <label>`, which is a later instant, so
 /// the single-instant property holds for every complete table and not for a
-/// truncated one. That is the right way round. The alternative is to keep
-/// spending a truncated table as an absence, which is how this function came to
-/// paint the toggle "off" while launchd was starting Wenlan every boot -- a
-/// wrong answer, where the escalation can at worst give a briefly stale one.
+/// truncated one. That is the right way round: spending a truncated table as an
+/// absence paints the toggle "off" while launchd is starting Wenlan every boot,
+/// where the escalation can at worst give a briefly stale answer.
 pub fn run_at_login_state(launchctl: &dyn LaunchctlExec) -> LabelState {
     // An isolated dev app has its own bundle identifier and never owns the
     // installed LaunchAgents, so reporting the user's production state here
@@ -1436,18 +1395,12 @@ pub async fn set_run_at_login(enabled: bool, launchctl: &dyn LaunchctlExec) -> R
         // through its child handle first; a launchd-owned daemon is never in
         // that slot, so this is a no-op once launchd owns the daemon.
         //
-        // Round 3 (defect 5): this used to log the two failing outcomes and
-        // install the plists anyway, on the reasoning that refusing would make
-        // the toggle unusable. That traded a measured "the old owner still
-        // holds the port" for a launchd job registered against it — a second
-        // owner, or a restart loop. The outcome is a decision input, not a
-        // diagnostic: a handover this code has just established is unsafe is
-        // not performed.
-        //
-        // The toggle does not become unusable, because the two things that
-        // made it so are gone: a failed stop no longer discards the sidecar
-        // record (so the next attempt can retry the kill), and
-        // `search::set_run_at_login` restarts the daemon when this returns
+        // The stop outcome is a decision input, not a diagnostic: a handover
+        // this code has just established is unsafe is not performed, because
+        // registering launchd against a still-held port makes a second owner
+        // or a restart loop. The toggle stays usable — a failed stop does not
+        // discard the sidecar record (so the next attempt can retry the kill),
+        // and `search::set_run_at_login` restarts the daemon when this returns
         // `Err` and nothing owns the port.
         handover_may_proceed(&crate::daemon_start::stop_sidecar().await)?;
         set_user_opted_out(false)?;
@@ -1701,6 +1654,15 @@ mod tests {
         )
     }
 
+    /// Stage that plist at the real `server_plist_path()`, creating the
+    /// LaunchAgents directory. Returns the path it was written to.
+    fn write_server_plist_for(data_dir: &Path) -> PathBuf {
+        let plist = server_plist_path().unwrap();
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, server_plist_for_data_dir(data_dir)).unwrap();
+        plist
+    }
+
     /// A nonzero exit for the targeted `launchctl list <label>` form. The real
     /// not-found code has varied across macOS releases and this worktree has no
     /// macOS host to settle it — which is the whole reason `targeted_label_probe`
@@ -1738,7 +1700,7 @@ mod tests {
         }
 
         /// How many times the BARE `launchctl list` was run. The pair-state
-        /// snapshot invariant (defect B) is stated in this number.
+        /// single-snapshot invariant is stated in this number.
         fn bare_list_calls(&self) -> usize {
             self.calls()
                 .iter()
@@ -1756,9 +1718,8 @@ mod tests {
                 list_status: Mutex::new(0),
                 targeted: Mutex::new(TargetedList::FromTable),
                 // A well-formed table that simply carries no Wenlan label —
-                // the measured negative. An EMPTY stdout used to be the
-                // default here and used to mean the same thing; it now means
-                // could-not-measure, which is the point of A1.
+                // the measured negative. An EMPTY stdout is NOT this: it
+                // means could-not-measure.
                 list_stdout: Mutex::new(launchctl_table(&[])),
             }
         }
@@ -2026,24 +1987,31 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn stable_launch_agent_target_accepts_system_wenlan_app_bundle() {
-        assert_eq!(
-            classify_stable_launch_agent_target(std::path::Path::new(
-                "/Applications/Wenlan.app/Contents/MacOS/origin-app"
-            )),
-            StableLaunchAgentTarget::Current
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn stable_launch_agent_target_accepts_system_wenlan_app_executable() {
-        assert_eq!(
-            classify_stable_launch_agent_target(std::path::Path::new(
-                "/Applications/Wenlan.app/Contents/MacOS/wenlan-app"
-            )),
-            StableLaunchAgentTarget::Current
-        );
+    fn stable_launch_agent_target_classifies_system_paths() {
+        for (exe, expected) in [
+            (
+                "/Applications/Wenlan.app/Contents/MacOS/origin-app",
+                StableLaunchAgentTarget::Current,
+            ),
+            (
+                "/Applications/Wenlan.app/Contents/MacOS/wenlan-app",
+                StableLaunchAgentTarget::Current,
+            ),
+            (
+                "/Applications/Origin.app/Contents/MacOS/origin",
+                StableLaunchAgentTarget::LegacyOrigin,
+            ),
+            (
+                "/Users/alice/Downloads/Wenlan.app/Contents/MacOS/origin-app",
+                StableLaunchAgentTarget::Rejected,
+            ),
+        ] {
+            assert_eq!(
+                classify_stable_launch_agent_target(std::path::Path::new(exe)),
+                expected,
+                "{exe}"
+            );
+        }
     }
 
     #[test]
@@ -2058,28 +2026,6 @@ mod tests {
         assert_eq!(
             classify_stable_launch_agent_target(&exe),
             StableLaunchAgentTarget::Current
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn stable_launch_agent_target_detects_legacy_origin_app_bundle() {
-        assert_eq!(
-            classify_stable_launch_agent_target(std::path::Path::new(
-                "/Applications/Origin.app/Contents/MacOS/origin"
-            )),
-            StableLaunchAgentTarget::LegacyOrigin
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn stable_launch_agent_target_rejects_downloads_app_bundle() {
-        assert_eq!(
-            classify_stable_launch_agent_target(std::path::Path::new(
-                "/Users/alice/Downloads/Wenlan.app/Contents/MacOS/origin-app"
-            )),
-            StableLaunchAgentTarget::Rejected
         );
     }
 
@@ -2326,20 +2272,12 @@ mod tests {
         assert_eq!(run_at_login_state(&refused), LabelState::Unknown);
     }
 
-    /// DEFECT B. `run_at_login_state` used to run `launchctl list` once per
-    /// label and combine two readings taken at two different instants. launchd
-    /// loads and unloads jobs between those instants, so the pair state it
-    /// returned could be a state that was true at NO instant at all.
-    ///
-    /// The fixture makes the two instants disagree in the most damaging way:
-    /// at T1 only the server label is loaded, at T2 only the app label is. The
-    /// old two-call code asked about the server at T1 (loaded) and the app at
-    /// T2 (loaded) and concluded `Loaded` — Run at Login painted ON for a pair
-    /// that was never simultaneously loaded. One snapshot can only answer from
-    /// T1, where the app label is absent, so the honest answer is `NotLoaded`.
-    ///
-    /// The call count is asserted directly, because "one snapshot" is the fix
-    /// and a passing result with two calls would be a coincidence, not a fix.
+    /// The fixture makes two instants disagree in the most damaging way: at T1
+    /// only the server label is loaded, at T2 only the app label is. Asking
+    /// once per label would conclude `Loaded` for a pair that was never
+    /// simultaneously loaded; one snapshot can only answer from T1, where the
+    /// app label is absent, so the honest answer is `NotLoaded`. The call count
+    /// is asserted directly — a passing result with two calls is a coincidence.
     #[test]
     #[serial_test::serial]
     fn run_at_login_state_answers_both_labels_from_one_snapshot() {
@@ -2502,128 +2440,100 @@ mod tests {
         uninstall_app_plist(&mock).unwrap();
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn cleanup_legacy_server_plist_unloads_and_removes_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", tmp.path());
-        let plist = legacy_server_plist_path().unwrap();
+    /// The two legacy plists (app and server) each with their path, an owned
+    /// body, a foreign body, and their cleanup verb — the three cleanup tests
+    /// below assert the same contract for both.
+    #[allow(clippy::type_complexity)]
+    const LEGACY_CLEANUPS: [(
+        &str,
+        fn() -> Result<PathBuf>,
+        fn() -> String,
+        fn() -> String,
+        fn(&dyn LaunchctlExec) -> Result<()>,
+    ); 2] = [
+        (
+            "app",
+            legacy_app_plist_path,
+            owned_legacy_app_plist,
+            foreign_legacy_app_plist,
+            cleanup_legacy_app_plist,
+        ),
+        (
+            "server",
+            legacy_server_plist_path,
+            owned_legacy_server_plist,
+            foreign_legacy_server_plist,
+            cleanup_legacy_server_plist,
+        ),
+    ];
+
+    fn stage_legacy_plist(path_of: fn() -> Result<PathBuf>, body: fn() -> String) -> PathBuf {
+        let plist = path_of().unwrap();
         std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, owned_legacy_server_plist()).unwrap();
-
-        let mock = MockLaunchctl::default();
-        cleanup_legacy_server_plist(&mock).unwrap();
-
-        assert!(!plist.exists(), "legacy server plist removed");
-        let calls = mock.calls.lock().unwrap();
-        assert!(
-            calls
-                .iter()
-                .any(|c| c[0] == "unload" && c[1] == plist.to_string_lossy()),
-            "legacy server plist unloaded before removal"
-        );
+        std::fs::write(&plist, body()).unwrap();
+        plist
     }
 
     #[test]
     #[serial_test::serial]
-    fn cleanup_legacy_app_plist_unloads_and_removes_owned_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", tmp.path());
-        let plist = legacy_app_plist_path().unwrap();
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, owned_legacy_app_plist()).unwrap();
+    fn cleanup_legacy_plist_unloads_and_removes_owned_file() {
+        for (kind, path_of, owned, _foreign, cleanup) in LEGACY_CLEANUPS {
+            let tmp = tempfile::tempdir().unwrap();
+            std::env::set_var("HOME", tmp.path());
+            let plist = stage_legacy_plist(path_of, owned);
 
-        let mock = MockLaunchctl::default();
-        cleanup_legacy_app_plist(&mock).unwrap();
+            let mock = MockLaunchctl::default();
+            cleanup(&mock).unwrap();
 
-        assert!(!plist.exists(), "legacy app plist removed");
-        let calls = mock.calls.lock().unwrap();
-        assert!(
-            calls
-                .iter()
-                .any(|c| c[0] == "unload" && c[1] == plist.to_string_lossy()),
-            "legacy app plist unloaded before removal"
-        );
+            assert!(!plist.exists(), "legacy {kind} plist removed");
+            let calls = mock.calls.lock().unwrap();
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c[0] == "unload" && c[1] == plist.to_string_lossy()),
+                "legacy {kind} plist unloaded before removal"
+            );
+        }
     }
 
     #[test]
     #[serial_test::serial]
-    fn cleanup_legacy_app_plist_removes_owned_file_when_unload_fails() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", tmp.path());
-        let plist = legacy_app_plist_path().unwrap();
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, owned_legacy_app_plist()).unwrap();
+    fn cleanup_legacy_plist_removes_owned_file_when_unload_fails() {
+        for (kind, path_of, owned, _foreign, cleanup) in LEGACY_CLEANUPS {
+            let tmp = tempfile::tempdir().unwrap();
+            std::env::set_var("HOME", tmp.path());
+            let plist = stage_legacy_plist(path_of, owned);
 
-        let mock = MockLaunchctl {
-            unload_status: Mutex::new(1),
-            ..Default::default()
-        };
-        cleanup_legacy_app_plist(&mock).unwrap();
+            let mock = MockLaunchctl {
+                unload_status: Mutex::new(1),
+                ..Default::default()
+            };
+            cleanup(&mock).unwrap();
 
-        assert!(
-            !plist.exists(),
-            "owned legacy app plist removed even when unload fails"
-        );
+            assert!(
+                !plist.exists(),
+                "owned legacy {kind} plist removed even when unload fails"
+            );
+        }
     }
 
     #[test]
     #[serial_test::serial]
-    fn cleanup_legacy_server_plist_removes_owned_file_when_unload_fails() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", tmp.path());
-        let plist = legacy_server_plist_path().unwrap();
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, owned_legacy_server_plist()).unwrap();
+    fn cleanup_legacy_plist_preserves_foreign_file() {
+        for (kind, path_of, _owned, foreign, cleanup) in LEGACY_CLEANUPS {
+            let tmp = tempfile::tempdir().unwrap();
+            std::env::set_var("HOME", tmp.path());
+            let plist = stage_legacy_plist(path_of, foreign);
 
-        let mock = MockLaunchctl {
-            unload_status: Mutex::new(1),
-            ..Default::default()
-        };
-        cleanup_legacy_server_plist(&mock).unwrap();
+            let mock = MockLaunchctl::default();
+            cleanup(&mock).unwrap();
 
-        assert!(
-            !plist.exists(),
-            "owned legacy server plist removed even when unload fails"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn cleanup_legacy_app_plist_preserves_foreign_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", tmp.path());
-        let plist = legacy_app_plist_path().unwrap();
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, foreign_legacy_app_plist()).unwrap();
-
-        let mock = MockLaunchctl::default();
-        cleanup_legacy_app_plist(&mock).unwrap();
-
-        assert!(plist.exists(), "foreign legacy app plist preserved");
-        assert!(
-            mock.calls.lock().unwrap().is_empty(),
-            "foreign legacy app plist must not be unloaded"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn cleanup_legacy_server_plist_preserves_foreign_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", tmp.path());
-        let plist = legacy_server_plist_path().unwrap();
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, foreign_legacy_server_plist()).unwrap();
-
-        let mock = MockLaunchctl::default();
-        cleanup_legacy_server_plist(&mock).unwrap();
-
-        assert!(plist.exists(), "foreign legacy server plist preserved");
-        assert!(
-            mock.calls.lock().unwrap().is_empty(),
-            "foreign legacy server plist must not be unloaded"
-        );
+            assert!(plist.exists(), "foreign legacy {kind} plist preserved");
+            assert!(
+                mock.calls.lock().unwrap().is_empty(),
+                "foreign legacy {kind} plist must not be unloaded"
+            );
+        }
     }
 
     #[test]
@@ -2673,16 +2583,11 @@ mod tests {
         );
     }
 
-    /// DEFECT C, at the source. A server plist that is THERE and cannot be
-    /// READ says nothing about which data root launchd targets. The deleted
-    /// `current_server_plist_matches_selected_data_dir()` answered `false` for
-    /// it — the same `false` a plist that genuinely points elsewhere gets —
-    /// and a `pub` compatibility surface that cannot tell those apart is a trap
-    /// for the next caller. `server_plist_data_dir_match` keeps them separate,
-    /// and this pins the arm that has no measured content behind it.
-    ///
-    /// The unreadable fixture is a DIRECTORY at the plist path: `read_to_string`
-    /// refuses it on every platform, and with an error that is not `NotFound`.
+    /// A server plist that is THERE and cannot be READ says nothing about which
+    /// data root launchd targets, so it must not answer the same as one that
+    /// genuinely points elsewhere. The unreadable fixture is a DIRECTORY at the
+    /// plist path: `read_to_string` refuses it on every platform, with an error
+    /// that is not `NotFound`.
     #[test]
     #[serial_test::serial]
     fn a_server_plist_that_cannot_be_read_is_unknown_not_a_mismatch() {
@@ -2714,11 +2619,10 @@ mod tests {
         );
     }
 
-    /// The shipped defect: `launchctl unload` fails, the follow-up `launchctl
-    /// list` also fails, and the old code read that non-answer as "not
-    /// loaded" and deleted the plist — leaving a `KeepAlive` daemon running
-    /// with no registration left to unload it by. A could-not-measure must
-    /// keep the file and fail the uninstall.
+    /// `launchctl unload` fails and the follow-up `launchctl list` also fails.
+    /// Reading that non-answer as "not loaded" deletes the plist of a live
+    /// `KeepAlive` daemon, leaving no registration to unload it by: a
+    /// could-not-measure must keep the file and fail the uninstall.
     #[test]
     #[serial_test::serial]
     fn uninstall_server_plist_keeps_file_when_launchctl_cannot_be_measured() {
@@ -2756,9 +2660,8 @@ mod tests {
     }
 
     /// The same non-answer must not make the app think launchd owns the
-    /// daemon — and, round 3, must not be flattened into "measured not owned"
-    /// on the way out either. A log line inside the probe was not a tri-state;
-    /// the return value is.
+    /// daemon, and must not be flattened into "measured not owned" on the way
+    /// out either.
     #[test]
     #[serial_test::serial]
     fn launchd_ownership_is_not_claimed_from_an_unreadable_launchctl() {
@@ -2794,10 +2697,9 @@ mod tests {
 
     /// The other input to the ownership decision has the same shape. A plist
     /// that is not there is a measured "launchd does not own this"; a plist
-    /// that is there and cannot be READ says nothing about its contents, and
-    /// `read_to_string(...).ok()` used to make the two identical. A directory
-    /// at the plist path stands in for the unreadable file, because it fails
-    /// with a non-`NotFound` error on every platform this ships to.
+    /// that is there and cannot be READ says nothing about its contents. A
+    /// directory at the plist path stands in for the unreadable file, because
+    /// it fails with a non-`NotFound` error on every platform this ships to.
     #[test]
     #[serial_test::serial]
     fn an_unreadable_server_plist_is_not_a_measured_absence() {
@@ -2907,16 +2809,12 @@ mod tests {
         );
     }
 
-    /// DEFECT A, the parser half. A `launchctl list` whose stdout was cut
-    /// mid-write ends without a newline. Every other check in the parser passes
-    /// on such a body — the header is intact, every complete row is well
-    /// formed, there are more than ten of them and a `com.apple.*` job among
-    /// them — so before this the short read was invisible and the truncated
-    /// table answered as a complete one.
-    ///
-    /// The fixture cuts the stream at a point where the partial tail is still a
-    /// SHAPE-VALID row, which is the only cut the row checks cannot already
-    /// catch.
+    /// A `launchctl list` whose stdout was cut mid-write ends without a
+    /// newline, and every other parser check passes on such a body (intact
+    /// header, well-formed complete rows, more than ten of them, a
+    /// `com.apple.*` job among them). The fixture cuts at a point where the
+    /// partial tail is still a SHAPE-VALID row — the only cut the row checks
+    /// cannot already catch.
     #[test]
     fn a_launchctl_table_cut_mid_row_is_not_a_table() {
         let mut cut = launchctl_table(&[]);
@@ -2942,16 +2840,13 @@ mod tests {
         );
     }
 
-    /// DEFECT A, THE ONE THAT MATTERS. The defeating table Codex named: a valid
-    /// header, ten valid rows, a `com.apple.*` job among them, ending in a
-    /// newline — and cut before the Wenlan row. Every witness in
-    /// `launchctl_list_labels` passes. The job IS loaded.
-    ///
-    /// Before this, `label_state` answered `NotLoaded` from that table and
-    /// `unload_plist_or_verify_absent` deleted the plist of a live `KeepAlive`
-    /// job. The targeted `launchctl list <label>` — which has no table to
-    /// truncate — exits 0 for that job, and no bulk-derived absence may
-    /// outvote it.
+    /// The defeating table: a valid header, ten valid rows, a `com.apple.*` job
+    /// among them, ending in a newline — and cut before the Wenlan row. Every
+    /// witness in `launchctl_list_labels` passes, yet the job IS loaded.
+    /// Answering `NotLoaded` from it would delete the plist of a live
+    /// `KeepAlive` job. The targeted `launchctl list <label>` — which has no
+    /// table to truncate — exits 0 for that job, and no bulk-derived absence
+    /// may outvote it.
     #[test]
     #[serial_test::serial]
     fn a_truncated_table_can_never_authorize_deleting_a_plist() {
@@ -3149,12 +3044,11 @@ mod tests {
         );
     }
 
-    /// RANKED DEFECT 1, half one. The same unsound bulk negative, spent
-    /// OUTSIDE the deletion path: a table cut at a row boundary made
-    /// `launchd_owns_server_daemon` answer `DoesNot`, and `daemon_start` then
-    /// took the CLEAN spawn branch -- a second daemon started against a job
-    /// that was in fact loaded, and no `spawned_on_unknown_owner` latch to
-    /// show for it, because nothing had reported an unmeasurable anything.
+    /// The same unsound bulk negative, spent OUTSIDE the deletion path: a table
+    /// cut at a row boundary making `launchd_owns_server_daemon` answer
+    /// `DoesNot` sends `daemon_start` down the CLEAN spawn branch — a second
+    /// daemon against a job that is in fact loaded, with no
+    /// `spawned_on_unknown_owner` latch to show for it.
     #[test]
     #[serial_test::serial]
     fn a_truncated_table_does_not_make_launchd_disown_the_daemon() {
@@ -3202,10 +3096,9 @@ mod tests {
         );
     }
 
-    /// RANKED DEFECT 1, half two: the same table painted the Settings toggle.
-    /// "Run at Login: off" while launchd starts Wenlan every boot is a lie the
-    /// user acts on -- they turn it on, and the handover unloads and reloads a
-    /// job that was already there.
+    /// The same table also paints the Settings toggle. "Run at Login: off"
+    /// while launchd starts Wenlan every boot is a lie the user acts on -- they
+    /// turn it on, and the handover unloads and reloads a job already there.
     #[test]
     #[serial_test::serial]
     fn a_truncated_table_does_not_paint_run_at_login_off() {
@@ -3520,25 +3413,9 @@ mod tests {
         std::env::set_var("WENLAN_DATA_DIR", selected_data.path());
         std::env::remove_var("ORIGIN_DATA_DIR");
 
+        let original = server_plist_for_data_dir(live_data.path());
         let plist = server_plist_path().unwrap();
         std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        let original = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.wenlan.server</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>WENLAN_DATA_DIR</key>
-        <string>{}</string>
-    </dict>
-</dict>
-</plist>
-"#,
-            live_data.path().display()
-        );
         std::fs::write(&plist, &original).unwrap();
 
         let mock = MockLaunchctl::default();
@@ -3622,12 +3499,9 @@ mod tests {
         assert!(mock.calls.lock().unwrap().is_empty());
     }
 
-    /// Round 3, defect 5. `set_run_at_login(true)` stops the app's own sidecar
-    /// and then registers launchd against the same port. It used to log
-    /// `StillRunning` / `CouldNotMeasure` and register anyway, which is the
-    /// review's finding (c) exactly: the third value was produced, observed,
-    /// and then not acted on. Two owners, or a launchd restart loop, is the
-    /// outcome the log line described and did not prevent.
+    /// `set_run_at_login(true)` stops the app's own sidecar and then registers
+    /// launchd against the same port. Registering after a `StillRunning` /
+    /// `CouldNotMeasure` stop makes two owners, or a launchd restart loop.
     ///
     /// The rule is pinned here rather than through `set_run_at_login` itself
     /// because that function rejects any binary outside `/Applications/*.app`
@@ -3700,29 +3574,7 @@ mod tests {
         std::env::set_var("HOME", tmp.path());
         std::env::set_var("WENLAN_DATA_DIR", data.path());
         std::env::remove_var("ORIGIN_DATA_DIR");
-        let plist = server_plist_path().unwrap();
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(
-            &plist,
-            format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.wenlan.server</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>WENLAN_DATA_DIR</key>
-        <string>{}</string>
-    </dict>
-</dict>
-</plist>
-"#,
-                data.path().display()
-            ),
-        )
-        .unwrap();
+        write_server_plist_for(data.path());
 
         assert!(current_server_plist_exists());
         assert_eq!(server_plist_data_dir_match(), ServerPlistMatch::Matches);
@@ -3753,29 +3605,7 @@ mod tests {
             LaunchdOwnership::DoesNot
         );
 
-        let plist = server_plist_path().unwrap();
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(
-            &plist,
-            format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.wenlan.server</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>WENLAN_DATA_DIR</key>
-        <string>{}</string>
-    </dict>
-</dict>
-</plist>
-"#,
-                data.path().display()
-            ),
-        )
-        .unwrap();
+        write_server_plist_for(data.path());
         assert_eq!(server_plist_data_dir_match(), ServerPlistMatch::Matches);
 
         assert_eq!(
@@ -3796,29 +3626,7 @@ mod tests {
         std::env::set_var("HOME", tmp.path());
         std::env::set_var("WENLAN_DATA_DIR", selected_data.path());
         std::env::remove_var("ORIGIN_DATA_DIR");
-        let plist = server_plist_path().unwrap();
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(
-            &plist,
-            format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.wenlan.server</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>WENLAN_DATA_DIR</key>
-        <string>{}</string>
-    </dict>
-</dict>
-</plist>
-"#,
-                stale_data.path().display()
-            ),
-        )
-        .unwrap();
+        write_server_plist_for(stale_data.path());
 
         assert!(
             current_server_plist_exists(),
@@ -3899,29 +3707,7 @@ mod tests {
         std::env::remove_var("WENLAN_DATA_DIR");
         std::env::remove_var("ORIGIN_DATA_DIR");
 
-        let plist = server_plist_path().unwrap();
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(
-            &plist,
-            format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.wenlan.server</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>WENLAN_DATA_DIR</key>
-        <string>{}</string>
-    </dict>
-</dict>
-</plist>
-"#,
-                stale_data.path().display()
-            ),
-        )
-        .unwrap();
+        let plist = write_server_plist_for(stale_data.path());
         let original = std::fs::read(&plist).unwrap();
 
         let mock = MockLaunchctl::default();
@@ -3946,26 +3732,7 @@ mod tests {
         std::env::set_var("WENLAN_DATA_DIR", selected_data.path());
         std::env::remove_var("ORIGIN_DATA_DIR");
 
-        let plist = server_plist_path().unwrap();
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        let original = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.wenlan.server</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>WENLAN_DATA_DIR</key>
-        <string>{}</string>
-    </dict>
-</dict>
-</plist>
-"#,
-            stale_data.path().display()
-        );
-        std::fs::write(&plist, &original).unwrap();
+        let plist = write_server_plist_for(stale_data.path());
 
         let mock = MockLaunchctl {
             load_status: Mutex::new(1),

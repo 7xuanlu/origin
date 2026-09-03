@@ -354,13 +354,10 @@ pub async fn detect_mcp_clients_cmd() -> Result<Vec<crate::mcp_config::McpClient
 
 /// The client's config path, or a message naming why it could not be given.
 ///
-/// ROUND 5, DEFECT 4. The three commands below each used
-/// `client_config_path(..).ok_or("Unknown client type: {client_type}")?`, and
-/// `client_config_path` returned `None` for TWO different things: a client type
-/// this app does not know, and a home directory the platform would not report.
-/// The second was reported to the user as the first — "Unknown client type:
-/// claude_code", about a client that plainly exists — which sends them looking
-/// for a bug that is not there instead of at the lookup that failed.
+/// An `Option` here would collapse two different failures — a client type this
+/// app does not know, and a home directory the platform would not report — and
+/// report the second as the first ("Unknown client type: claude_code", about a
+/// client that plainly exists).
 fn client_config_path_or_message(client_type: &str) -> Result<std::path::PathBuf, String> {
     match crate::mcp_config::client_config_path(client_type) {
         crate::mcp_config::ClientConfigPath::Known(path) => Ok(path),
