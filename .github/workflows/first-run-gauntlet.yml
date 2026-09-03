@@ -23,6 +23,18 @@
 # The script exits nonzero when any of its checks FAILed but always leaves
 # findings.tsv behind; `python3 scripts/first-run/summary.py gauntlet-out`
 # renders the same Markdown the summary job does.
+#
+# GAUNTLET_HEALTH_TIMEOUT_SEC (windows-zip only, optional, default 5, floor 5).
+# The health probe's client timeout. A REFUSED loopback connect is not instant
+# on Windows -- it retries the SYN, and measured on the reference host it takes
+# ~2.05 s -- so a timeout shorter than the refusal turns every genuine refusal
+# into a Timeout, which the probe classifies as "could not measure" rather than
+# as a stopped daemon. That is the safe direction, but it means a runner slower
+# than the reference host FAILS `health-unreachable-after-off` and
+# `daemon-stopped-*` instead of passing them: unmeasured, never a pass. Raise
+# this if that happens. It cannot be lowered below the floor; a value under it
+# is reported and ignored, because a timeout beneath the refusal makes the
+# probe's negative unreachable in principle.
 
 name: First-run gauntlet
 
@@ -85,6 +97,15 @@ jobs:
       # place these unit tests run.
       - name: Self-test the gauntlet helper library
         run: bash scripts/first-run/lib.test.sh
+
+      # Same argument for the PowerShell half, which the four Windows channels
+      # source. It covers the two properties that make a green channel run mean
+      # something: an interpreter that is missing or fails is a FAIL row rather
+      # than a block that silently stops running, and Evaluate fails when a
+      # declared row never arrived. pwsh is preinstalled on GitHub runners.
+      - name: Self-test the gauntlet helper library (PowerShell)
+        shell: pwsh
+        run: ./scripts/first-run/lib.test.ps1
 
       # The release JSON is fetched once and reused by the inventory and parity
       # steps below so every job in the run talks about the same asset list.
@@ -352,19 +373,10 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Port 7878 precheck
-        run: |
-          mkdir -p "$GAUNTLET_OUT"
-          listeners="$(lsof -nP -iTCP:7878 -sTCP:LISTEN 2>/dev/null || true)"
-          detail="free"
-          st=INFO
-          if [ -n "$listeners" ]; then
-            # A busy port means later health/CLI checks could pass against a
-            # daemon this channel never installed — fail the leg as infra.
-            detail="BUSY: $(printf '%s' "$listeners" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000)"
-            st=FAIL
-          fi
-          printf '%s\tport-7878-precheck\t%s\t0\t%s\n' "$GAUNTLET_CHANNEL" "$st" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
-          echo "[$st] port-7878-precheck: $detail"
+        # One tri-state probe for every channel, POSIX and Windows. The ten
+        # copies this replaces recorded an unmeasurable port as "free".
+        shell: bash
+        run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
         run: bash scripts/first-run/macos-app.sh
       - name: Upload findings
@@ -396,19 +408,10 @@ jobs:
         with:
           node-version: 24
       - name: Port 7878 precheck
-        run: |
-          mkdir -p "$GAUNTLET_OUT"
-          listeners="$(lsof -nP -iTCP:7878 -sTCP:LISTEN 2>/dev/null || true)"
-          detail="free"
-          st=INFO
-          if [ -n "$listeners" ]; then
-            # A busy port means later health/CLI checks could pass against a
-            # daemon this channel never installed — fail the leg as infra.
-            detail="BUSY: $(printf '%s' "$listeners" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000)"
-            st=FAIL
-          fi
-          printf '%s\tport-7878-precheck\t%s\t0\t%s\n' "$GAUNTLET_CHANNEL" "$st" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
-          echo "[$st] port-7878-precheck: $detail"
+        # One tri-state probe for every channel, POSIX and Windows. The ten
+        # copies this replaces recorded an unmeasurable port as "free".
+        shell: bash
+        run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
         run: bash scripts/first-run/npx-setup.sh
       - name: Upload findings
@@ -437,19 +440,10 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Port 7878 precheck
-        run: |
-          mkdir -p "$GAUNTLET_OUT"
-          listeners="$(lsof -nP -iTCP:7878 -sTCP:LISTEN 2>/dev/null || true)"
-          detail="free"
-          st=INFO
-          if [ -n "$listeners" ]; then
-            # A busy port means later health/CLI checks could pass against a
-            # daemon this channel never installed — fail the leg as infra.
-            detail="BUSY: $(printf '%s' "$listeners" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000)"
-            st=FAIL
-          fi
-          printf '%s\tport-7878-precheck\t%s\t0\t%s\n' "$GAUNTLET_CHANNEL" "$st" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
-          echo "[$st] port-7878-precheck: $detail"
+        # One tri-state probe for every channel, POSIX and Windows. The ten
+        # copies this replaces recorded an unmeasurable port as "free".
+        shell: bash
+        run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
         run: bash scripts/first-run/brew.sh
       - name: Upload findings
@@ -485,37 +479,10 @@ jobs:
         with:
           node-version: 24
       - name: Port 7878 precheck
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p "$GAUNTLET_OUT"
-          listeners="$(lsof -nP -iTCP:7878 -sTCP:LISTEN 2>/dev/null || true)"
-          detail="free"
-          st=INFO
-          if [ -n "$listeners" ]; then
-            # A busy port means later health/CLI checks could pass against a
-            # daemon this channel never installed — fail the leg as infra.
-            detail="BUSY: $(printf '%s' "$listeners" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000)"
-            st=FAIL
-          fi
-          printf '%s\tport-7878-precheck\t%s\t0\t%s\n' "$GAUNTLET_CHANNEL" "$st" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
-          echo "[$st] port-7878-precheck: $detail"
-      - name: Port 7878 precheck (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path $env:GAUNTLET_OUT | Out-Null
-          $listeners = Get-NetTCPConnection -LocalPort 7878 -State Listen -ErrorAction SilentlyContinue
-          $detail = "free"
-          $st = "INFO"
-          if ($listeners) {
-            # A busy port means later health/CLI checks could pass against a
-            # daemon this channel never installed — fail the leg as infra.
-            $detail = "BUSY: " + (($listeners | ForEach-Object { "$($_.LocalAddress):$($_.LocalPort) pid=$($_.OwningProcess)" }) -join "|")
-            $st = "FAIL"
-          }
-          $line = "{0}`tport-7878-precheck`t{1}`t0`t{2}" -f $env:GAUNTLET_CHANNEL, $st, $detail
-          Add-Content -Path (Join-Path $env:GAUNTLET_OUT "findings.tsv") -Value $line -Encoding utf8
-          Write-Host "[$st] port-7878-precheck: $detail"
+        # One tri-state probe for every channel, POSIX and Windows. The ten
+        # copies this replaces recorded an unmeasurable port as "free".
+        shell: bash
+        run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
         if: runner.os != 'Windows'
         run: bash scripts/first-run/npx-mcp.sh
@@ -553,19 +520,10 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Port 7878 precheck
-        run: |
-          mkdir -p "$GAUNTLET_OUT"
-          listeners="$(lsof -nP -iTCP:7878 -sTCP:LISTEN 2>/dev/null || true)"
-          detail="free"
-          st=INFO
-          if [ -n "$listeners" ]; then
-            # A busy port means later health/CLI checks could pass against a
-            # daemon this channel never installed — fail the leg as infra.
-            detail="BUSY: $(printf '%s' "$listeners" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000)"
-            st=FAIL
-          fi
-          printf '%s\tport-7878-precheck\t%s\t0\t%s\n' "$GAUNTLET_CHANNEL" "$st" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
-          echo "[$st] port-7878-precheck: $detail"
+        # One tri-state probe for every channel, POSIX and Windows. The ten
+        # copies this replaces recorded an unmeasurable port as "free".
+        shell: bash
+        run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
         run: bash scripts/first-run/linux-install.sh
       - name: Upload findings
@@ -594,21 +552,10 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Port 7878 precheck
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path $env:GAUNTLET_OUT | Out-Null
-          $listeners = Get-NetTCPConnection -LocalPort 7878 -State Listen -ErrorAction SilentlyContinue
-          $detail = "free"
-          $st = "INFO"
-          if ($listeners) {
-            # A busy port means later health/CLI checks could pass against a
-            # daemon this channel never installed — fail the leg as infra.
-            $detail = "BUSY: " + (($listeners | ForEach-Object { "$($_.LocalAddress):$($_.LocalPort) pid=$($_.OwningProcess)" }) -join "|")
-            $st = "FAIL"
-          }
-          $line = "{0}`tport-7878-precheck`t{1}`t0`t{2}" -f $env:GAUNTLET_CHANNEL, $st, $detail
-          Add-Content -Path (Join-Path $env:GAUNTLET_OUT "findings.tsv") -Value $line -Encoding utf8
-          Write-Host "[$st] port-7878-precheck: $detail"
+        # One tri-state probe for every channel, POSIX and Windows. The ten
+        # copies this replaces recorded an unmeasurable port as "free".
+        shell: bash
+        run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
         shell: pwsh
         run: pwsh -File scripts/first-run/windows-zip.ps1
@@ -638,21 +585,10 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Port 7878 precheck
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path $env:GAUNTLET_OUT | Out-Null
-          $listeners = Get-NetTCPConnection -LocalPort 7878 -State Listen -ErrorAction SilentlyContinue
-          $detail = "free"
-          $st = "INFO"
-          if ($listeners) {
-            # A busy port means later health/CLI checks could pass against a
-            # daemon this channel never installed — fail the leg as infra.
-            $detail = "BUSY: " + (($listeners | ForEach-Object { "$($_.LocalAddress):$($_.LocalPort) pid=$($_.OwningProcess)" }) -join "|")
-            $st = "FAIL"
-          }
-          $line = "{0}`tport-7878-precheck`t{1}`t0`t{2}" -f $env:GAUNTLET_CHANNEL, $st, $detail
-          Add-Content -Path (Join-Path $env:GAUNTLET_OUT "findings.tsv") -Value $line -Encoding utf8
-          Write-Host "[$st] port-7878-precheck: $detail"
+        # One tri-state probe for every channel, POSIX and Windows. The ten
+        # copies this replaces recorded an unmeasurable port as "free".
+        shell: bash
+        run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
         shell: pwsh
         run: pwsh -File scripts/first-run/windows-nsis.ps1
@@ -682,19 +618,10 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Port 7878 precheck
-        run: |
-          mkdir -p "$GAUNTLET_OUT"
-          listeners="$(lsof -nP -iTCP:7878 -sTCP:LISTEN 2>/dev/null || true)"
-          detail="free"
-          st=INFO
-          if [ -n "$listeners" ]; then
-            # A busy port means later health/CLI checks could pass against a
-            # daemon this channel never installed — fail the leg as infra.
-            detail="BUSY: $(printf '%s' "$listeners" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000)"
-            st=FAIL
-          fi
-          printf '%s\tport-7878-precheck\t%s\t0\t%s\n' "$GAUNTLET_CHANNEL" "$st" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
-          echo "[$st] port-7878-precheck: $detail"
+        # One tri-state probe for every channel, POSIX and Windows. The ten
+        # copies this replaces recorded an unmeasurable port as "free".
+        shell: bash
+        run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
         run: bash scripts/first-run/cargo-mcp.sh
       - name: Upload findings
@@ -738,19 +665,10 @@ jobs:
         with:
           node-version: 24
       - name: Port 7878 precheck
-        run: |
-          mkdir -p "$GAUNTLET_OUT"
-          listeners="$(lsof -nP -iTCP:7878 -sTCP:LISTEN 2>/dev/null || true)"
-          detail="free"
-          st=INFO
-          if [ -n "$listeners" ]; then
-            # A busy port means later health/CLI checks could pass against a
-            # daemon this channel never installed — fail the leg as infra.
-            detail="BUSY: $(printf '%s' "$listeners" | tr '\t\r' '  ' | tr '\n' '|' | head -c 2000)"
-            st=FAIL
-          fi
-          printf '%s\tport-7878-precheck\t%s\t0\t%s\n' "$GAUNTLET_CHANNEL" "$st" "$detail" >> "$GAUNTLET_OUT/findings.tsv"
-          echo "[$st] port-7878-precheck: $detail"
+        # One tri-state probe for every channel, POSIX and Windows. The ten
+        # copies this replaces recorded an unmeasurable port as "free".
+        shell: bash
+        run: bash scripts/first-run/port-precheck.sh 7878
       - name: Run channel
         run: bash scripts/first-run/plugin-setup.sh
       - name: Upload findings

@@ -1,3 +1,24 @@
+# Installs the pinned LunarG Vulkan SDK for BUILDING wenlan on Windows.
+#
+# Scope, stated precisely because it is easy to overstate: the SDK is a
+# build-time prerequisite and that is established -- llama-cpp-sys-2's build
+# script panics without VULKAN_SDK, so no daemon crate compiles without it.
+# Nothing this script installs is redistributed to end users; the release
+# archive ships only the separately verified loader (vulkan-1.dll), staged by
+# scripts\stage-vulkan-loader-windows.ps1.
+#
+# What is NOT established, and must not be written anywhere as if it were:
+# that an end user with the loader but no vendor ICD is unaffected. The shipped
+# ZIP and NSIS channels are measured starting and answering /api/health on a
+# driverless hosted runner (.github/workflows/first-run-gauntlet.yml), but no
+# gate has ever loaded a GGUF there. The CPU plan in
+# crates/wenlan-core/src/engine.rs is built from a live device list reached only
+# after LlamaBackend::init() succeeds (engine.rs:33), so a backend-init failure
+# on a driverless machine never reaches it. The gate that would settle it: a
+# clean Windows VM or Sandbox with no vendor ICD, the real signed installer or
+# release ZIP, one real GGUF inference, asserting backend=cpu and gpu_layers=0.
+# See docs/windows-vulkan.md.
+
 param(
     [string]$Version = "1.4.350.0",
 

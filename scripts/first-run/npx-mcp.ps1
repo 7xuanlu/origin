@@ -40,6 +40,21 @@ function Remove-Retry([string]$Target) {
     }
 }
 
+# The rows this channel owes. $Spec is fixed above, so the npx row names are
+# known before the run; the MCP helper declares its own mcp-* rows.
+Expect-Rows -Names @(
+    # Recorded by the workflow's precheck step, before this script starts, and
+    # declared here because Evaluate now fails on an undeclared row.
+    "port-7878-precheck",
+    "download-zip",
+    "extract-zip",
+    "smoke-windows",
+    "health-version",
+    "npx-postinstall (npx -y $Spec --version)",
+    "npx-version-matches",
+    "mcp-roundtrip-driver"
+)
+
 try {
     New-Item -ItemType Directory -Force -Path $Bin, $DaemonData | Out-Null
     $Zip = Join-Path $Work "wenlan-windows-x64.zip"
@@ -75,8 +90,7 @@ try {
     $env:EXPECT_TOOL_COUNT = "29"
     $env:MCP_TOOLS = "capture,recall,brief"
     Info "mcp-command" "npx.cmd $($env:MCP_ARGS)"
-    & python (Join-Path $Helpers "mcp-roundtrip.py")
-    $global:LASTEXITCODE = 0
+    Check-Helper -Name "mcp-roundtrip-driver" -Interpreter "python" -Path (Join-Path $Helpers "mcp-roundtrip.py") -MustDeclare "^mcp-"
 } finally {
     if ($Daemon) { Stop-Process -Id $Daemon.Id -Force -ErrorAction SilentlyContinue }
     Get-Process -Name wenlan-server -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$Work*" } | Stop-Process -Force -ErrorAction SilentlyContinue
