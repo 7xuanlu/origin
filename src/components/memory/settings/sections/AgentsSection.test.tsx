@@ -23,6 +23,7 @@ vi.mock("../../RemoteAccessPanel", () => ({ RemoteAccessPanel: () => <div /> }))
 vi.mock("../../../connect/ClientSetupList", () => ({ default: () => <div /> }));
 
 import AgentsSection from "./AgentsSection";
+import { NO, YES } from "../../../../test/readings";
 
 function agent(name: string, agent_type: string, overrides: Partial<AgentConnection> = {}): AgentConnection {
   return {
@@ -143,11 +144,50 @@ describe("AgentsSection", () => {
   it("shows a pending client's restart note on the family row when the family is already connected", async () => {
     mocks.listAgents.mockResolvedValue([agent("codex", "mcp", { memory_count: 3 })]);
     mocks.detectMcpClients.mockResolvedValue([
-      { name: "Codex CLI", client_type: "codex_cli", config_path: "~/.codex/config.toml", detected: true, already_configured: true },
+      { name: "Codex CLI", client_type: "codex_cli", config_path: "~/.codex/config.toml", detected: YES, already_configured: YES, has_raw_entry: YES, has_raw_duplicate: NO, has_plugin: NO },
     ]);
     renderAgentsSection();
 
     const codexRow = (await screen.findByText("Codex")).closest("div.px-5") as HTMLElement;
     expect(within(codexRow).getByText("Restart Codex to activate")).toBeInTheDocument();
+  });
+  // Round 5, defect 4. The gate was `if (!client.already_configured) continue;`
+  // — and `!` on a read that FAILED is `true`, so an unreadable config was
+  // treated exactly like a config measured to have no Wenlan entry. Skipping
+  // is the right call for an unread client (a "restart to activate" note is a
+  // claim, and nothing was measured that supports it); this pins that it is
+  // reached by asking, not by a boolean falling the convenient way.
+  it("makes no restart claim about a client whose config could not be read", async () => {
+    mocks.listAgents.mockResolvedValue([agent("codex", "mcp", { memory_count: 3 })]);
+    mocks.detectMcpClients.mockResolvedValue([
+      {
+        name: "Codex CLI",
+        client_type: "codex_cli",
+        config_path: "~/.codex/config.toml",
+        detected: YES,
+        already_configured: { kind: "unreadable", error: "Access is denied. (os error 5)" },
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
+      },
+    ]);
+    renderAgentsSection();
+
+    const codexRow = (await screen.findByText("Codex")).closest("div.px-5") as HTMLElement;
+    expect(within(codexRow).queryByText("Restart Codex to activate")).not.toBeInTheDocument();
+  });
+
+  // The measured negative, for contrast: same shape, `no` instead of
+  // `unreadable`, same outcome — which is exactly why the two must be
+  // distinguishable somewhere other than here.
+  it("makes no restart claim about a client measured to have no entry", async () => {
+    mocks.listAgents.mockResolvedValue([agent("codex", "mcp", { memory_count: 3 })]);
+    mocks.detectMcpClients.mockResolvedValue([
+      { name: "Codex CLI", client_type: "codex_cli", config_path: "~/.codex/config.toml", detected: YES, already_configured: NO, has_raw_entry: NO, has_raw_duplicate: NO, has_plugin: NO },
+    ]);
+    renderAgentsSection();
+
+    const codexRow = (await screen.findByText("Codex")).closest("div.px-5") as HTMLElement;
+    expect(within(codexRow).queryByText("Restart Codex to activate")).not.toBeInTheDocument();
   });
 });

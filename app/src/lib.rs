@@ -733,7 +733,8 @@ pub fn run() {
                         &install_handle,
                         daemon_startup_preflight_ok,
                         pending,
-                    );
+                    )
+                    .await;
                 });
             }
 
@@ -1145,16 +1146,33 @@ pub fn run() {
                                 );
                                 std::process::exit(1);
                             });
-                            if tokio::time::timeout(
+                            // Three-way, not fire-and-forget: a SIGTERM'd app
+                            // that leaves its daemon behind is the shape the
+                            // next launch meets as a held port, and the only
+                            // place that fact can still be written down is
+                            // this log line.
+                            use crate::daemon_start::SidecarStopOutcome;
+                            match tokio::time::timeout(
                                 SIGTERM_STOP_LIMIT,
                                 crate::daemon_start::stop_sidecar(),
                             )
                             .await
-                            .is_err()
                             {
-                                log::warn!(
+                                Ok(SidecarStopOutcome::Ended) => {
+                                    log::info!("[app] the sidecar daemon ended")
+                                }
+                                Ok(SidecarStopOutcome::NoSidecar) => {
+                                    log::info!("[app] this app owned no sidecar")
+                                }
+                                Ok(SidecarStopOutcome::StillRunning { reason }) => log::error!(
+                                    "[app] the sidecar daemon is STILL RUNNING after SIGTERM teardown ({reason})"
+                                ),
+                                Ok(SidecarStopOutcome::CouldNotMeasure { reason }) => log::error!(
+                                    "[app] could not establish whether the sidecar daemon ended ({reason})"
+                                ),
+                                Err(_) => log::warn!(
                                     "[app] sidecar stop did not finish within {SIGTERM_STOP_LIMIT:?}; exiting anyway"
-                                );
+                                ),
                             }
                             handle.exit(0);
                         }

@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 /// principle be customized but is not exposed via any API today. Verified
 /// safe: this subdir is not a reserved ingest root and indexes normally.
 pub fn sources_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".wenlan/sources")
+    // Through `identity_paths`, not `dirs`, because `place_upload` below
+    // *creates* this directory: a unit test that reached it would file uploads
+    // into the developer's real `~/.wenlan`.
+    crate::identity_paths::home_base().join(".wenlan/sources")
 }
 
 /// Atomically place `src` into `sources_dir`: copy to a temp name on the same

@@ -245,18 +245,43 @@ describe("sources, page export, and knowledge wrappers", () => {
     });
   });
 
-  it("getWenlanMcpEntry calls the typed MCP entry command", async () => {
+  // CHANGED IN ROUND 6 WITH THE COMMAND. `get_wenlan_mcp_entry` used to
+  // resolve with a bare `{command, args}`, which is byte-for-byte what a
+  // search that could not determine one of its inputs returned as well — the
+  // D3 boundary defect. The report keeps the two apart, and the entry written
+  // into a user's config file stays exactly `{command, args}` (see
+  // `WenlanMcpEntryReport`).
+  it("getWenlanMcpEntry returns the entry and what the search could not determine", async () => {
     const { invoke } = await import("@tauri-apps/api/core");
     const { getWenlanMcpEntry } = await import("../tauri");
     (invoke as ReturnType<typeof vi.fn>).mockResolvedValue({
-      command: "npx",
-      args: ["-y", "wenlan-mcp"],
+      entry: { command: "npx", args: ["-y", "wenlan-mcp"] },
+      undetermined: [
+        {
+          input: "WENLAN_MCP_DEV_BIN",
+          blocked: "WENLAN_MCP_DEV_BIN",
+          error: "environment variable was not valid Unicode",
+        },
+      ],
     });
 
     const result = await getWenlanMcpEntry();
 
-    expect(result.command).toBe("npx");
-    expect(result.args).toEqual(["-y", "wenlan-mcp"]);
+    expect(result.entry.command).toBe("npx");
+    expect(result.entry.args).toEqual(["-y", "wenlan-mcp"]);
+    expect(result.undetermined).toHaveLength(1);
+    expect(result.undetermined[0].input).toBe("WENLAN_MCP_DEV_BIN");
     expect(invoke).toHaveBeenCalledWith("get_wenlan_mcp_entry");
+  });
+
+  it("writeMcpConfig returns the inputs the resolver could not determine", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const { writeMcpConfig } = await import("../tauri");
+    (invoke as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+    // An EMPTY array is a measurement — every resolver input was read — and it
+    // is a different value from a non-empty one, which is the whole point.
+    await expect(writeMcpConfig("cursor")).resolves.toEqual([]);
+    expect(invoke).toHaveBeenCalledWith("write_mcp_config", { clientType: "cursor" });
   });
 });
