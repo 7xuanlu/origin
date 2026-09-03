@@ -3265,6 +3265,61 @@ def _powershell() -> str | None:
 FixtureResult = tuple[str, str | None, str | None]
 
 
+def _authenticode_hashed_byte(data: bytes) -> tuple[int | None, str]:
+    """A file offset Authenticode covers, or why this fixture has none.
+
+    The first cut of the tampered-installer row wrote `data[4096:4100]`, which
+    is two assumptions wearing one line. Python slice assignment past the end
+    of a bytearray APPENDS, so on a host whose smallest signed binary is under
+    4 KiB -- and the probe sorts by size ascending, so it goes looking for one
+    -- the tampered-in-the-middle fixture silently became a second copy of the
+    byte-appended fixture: same bytes, same NotSigned, and the row that exists
+    to prove the HashMismatch branch is reachable was re-measuring the row
+    above it. A catalog-signed pick fails the same way for a different reason:
+    it carries no embedded certificate table, so nothing done to it can
+    produce a hash mismatch.
+
+    Both are answered from the file's own geometry instead of a constant.
+    Parse the PE header, find the certificate table, and return an offset that
+    is inside the hashed region and past the spans Authenticode excludes.
+    """
+    if len(data) < 0x40:
+        return None, f"the fixture is {len(data)} bytes, too short for a PE header"
+    pe = int.from_bytes(data[0x3C:0x40], "little")
+    if pe + 0x78 > len(data) or data[pe : pe + 4] != b"PE\0\0":
+        return None, "the fixture has no PE signature where its DOS header points"
+    magic = int.from_bytes(data[pe + 24 : pe + 26], "little")
+    if magic == 0x20B:  # PE32+
+        directories = pe + 24 + 112
+    elif magic == 0x10B:  # PE32
+        directories = pe + 24 + 96
+    else:
+        return None, f"unrecognised PE optional-header magic 0x{magic:x}"
+    # IMAGE_DIRECTORY_ENTRY_SECURITY is index 4, and it is the one directory
+    # whose first field is a FILE OFFSET rather than an RVA.
+    entry = directories + 4 * 8
+    if entry + 8 > len(data):
+        return None, "the PE data directory is truncated before the security entry"
+    table = int.from_bytes(data[entry : entry + 4], "little")
+    size = int.from_bytes(data[entry + 4 : entry + 8], "little")
+    if table == 0 or size == 0:
+        return None, (
+            "the fixture is catalog-signed -- it carries no embedded certificate "
+            "table -- so a modified copy of it reports NotSigned, and a hash "
+            "mismatch is not reachable through this file at all"
+        )
+    # Everything ahead of the certificate table is hashed except the checksum
+    # field and this directory entry, both of which live in the headers. The
+    # last byte before the table is past both.
+    offset = min(table, len(data)) - 1
+    if offset <= entry + 8:
+        return None, (
+            f"the certificate table starts at {table}, which leaves no hashed "
+            "byte after the header fields Authenticode excludes"
+        )
+    return offset, ""
+
+
 def _signed_fixture(shell: str, work: str) -> FixtureResult:
     """A real Authenticode-signed binary on this host, its publisher, and why not.
 
@@ -3293,6 +3348,19 @@ def _signed_fixture(shell: str, work: str) -> FixtureResult:
         "Write-Output 'NO-SUPPORT cmdlet-unusable'; exit 2 }\n"
         "$roots = @([System.Environment]::SystemDirectory, $PSHOME) |\n"
         "  Where-Object { $_ } | Select-Object -Unique\n"
+        # An embedded signature is PREFERRED, not required, so this is the
+        # first valid file seen rather than the answer. Measured on one
+        # Windows 11 host: 613 of the 622 validly signed .exe files under
+        # these roots are CATALOG-signed, which carries no certificate
+        # table of its own -- a modified copy of one reports NotSigned and
+        # can never report HashMismatch. Taking the first valid file made
+        # which kind the caller got a matter of luck, and the tampered
+        # -installer row then read that luck as a regression in the
+        # shipped step. Requiring an embedded one instead would answer
+        # NONE-FOUND on a host that has none in range, and this suite
+        # treats NONE-FOUND as a broken probe. Prefer, fall back, and let
+        # the one row that needs the certificate table say so itself.
+        "$fallback = $null\n"
         "foreach ($root in $roots) {\n"
         "  if (-not (Test-Path -LiteralPath $root)) { continue }\n"
         # Smallest first: the fixture gets read, patched and re-hashed five times.
@@ -3306,10 +3374,12 @@ def _signed_fixture(shell: str, work: str) -> FixtureResult:
         "      [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, "
         "$false)\n"
         "    if (-not $n) { continue }\n"
-        "    Write-Output \"FIXTURE`t$($f.FullName)`t$n\"\n"
-        "    exit 0\n"
+        "    $line = \"FIXTURE`t$($f.FullName)`t$n\"\n"
+        "    if ($s.SignatureType -eq 'Authenticode') { Write-Output $line; exit 0 }\n"
+        "    if (-not $fallback) { $fallback = $line }\n"
         "  }\n"
         "}\n"
+        "if ($fallback) { Write-Output $fallback; exit 0 }\n"
         "Write-Output 'NONE-FOUND'\n"
         "exit 1\n",
         encoding="utf-8",
@@ -3468,7 +3538,22 @@ def authenticode_behaviour_violations(release: str) -> AuthenticodeRun:
                 if kind == "notsigned":
                     data += b"X"
                 elif kind == "mismatch":
-                    data[4096:4100] = b"ZZZZ"
+                    offset, why = _authenticode_hashed_byte(bytes(data))
+                    if offset is None:
+                        unchecked.append(f"{description}: {why}")
+                        continue
+                    was, before = data[offset], len(data)
+                    data[offset] ^= 0xFF
+                    # Measured, not assumed. A fixture that did not actually
+                    # change is this branch's own version of the defect the
+                    # row exists to catch, and without this check it reaches
+                    # the runner looking like a signed file that stayed valid.
+                    if len(data) != before or data[offset] == was:
+                        violations.append(
+                            f"{description}: patching byte {offset} of the "
+                            f"{before}-byte fixture did not change it"
+                        )
+                        continue
                 elif kind in AUTHENTICODE_SUBSTITUTED_KINDS:
                     # The OPERATOR is matched, not assumed. A mutation that
                     # swaps -cne for -ne must leave both rows buildable, or the
@@ -3530,6 +3615,31 @@ def authenticode_behaviour_violations(release: str) -> AuthenticodeRun:
                     f"{output.strip()[:400]!r}"
                 )
             elif required not in output:
+                # A row can exit for the right reason and still not prove its
+                # own claim. The tampered-installer row asks for HashMismatch;
+                # if this host's signed binary refuses with some other status
+                # the gate did hold -- the installer was rejected -- but the
+                # HashMismatch branch went unexercised. That is the third
+                # state, and it is reported with the status that actually came
+                # back, so a reader can tell it from both a pass and a
+                # regression. The row also leaves `ran`, which is what stops
+                # the mutation loop below from crediting it with catching
+                # anything.
+                status = re.search(r"^Status: (\S+)", output, re.MULTILINE)
+                if (
+                    kind == "mismatch"
+                    and status is not None
+                    and status.group(1) != "HashMismatch"
+                    and "Authenticode status is" in output
+                ):
+                    unchecked.append(
+                        f"{description}: this host's fixture reports "
+                        f"{status.group(1)!r} when tampered rather than "
+                        "'HashMismatch'; the step refused it either way, but "
+                        "nothing here exercised the hash-mismatch branch"
+                    )
+                    ran.discard(kind)
+                    continue
                 failed.add(kind)
                 violations.append(
                     f"Authenticode step: {description}: exited {result.returncode} "
