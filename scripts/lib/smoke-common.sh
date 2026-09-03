@@ -267,7 +267,7 @@ smoke_assert_isolation() {
         fail "pages readback mismatch: got [$reported] want [{\"path\":\"$NATIVE_PAGES_DIR\"}]"
     # One process, no pipe: `sed … | head -1` CAN SIGPIPE sed, and under
     # pipefail that is indistinguishable from a parse failure.
-    logged_root="$(sed -n '/Wenlan data root: /{s/.*Wenlan data root: //;s/\r$//;p;q;}' "$DATA_DIR/daemon.log")" ||
+    logged_root="$(sed -n '/Wenlan data root: /{s/.*Wenlan data root: //;s/\r$//;s/ (database [^)]*)$//;p;q;}' "$DATA_DIR/daemon.log")" ||
         fail "extracting the logged data root FAILED — unmeasured, not a match"
     [ -n "$logged_root" ] || fail "the daemon log has no 'Wenlan data root:' line at all"
     if (( HOST_IS_WINDOWS == 1 )); then
