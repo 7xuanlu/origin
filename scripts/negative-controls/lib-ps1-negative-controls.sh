@@ -219,7 +219,14 @@ if s.count(old) != 1:
     sys.exit('nc1 anchor matched %d times' % s.count(old))
 io.open(p, 'w', encoding='utf-8', newline='').write(s.replace(old, new))
 PY
-run_control nc1-evaluate-ignores-missing "$work/nc1.py" one-missing only-info-rows shadowing-row-names
+# carried-row-declared-the-old-way is on the roster because it is defended by
+# this same return: it declares a row that is recorded above the mark and can
+# therefore never be balanced, so its whole assertion is that the suite exits
+# 1 for a MISSING row. Tolerate missing rows and it goes green -- correct
+# blast radius, and naming it is what keeps the pin honest.
+run_control nc1-evaluate-ignores-missing "$work/nc1.py" \
+    one-missing only-info-rows shadowing-row-names \
+    carried-row-declared-the-old-way
 
 # --- NC2: the no-declaration guard is removed -------------------------------
 cat > "$work/nc2.py" <<'PY'
@@ -267,7 +274,8 @@ PY
 run_control nc3-bare-interpreter "$work/nc3.py" \
     helper-interpreter-missing helper-nonzero-exit helper-ok \
     helper-exits-0-declaring-nothing helper-declares-required-prefix \
-    helper-reuses-stale-declaration helper-declaration-count-unreadable
+    helper-reuses-stale-declaration helper-declaration-count-unreadable \
+    declaration-count-lookup-answers-absent
 
 # --- NC4: Evaluate goes back to $hash.Keys, which a row named Keys shadows ---
 cat > "$work/nc4.py" <<'PY'
@@ -343,24 +351,29 @@ run_control nc7-case-insensitive-row-names "$work/nc7.py" case-differs-from-decl
 # helper that returns before its own Expect-Rows is a PASS with nothing owed.
 # Only the assertion is reverted, not the count message, so the control stays
 # pinned to the assertion rather than to the log line beside it.
+# Cut between boundary lines rather than quoting the throw: the message inside
+# this block carries the diagnosis and gets rewritten (it has been reordered
+# once already, to put the verdict ahead of two absolute paths that Record-Row
+# truncates), and a whole-block anchor silently stops applying each time.
 cat > "$work/nc8.py" <<'PY'
 import io, sys
 p = sys.argv[1]
 s = io.open(p, encoding='utf-8', newline='').read()
-old = '''            if ($added -le 0) {
-                throw ("$Path exited 0 but declared no NEW row matching '$MustDeclare' " +
-                       "(before=$before after=$after); it cannot have reached its own " +
-                       "Expect-Rows, so nothing it was supposed to check is owed. " +
-                       "Output in $helperLog")
-            }
-'''
+head = '            if ($added -le 0) {\n'
+close = '\n            }\n'
+if s.count(head) != 1:
+    sys.exit('nc8 anchor matched %d times' % s.count(head))
+start = s.index(head)
+end = s.index(close, start) + len(close)
 new = '            # INJECTED nc8: a helper that declared nothing is accepted\n'
-if s.count(old) != 1:
-    sys.exit('nc8 anchor matched %d times' % s.count(old))
-io.open(p, 'w', encoding='utf-8', newline='').write(s.replace(old, new))
+io.open(p, 'w', encoding='utf-8', newline='').write(s[:start] + new + s[end:])
 PY
+# declaration-count-lookup-answers-absent is on the roster for the same reason
+# it is on nc9's: its whole assertion is the throw this control deletes, so
+# accepting a helper that declared nothing turns its [FAIL] driver row green.
 run_control nc8-helper-need-not-declare "$work/nc8.py" \
-    helper-exits-0-declaring-nothing helper-reuses-stale-declaration
+    helper-exits-0-declaring-nothing helper-reuses-stale-declaration \
+    declaration-count-lookup-answers-absent
 
 # --- nc9: the declaration may be the PREVIOUS run's -------------------------
 # Keeps the whole "must declare" assertion and reverts only the before/after
@@ -381,10 +394,14 @@ PY
 # helper-declaration-count-unreadable is in the blast radius on purpose: with
 # the before-count gone there is nothing to fail EARLY on an unreadable
 # expected.tsv, so the row still fails but for the after-count's reason and with
-# the wrong diagnosis. The named-cases pin says so out loud rather than letting
-# the two controls quietly overlap.
+# the wrong diagnosis. declaration-count-lookup-answers-absent is there for the
+# same reason from the other side: it asserts the before-count reads 1 for a
+# lookup that answered, and a hard-coded 0 is exactly the stale-declaration
+# defect this control reverts. The named-cases pin says so out loud rather than
+# letting the controls quietly overlap.
 run_control nc9-stale-declaration-accepted "$work/nc9.py" \
-    helper-reuses-stale-declaration helper-declaration-count-unreadable
+    helper-reuses-stale-declaration helper-declaration-count-unreadable \
+    declaration-count-lookup-answers-absent
 
 # --- nc10: a row name may carry a tab ---------------------------------------
 # Both ledgers are unquoted TSV, so a tab in a name writes its own status
