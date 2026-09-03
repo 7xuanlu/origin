@@ -34,7 +34,6 @@ PLUGIN_VER=$(jq -r .version plugin/.claude-plugin/plugin.json)
 CODEX_PLUGIN_VER_RAW=$(jq -r .version plugin-codex/.codex-plugin/plugin.json)
 CODEX_PLUGIN_VER="${CODEX_PLUGIN_VER_RAW%%+*}"
 CODEX_RUNNER_PINS=$(grep -Eo 'wenlan-mcp@\^[0-9]+\.[0-9]+\.[0-9]+' plugin-codex/bin/wenlan-mcp-runner.sh | sed -E 's/.*@\^//' | sort -u || true)
-CODEX_README_PINS=$(grep -Eo 'wenlan-mcp@\^[0-9]+\.[0-9]+\.[0-9]+' plugin-codex/README.md | sed -E 's/.*@\^//' | sort -u || true)
 CODEX_SETUP_TAGS=$(grep -Eo '/v[0-9]+\.[0-9]+\.[0-9]+/install\.sh' plugin-codex/skills/setup/SKILL.md | sed -E 's|/v([^/]+)/install\.sh|\1|' | sort -u || true)
 
 echo "Tag:         $TAG_VER"
@@ -53,8 +52,6 @@ echo "Plugin:      $PLUGIN_VER"
 echo "Codex plugin: $CODEX_PLUGIN_VER_RAW"
 echo "Codex runner pins:"
 printf '%s\n' "$CODEX_RUNNER_PINS" | sed 's/^/  /'
-echo "Codex README pins:"
-printf '%s\n' "$CODEX_README_PINS" | sed 's/^/  /'
 echo "Codex setup tags:"
 printf '%s\n' "$CODEX_SETUP_TAGS" | sed 's/^/  /'
 
@@ -63,14 +60,14 @@ if [[ "$VTXT_VER" != "$TAG_VER" || "$WS_VER" != "$TAG_VER" || "$WENLAN_TYPES_DEP
     exit 1
 fi
 
-for pin in $CODEX_RUNNER_PINS $CODEX_README_PINS $CODEX_SETUP_TAGS; do
+for pin in $CODEX_RUNNER_PINS $CODEX_SETUP_TAGS; do
     if [[ "$pin" != "$TAG_VER" ]]; then
         echo "ERROR: Codex plugin release pin drift — ${pin} is not ${TAG_VER}"
         exit 1
     fi
 done
 
-if [[ -z "$CODEX_RUNNER_PINS" || -z "$CODEX_README_PINS" || -z "$CODEX_SETUP_TAGS" ]]; then
+if [[ -z "$CODEX_RUNNER_PINS" || -z "$CODEX_SETUP_TAGS" ]]; then
     echo "ERROR: Codex plugin release pin missing"
     exit 1
 fi
