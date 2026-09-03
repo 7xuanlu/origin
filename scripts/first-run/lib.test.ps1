@@ -178,6 +178,46 @@ if ($Case) {
                 Write-Output "refused-stub -> negative"
             }
         }
+        "check-captures-mixed-output-types" {
+            # Check formats a [string] with a direct cast and sends everything
+            # else through Out-String. The two must produce the same text or a
+            # detail column, a check log and every -Expect substring quietly
+            # change shape. The reference here IS the Out-String expression,
+            # run over the same objects, and the comparison is its own row.
+            #
+            # The 400-character line is the case that matters: Out-String
+            # formats through the host, and a host that wrapped a long line
+            # would make the two disagree exactly where a long throw message or
+            # a long native stdout line lands.
+            Expect-Rows -Names @("mixed-output", "mixed-output-matches-out-string")
+            $emit = {
+                "plain string"
+                "trailing space and tab   `t"
+                ("x" * 400)
+                "two`nlines"
+                ""
+                42
+                3.5
+                [pscustomobject]@{ Name = "obj"; Value = 7 }
+                (New-Object System.Version -ArgumentList @(1, 2, 3))
+            }
+            $reference = Escape-Detail (((& $emit) | ForEach-Object { ($_ | Out-String).TrimEnd() }) -join "`n")
+            Check -Name "mixed-output" -Script { & $emit }
+            $recorded = "<no mixed-output row was recorded>"
+            foreach ($r in @(Get-Content -LiteralPath $script:GauntletTsv)) {
+                $c = $r -split "`t"
+                if ($c.Count -ge 5 -and $c[1] -ceq "mixed-output") { $recorded = $c[4] }
+            }
+            Check -Name "mixed-output-matches-out-string" -Script {
+                if ($recorded -cne $reference) {
+                    throw ("what Check captured and what " + '($_ | Out-String).TrimEnd()' +
+                           " produces are not the same text" +
+                           "`n  captured : " + $recorded +
+                           "`n  reference: " + $reference)
+                }
+                Write-Output "capture is byte-identical to Out-String over strings, numbers and objects"
+            }
+        }
         "helper-declares-required-prefix" {
             # The positive half of the same property: a helper that does reach
             # its Expect-Rows passes. Without this case, an assertion that
@@ -618,6 +658,15 @@ Assert-Case -Name "health-reset-is-not-a-negative" -ExpectExit 0 `
 Assert-Case -Name "health-refused-stub-is-a-negative" -ExpectExit 0 `
     -ExpectText @("[PASS] refusal-stub-classified", "refused-stub -> negative") `
     -RejectText @("GONE")
+
+# Check's output capture takes a fast path for [string] and the format engine
+# for everything else. Strings, numbers and an object go through both here and
+# the row FAILS on any difference, so the fast path cannot silently reshape a
+# detail column, a check log or an -Expect substring.
+Assert-Case -Name "check-captures-mixed-output-types" -ExpectExit 0 `
+    -ExpectText @("[PASS] mixed-output-matches-out-string",
+                  "capture is byte-identical to Out-String") `
+    -RejectText @("GONE", "DRIFT")
 
 Assert-Case -Name "helper-declares-required-prefix" -ExpectExit 0 `
     -ExpectText @("[PASS] driver", "PASS cli-roundtrip", "declared 1 new '^cli-' row(s)") `

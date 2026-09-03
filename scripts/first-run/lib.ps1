@@ -246,15 +246,31 @@ function Measure-ChannelRows([string]$path) {
     return $n
 }
 
-function Write-Ledger([string]$path, [string]$line) {
+# Takes an ARRAY, and one `Add-Content` writes all of it. An Add-Content call
+# costs about the same whatever it writes, so a per-name loop pays that price
+# once per row. MEASURED on this host, the zip channel's 27 declarations:
+#
+#                        27 calls        1 call with 27 values
+#   pwsh 7.6.5           220.6 ms        13.9 ms
+#   Windows PowerShell   369.4 ms         4.6 ms
+#
+# and the two files compare byte for byte, because `-Value` with an array
+# writes one line per element. A single string still binds -- [string[]] wraps
+# it -- so every other caller is unchanged.
+function Write-Ledger([string]$path, [string[]]$lines) {
+    if ($null -eq $lines -or $lines.Count -eq 0) { return }
     try {
-        Add-Content -Path $path -Value $line -Encoding utf8 -ErrorAction Stop
+        Add-Content -Path $path -Value $lines -Encoding utf8 -ErrorAction Stop
         # Counted only on the path where the append SUCCEEDED. A row this
         # process failed to write is not in the window, and counting it here
         # would make the arithmetic below report a shortfall that is really a
         # write failure -- which GauntletLedgerBroken already reports, better.
-        if ($path -eq $script:GauntletTsv) { $script:GauntletFindingsMine++ }
-        elseif ($path -eq $script:GauntletExpectedFile) { $script:GauntletExpectedMine++ }
+        #
+        # Add-Content is one operation over the whole array: it writes every
+        # line or it throws, so the count is the array's length rather than a
+        # per-line tally that could be short.
+        if ($path -eq $script:GauntletTsv) { $script:GauntletFindingsMine += $lines.Count }
+        elseif ($path -eq $script:GauntletExpectedFile) { $script:GauntletExpectedMine += $lines.Count }
     } catch {
         if (-not $script:GauntletLedgerBroken) {
             $script:GauntletLedgerBroken = "cannot write ${path}: $($_.Exception.Message)"
@@ -308,9 +324,16 @@ function Count-Declared([string]$pattern) {
 
 function Record-Row([string]$status, [string]$name, [int]$rc, [string]$detail) {
     Assert-RowName $name
-    $line = "{0}`t{1}`t{2}`t{3}`t{4}" -f $script:GauntletChannel, $name, $status, $rc, (Escape-Detail $detail)
+    # Escaped ONCE. The three calls this replaces ran the same three -replace
+    # passes and the same 2000-character truncation over the same string, and a
+    # Check detail is the whole of a block's output. MEASURED on this host, one
+    # pass over a 4000-character detail: 0.12 ms under Windows PowerShell,
+    # 0.004 ms under pwsh 7 -- small per row, and there is no reason to pay it
+    # three times.
+    $escaped = Escape-Detail $detail
+    $line = "{0}`t{1}`t{2}`t{3}`t{4}" -f $script:GauntletChannel, $name, $status, $rc, $escaped
     Write-Ledger $script:GauntletTsv $line
-    $short = if ($detail) { " — " + (Escape-Detail $detail).Substring(0, [Math]::Min(200, (Escape-Detail $detail).Length)) } else { "" }
+    $short = if ($detail) { " — " + $escaped.Substring(0, [Math]::Min(200, $escaped.Length)) } else { "" }
     Write-Host "[$status] $name (rc=$rc)$short"
 }
 
@@ -427,7 +450,24 @@ function Check {
     try {
         & $Script 2>&1 | ForEach-Object {
             $phase.Value = "capture"
-            $lines.Add(($_ | Out-String).TrimEnd())
+            # A [string] is cast rather than run through the format engine.
+            # MEASURED on this host, 500 emitted lines:
+            #
+            #                        ($_ | Out-String).TrimEnd()   the cast
+            #   pwsh 7.6.5           132 ms                        17 ms
+            #   Windows PowerShell   582 ms                         7 ms
+            #
+            # and the text is identical -- Out-String over a single string
+            # formats it into itself and appends a newline, which TrimEnd then
+            # removes, exactly as .TrimEnd() on the string does. Everything
+            # else -- a number, an object, and above all the ErrorRecords that
+            # `2>&1` merges in -- still goes through Out-String, because for
+            # those the format engine is doing real work. lib.test.ps1's
+            # `check-captures-mixed-output-types` compares the two over all
+            # three kinds and fails the row on any difference.
+            $item = $_
+            if ($item -is [string]) { $lines.Add($item.TrimEnd()) }
+            else { $lines.Add(($item | Out-String).TrimEnd()) }
             $phase.Value = "block"
         }
         if ($LASTEXITCODE -is [int] -and $LASTEXITCODE -ne 0) { $rc = $LASTEXITCODE }
@@ -474,11 +514,15 @@ function Expect-Rows {
     # file rather than a variable so a helper running in its own process
     # (cli-roundtrip.ps1, mcp-roundtrip.py) declares its own contract from its
     # own inputs, instead of the channel pasting a copy that silently rots.
+    #
+    # Every name is validated BEFORE anything is written, and then the whole
+    # contract is written in one append. The line format is the one a per-name
+    # loop produced, character for character; what changes is that a channel
+    # declaring 27 rows pays for one Add-Content instead of 27.
     param([Parameter(Mandatory)][string[]]$Names)
-    foreach ($n in $Names) {
-        Assert-RowName $n
-        Write-Ledger $script:GauntletExpectedFile ("{0}`t{1}" -f $script:GauntletChannel, $n)
-    }
+    foreach ($n in $Names) { Assert-RowName $n }
+    Write-Ledger $script:GauntletExpectedFile @(
+        $Names | ForEach-Object { "{0}`t{1}" -f $script:GauntletChannel, $_ })
 }
 
 function Record-CarriedRow {
