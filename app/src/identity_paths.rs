@@ -296,7 +296,13 @@ mod tests {
     #[test]
     fn app_data_dir_picks_the_root_that_holds_app_state() {
         // (case, `wenlan` root, `origin` root, the root that must win)
-        let cases: [(&str, Option<&[&str]>, Option<&[&str]>, &str); 6] = [
+        type Case = (
+            &'static str,
+            Option<&'static [&'static str]>,
+            Option<&'static [&'static str]>,
+            &'static str,
+        );
+        let cases: [Case; 6] = [
             (
                 "current absent, legacy config",
                 None,
