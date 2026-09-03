@@ -2014,7 +2014,7 @@ async fn fts_hardening_ab_dualbench() {
             .await
             .unwrap();
             let off = temp_env::async_with_vars(
-                [("WENLAN_ENABLE_FTS_HARDENING", None::<&str>)],
+                [("WENLAN_ENABLE_FTS_HARDENING", Some("0"))],
                 run_locomo_eval_from_db(&db, &fx),
             )
             .await
@@ -2047,7 +2047,7 @@ async fn fts_hardening_ab_dualbench() {
             .await
             .unwrap();
             let off = temp_env::async_with_vars(
-                [("WENLAN_ENABLE_FTS_HARDENING", None::<&str>)],
+                [("WENLAN_ENABLE_FTS_HARDENING", Some("0"))],
                 run_longmemeval_eval_from_db(&db, &fx),
             )
             .await
@@ -2592,14 +2592,15 @@ async fn paired_run_cached_feature(feature: &str, flag: &str) {
     use wenlan_core::eval::locomo::run_locomo_eval_from_db_collect;
     use wenlan_core::eval::longmemeval::run_longmemeval_eval_from_db_collect;
     let root = resolve_scenario_db_root_from_harness();
-    // WENLAN_GRAPH_MEMORY_STREAM is default-ON since 2026-06-10, so its OFF arm
-    // must explicitly disable it ("0"); every other paired flag is opt-in (OFF =
-    // unset).
-    let off_val: Option<&str> = if flag == "WENLAN_GRAPH_MEMORY_STREAM" {
-        Some("0")
-    } else {
-        None
-    };
+    // WENLAN_GRAPH_MEMORY_STREAM (since 2026-06-10) and WENLAN_ENABLE_FTS_HARDENING
+    // (since T14) are default-ON, so their OFF arm must explicitly disable it
+    // ("0"); every other paired flag is opt-in (OFF = unset).
+    let off_val: Option<&str> =
+        if flag == "WENLAN_GRAPH_MEMORY_STREAM" || flag == "WENLAN_ENABLE_FTS_HARDENING" {
+            Some("0")
+        } else {
+            None
+        };
     // Seed-vs-stream mutual exclusion: the seeded branch is reachable only when
     // !(allow_graph_stream && graph_memory_stream_enabled()), so with the stream
     // default-ON a graph_seed A/B routes BOTH arms through the stream (byte-
