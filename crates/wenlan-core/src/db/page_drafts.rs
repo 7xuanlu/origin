@@ -292,12 +292,14 @@ impl MemoryDB {
                     id, title, summary, content, entity_id, space, source_memory_ids,
                     version, status, embedding, created_at, last_compiled,
                     last_modified, sources_updated_count, stale_reason, user_edited,
-                    changelog, creation_kind, review_status, workspace, citations, kind
+                    changelog, creation_kind, review_status, workspace, citations, kind,
+                    incarnation
                  ) VALUES (
                     ?1, ?2, NULL, ?3, NULL, ?4, '[]',
                     1, 'draft', NULL, ?5, ?5,
                     ?5, 0, NULL, 1,
-                    '[]', 'authored', 'unconfirmed', ?4, '[]', ?6
+                    '[]', 'authored', 'unconfirmed', ?4, '[]', ?6,
+                    lower(hex(randomblob(16)))
                  )",
             libsql::params![
                 id,

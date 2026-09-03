@@ -1088,3 +1088,34 @@ describe("daemonMeetsFloor", () => {
     expect(daemonMeetsFloor("0.13.0", "0.13.0")).toBe(true);
   });
 });
+
+describe("daemonErrorMessage", () => {
+  it("pulls the daemon's sentence out of a rejected command string", () => {
+    expect(
+      tauri.daemonErrorMessage(
+        "HTTP POST /api/memory/revision/mem_1/accept returned 409 Conflict: "
+        + '{"error":"page revision card mem_1 for page page_a was staged before '
+        + 'source-revision fencing; it has been discarded and the page re-queued"}',
+      ),
+    ).toBe(
+      "page revision card mem_1 for page page_a was staged before "
+      + "source-revision fencing; it has been discarded and the page re-queued",
+    );
+  });
+
+  it("reads an Error's message the same way as a raw string rejection", () => {
+    expect(
+      tauri.daemonErrorMessage(new Error('returned 409 Conflict: {"error":"stale card"}')),
+    ).toBe("stale card");
+  });
+
+  it("returns null when the rejection carries no daemon body", () => {
+    // A transport failure never reaches a route, so the caller keeps its own
+    // wording rather than showing the reader a socket error.
+    expect(tauri.daemonErrorMessage("HTTP POST /api/x: connection refused")).toBeNull();
+    expect(tauri.daemonErrorMessage("returned 500: {not json")).toBeNull();
+    expect(tauri.daemonErrorMessage('returned 500: {"error":"  "}')).toBeNull();
+    expect(tauri.daemonErrorMessage('returned 500: {"detail":"no error key"}')).toBeNull();
+    expect(tauri.daemonErrorMessage(undefined)).toBeNull();
+  });
+});
