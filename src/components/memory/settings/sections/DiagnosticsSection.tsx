@@ -11,12 +11,16 @@ import {
   removeRawMcpEntry,
   setSetupCompleted,
   startDaemonSidecar,
+  type BinaryCandidate,
   type BinaryWire,
   type ClientWire,
   type DaemonWire,
+  type JobBinding,
+  type SidecarStopOutcome,
   type PipelineStatusResponse,
   type WireState,
 } from "../../../../lib/tauri";
+import { readingIsNo, readingIsYes, type Reading } from "../../../../lib/reading";
 import { Button, Card, ConfirmActionButton, SectionHeader, Skeleton, StatusChip } from "../primitives";
 
 function sortedEntries(values: Record<string, number>): [string, number][] {
@@ -49,11 +53,95 @@ const ROUTE_LABEL_KEYS = {
   plugin: "settings.diagnostics.wiring.routePlugin",
   config: "settings.diagnostics.wiring.routeConfig",
   skip: "settings.diagnostics.wiring.routeSkip",
+  unknown: "settings.diagnostics.wiring.routeUnknown",
 } as const;
 
 function routeLabel(t: TFunction, route: string): string {
   const key = ROUTE_LABEL_KEYS[route as keyof typeof ROUTE_LABEL_KEYS];
   return key ? t(key) : route;
+}
+
+/** How one client detection reads on screen. THREE labels, because there are
+ *  three readings: a look that failed is not a client that is absent, and
+ *  "Not detected" said both. */
+function detectionLabel(t: TFunction, detected: Reading): string {
+  switch (detected.kind) {
+    case "yes":
+      return t("settings.diagnostics.wiring.clientDetected");
+    case "no":
+      return t("settings.diagnostics.wiring.clientNotDetected");
+    case "unreadable":
+      return t("settings.diagnostics.wiring.clientUnreadable");
+  }
+}
+
+/** How one candidate reads on screen. "Missing" used to cover every non-`file`
+ *  state, including the one where the OS refused to answer — the boolean
+ *  collapse, rendered. A path that could not be looked at is not a missing
+ *  path, and the user chasing a broken setup needs to know which it is. */
+function candidateLabel(t: TFunction, state: BinaryCandidate["state"]): string {
+  switch (state.kind) {
+    case "file":
+      return t("settings.diagnostics.wiring.candidateFound");
+    case "unreadable":
+      return t("settings.diagnostics.wiring.candidateUnreadable");
+    case "not_a_file":
+    case "not_executable":
+      return t("settings.diagnostics.wiring.candidateUnusable");
+    default:
+      return t("settings.diagnostics.wiring.candidateMissing");
+  }
+}
+
+/** C1.7. `sidecar_spawned_on_unknown_owner`, the job binding and the last
+ *  stop outcome all reached `DaemonWire` and stopped there. `daemon_start`
+ *  maps both `Spawn` and `SpawnOnUnknownOwner` to the same `Started` result,
+ *  so the difference between "launchd was measured not to own the daemon" and
+ *  "nobody could tell" was recorded and never rendered — which made the claim
+ *  that the third value reaches a user-visible outcome false. These render it.
+ *
+ *  All three are about a daemon that outlives, or duplicates, the one the user
+ *  thinks they have; none of them is visible anywhere else in the app. */
+function sidecarBindingLabel(t: TFunction, binding: JobBinding): string {
+  switch (binding.state) {
+    case "bound":
+      return t("settings.diagnostics.wiring.sidecarBound");
+    case "unbound":
+      return t("settings.diagnostics.wiring.sidecarUnbound");
+    default:
+      return t("settings.diagnostics.wiring.sidecarNotSupported");
+  }
+}
+
+/** `null` for `no_sidecar`: nothing was stopped and nothing needed to be, so
+ *  there is no outcome worth a row. Every other outcome gets one — including
+ *  `could_not_measure`, which is the whole reason the field exists. */
+function lastStopLabel(t: TFunction, stop: SidecarStopOutcome): string | null {
+  switch (stop.outcome) {
+    case "ended":
+      return t("settings.diagnostics.wiring.lastStopEnded");
+    case "still_running":
+      return t("settings.diagnostics.wiring.lastStopStillRunning");
+    case "could_not_measure":
+      return t("settings.diagnostics.wiring.lastStopUnverified");
+    default:
+      return null;
+  }
+}
+
+/** Lines for the three sidecar facts, shared by the card and the copyable
+ *  report so they cannot drift apart. */
+function sidecarReportLines(t: TFunction, daemon: DaemonWire): string[] {
+  const lines: string[] = [];
+  if (daemon.sidecar_job_binding) {
+    lines.push(sidecarBindingLabel(t, daemon.sidecar_job_binding));
+  }
+  const stop = daemon.last_sidecar_stop ? lastStopLabel(t, daemon.last_sidecar_stop) : null;
+  if (stop) lines.push(stop);
+  if (daemon.sidecar_spawned_on_unknown_owner) {
+    lines.push(t("settings.diagnostics.wiring.sidecarUnknownOwner"));
+  }
+  return lines;
 }
 
 /** Plain-text dump of the wire state, built from the same translated labels
@@ -74,15 +162,32 @@ function buildWireReport(t: TFunction, wire: WireState): string {
   if (!wire.daemon.reachable && wire.daemon.error) {
     lines.push(`  ${wire.daemon.error}`);
   }
+  for (const line of sidecarReportLines(t, wire.daemon)) {
+    lines.push(`  ${line}`);
+  }
   lines.push("");
 
   lines.push(t("settings.diagnostics.wiring.mcpBinaryTitle"));
-  lines.push(`  ${[wire.mcp_binary.command, ...wire.mcp_binary.args].join(" ")}`);
+  lines.push(
+    wire.mcp_binary.command === null
+      ? `  ${wire.mcp_binary.unresolved?.message ?? t("settings.diagnostics.wiring.binaryUnresolved")}`
+      : `  ${[wire.mcp_binary.command, ...wire.mcp_binary.args].join(" ")}`,
+  );
   for (const candidate of wire.mcp_binary.candidates) {
-    const marker = candidate.exists
-      ? t("settings.diagnostics.wiring.candidateFound")
-      : t("settings.diagnostics.wiring.candidateMissing");
-    lines.push(`  [${marker}] ${candidate.path} (${candidate.source})`);
+    lines.push(`  [${candidateLabel(t, candidate.state)}] ${candidate.path} (${candidate.source})`);
+  }
+  // An input that could not be determined has NO candidate row — its paths
+  // were never built — so a report that only listed candidates would show a
+  // short list and no reason for it. Read off `mcp_binary`, not `unresolved`:
+  // a pasted report from a machine where the binary WAS found must still name
+  // the input that went unread (round 5, D4).
+  for (const undetermined of wire.mcp_binary.undetermined ?? []) {
+    lines.push(
+      `  [${t("settings.diagnostics.wiring.candidateNotChecked")}] ${t(
+        "settings.diagnostics.wiring.binaryUndetermined",
+        { ...undetermined },
+      )}`,
+    );
   }
   lines.push("");
 
@@ -91,16 +196,25 @@ function buildWireReport(t: TFunction, wire: WireState): string {
     lines.push(`  ${t("settings.diagnostics.wiring.clientsEmpty")}`);
   }
   for (const client of wire.clients) {
-    const detected = client.detected
-      ? t("settings.diagnostics.wiring.clientDetected")
-      : t("settings.diagnostics.wiring.clientNotDetected");
-    lines.push(
-      `  ${client.name}: ${detected}, ${routeLabel(t, client.route)}, ${client.config_path}`,
-    );
-    if (client.has_plugin && client.has_raw_entry) {
+    const detected = detectionLabel(t, client.detected);
+    const path = client.config_path ?? t("settings.diagnostics.wiring.clientPathUnknown");
+    lines.push(`  ${client.name}: ${detected}, ${routeLabel(t, client.route)}, ${path}`);
+    // A pasted report has to carry the REASON, not just the word "unknown" —
+    // it is the only artefact the person debugging this ever sees.
+    if (client.detected.kind === "unreadable") {
+      lines.push(
+        `    ! ${t("settings.diagnostics.wiring.clientUnreadableDetail", {
+          error: client.detected.error,
+        })}`,
+      );
+    }
+    if (readingIsYes(client.has_plugin) && readingIsYes(client.has_raw_entry)) {
       lines.push(`    ! ${t("settings.diagnostics.wiring.doubleRegistrationBody", { name: client.name })}`);
     }
-    if (!client.has_plugin && client.has_raw_duplicate) {
+    // `readingIsNo`, not `!has_plugin`: a plugin state that could not be read
+    // must not fire a warning whose whole premise is "this client has no
+    // plugin", nor suppress the one above.
+    if (readingIsNo(client.has_plugin) && readingIsYes(client.has_raw_duplicate)) {
       lines.push(`    ! ${t("settings.diagnostics.wiring.rawDuplicateBody", { name: client.name })}`);
     }
   }
@@ -171,6 +285,7 @@ function DaemonStatus({ daemon, onRetry }: { daemon: DaemonWire; onRetry: () => 
           {t("settings.diagnostics.wiring.daemonVersion", { version: daemon.version })}
         </p>
       )}
+      <DaemonSidecarStatus daemon={daemon} />
       {!daemon.reachable && (
         <>
           {daemon.error && (
@@ -189,31 +304,130 @@ function DaemonStatus({ daemon, onRetry }: { daemon: DaemonWire; onRetry: () => 
   );
 }
 
+/** See `sidecarBindingLabel`. Renders nothing at all when this app owns no
+ *  sidecar and never stopped one — the ordinary case, where there is nothing
+ *  to say and a row saying so would be noise. */
+function DaemonSidecarStatus({ daemon }: { daemon: DaemonWire }) {
+  const { t } = useTranslation();
+  const binding = daemon.sidecar_job_binding ?? null;
+  const lastStop = daemon.last_sidecar_stop ?? null;
+  const lastStopText = lastStop ? lastStopLabel(t, lastStop) : null;
+  if (!binding && !lastStopText && !daemon.sidecar_spawned_on_unknown_owner) return null;
+  return (
+    <div className="mt-3 flex flex-col gap-2">
+      <div style={{ fontFamily: "var(--mem-font-body)", fontSize: "var(--mem-text-sm)", color: "var(--mem-text-tertiary)" }}>
+        {t("settings.diagnostics.wiring.daemonSidecarTitle")}
+      </div>
+      {binding && (
+        <div className="flex items-center gap-2 flex-wrap">
+          <StatusChip
+            state={
+              binding.state === "bound"
+                ? { kind: "up" }
+                : binding.state === "unbound"
+                  ? { kind: "down" }
+                  : { kind: "idle" }
+            }
+            label={sidecarBindingLabel(t, binding)}
+          />
+          {binding.state === "unbound" && (
+            <span style={{ fontFamily: "var(--mem-font-mono)", fontSize: "var(--mem-text-2xs)", color: "var(--mem-text-tertiary)", overflowWrap: "anywhere" }}>
+              {binding.reason}
+            </span>
+          )}
+        </div>
+      )}
+      {lastStop && lastStopText && (
+        <div className="flex items-center gap-2 flex-wrap">
+          <StatusChip
+            // Round 5, D5 residual. `could_not_measure` used to fall into the
+            // same `down` as `still_running`, so the colour asserted a
+            // negative stop nobody observed — the "unverified" wording was the
+            // only thing keeping them apart, and colour is read first. Three
+            // outcomes, three tones: ended is measured good, still_running is
+            // measured bad, could_not_measure is not a measurement at all.
+            state={
+              lastStop.outcome === "ended"
+                ? { kind: "up" }
+                : lastStop.outcome === "could_not_measure"
+                  ? { kind: "unknown" }
+                  : { kind: "down" }
+            }
+            label={lastStopText}
+          />
+          {"reason" in lastStop && (
+            <span style={{ fontFamily: "var(--mem-font-mono)", fontSize: "var(--mem-text-2xs)", color: "var(--mem-text-tertiary)", overflowWrap: "anywhere" }}>
+              {lastStop.reason}
+            </span>
+          )}
+        </div>
+      )}
+      {daemon.sidecar_spawned_on_unknown_owner && (
+        <p style={{ fontFamily: "var(--mem-font-body)", fontSize: "var(--mem-text-sm)", color: "var(--mem-status-danger-text)", lineHeight: "1.5" }}>
+          {t("settings.diagnostics.wiring.sidecarUnknownOwner")}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function McpBinaryStatus({ mcpBinary }: { mcpBinary: BinaryWire }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   // The candidates list is a probe order — most paths are SUPPOSED to be
   // missing as long as one is found. Only flag red (down) when the binary
   // exists nowhere; otherwise a missing candidate is idle, not an alarm.
-  const anyFound = mcpBinary.candidates.some((candidate) => candidate.exists);
+  const anyFound = mcpBinary.candidates.some((candidate) => candidate.state.kind === "file");
+  // A candidate the OS would not answer about is NOT evidence the binary is
+  // absent, so it must not trigger the "reinstall via setup" advice: the
+  // install may be perfectly fine behind a permission problem, and reinstalling
+  // is not the fix for that. Only a fully measured search offers the button.
+  // ...and neither is an input that could not be determined: its candidate
+  // paths were never built, so the search did not cover them and their absence
+  // from the list below is not evidence of anything.
+  // Read off `mcpBinary` itself, not off `unresolved`: an input that could not
+  // be determined is a property of the search, and a search that FOUND
+  // something can still have one (round 5, D4). Rendering it only when no
+  // command was chosen is how it stayed invisible in the case where the
+  // command beside it looks like a complete answer.
+  const undetermined = mcpBinary.undetermined ?? [];
+  const searchIncomplete =
+    mcpBinary.candidates.some((candidate) => candidate.state.kind === "unreadable") ||
+    undetermined.length > 0;
   return (
     <>
       <div className="mb-1" style={{ fontFamily: "var(--mem-font-body)", fontSize: "var(--mem-text-md)", fontWeight: 500, color: "var(--mem-text)" }}>
         {t("settings.diagnostics.wiring.mcpBinaryTitle")}
       </div>
       <p style={{ fontFamily: "var(--mem-font-mono)", fontSize: "var(--mem-text-sm)", color: "var(--mem-text)", overflowWrap: "anywhere" }}>
-        {[mcpBinary.command, ...mcpBinary.args].join(" ")}
+        {mcpBinary.command === null
+          ? (mcpBinary.unresolved?.message ?? t("settings.diagnostics.wiring.binaryUnresolved"))
+          : [mcpBinary.command, ...mcpBinary.args].join(" ")}
       </p>
       <div className="mt-3 flex flex-col gap-2">
+        {/* Keyed by SOURCE as well as path: two slots can name the same file
+            (a dev override pointed at the installed binary), and they share one
+            reading rather than being deduplicated away. */}
         {mcpBinary.candidates.map((candidate) => (
-          <div key={candidate.path} className="flex items-center gap-2 flex-wrap">
+          <div
+            key={`${candidate.source}:${candidate.path}`}
+            className="flex items-center gap-2 flex-wrap"
+          >
             <StatusChip
-              state={candidate.exists ? { kind: "up" } : anyFound ? { kind: "idle" } : { kind: "down" }}
-              label={
-                candidate.exists
-                  ? t("settings.diagnostics.wiring.candidateFound")
-                  : t("settings.diagnostics.wiring.candidateMissing")
+              // `unreadable` is a failed look, not a measured absence — same
+              // reasoning as the sidecar stop above, so it gets the same
+              // unknown tone rather than the red that would read as "this
+              // path is definitely not the binary".
+              state={
+                candidate.state.kind === "file"
+                  ? { kind: "up" }
+                  : candidate.state.kind === "unreadable"
+                    ? { kind: "unknown" }
+                    : anyFound
+                      ? { kind: "idle" }
+                      : { kind: "down" }
               }
+              label={candidateLabel(t, candidate.state)}
             />
             <span
               className="truncate flex-1 min-w-0"
@@ -226,12 +440,29 @@ function McpBinaryStatus({ mcpBinary }: { mcpBinary: BinaryWire }) {
             </span>
           </div>
         ))}
+        {undetermined.map((input) => (
+          <div key={input.input} className="flex items-center gap-2 flex-wrap">
+            <StatusChip
+              // An input that could not be determined is the purest case of
+              // this: its candidate paths were never even built, so nothing
+              // about them was measured either way.
+              state={{ kind: "unknown" }}
+              label={t("settings.diagnostics.wiring.candidateNotChecked")}
+            />
+            <span
+              className="flex-1 min-w-0"
+              style={{ fontFamily: "var(--mem-font-body)", fontSize: "var(--mem-text-sm)", color: "var(--mem-text-secondary)", overflowWrap: "anywhere" }}
+            >
+              {t("settings.diagnostics.wiring.binaryUndetermined", { ...input })}
+            </span>
+          </div>
+        ))}
       </div>
       {/* No candidate exists anywhere — the one actionable fix is to re-run
           setup, which reinstalls the binary. Mirrors General's re-run row:
           setup completion is cleared and the wizard is re-armed; data is
           preserved, so the confirm is a light guard, not a danger gate. */}
-      {!anyFound && (
+      {!anyFound && !searchIncomplete && (
         <div className="mt-3">
           <ConfirmActionButton
             variant="secondary"
@@ -381,26 +612,34 @@ function ClientsWiring({ clients }: { clients: ClientWire[] }) {
             // THE valuable finding this card exists to surface: Wenlan
             // registered twice for one client (plugin + a raw MCP entry).
             // Now carries its own one-action fix — see DoubleRegistrationWarning.
-            const doubleRegistered = client.has_plugin && client.has_raw_entry;
+            // Both halves must be a MEASURED yes. A warning box that offers a
+            // destructive one-click fix ("remove the duplicate entry") may
+            // never be raised off a read that failed.
+            const doubleRegistered =
+              readingIsYes(client.has_plugin) && readingIsYes(client.has_raw_entry);
             // The raw+raw sibling: both `wenlan` and legacy `origin` raw
-            // entries in a no-plugin client's config. Gated on `!has_plugin`
-            // so it never double-fires with doubleRegistered (a plugin client
-            // is handled by the box above, whose fix removes both raw entries).
-            const rawDuplicate = !client.has_plugin && client.has_raw_duplicate;
+            // entries in a no-plugin client's config. Gated on a measured
+            // `no` for the plugin — not `!has_plugin`, which fired this box on
+            // an unread plugin state — so it never double-fires with
+            // doubleRegistered (a plugin client is handled by the box above,
+            // whose fix removes both raw entries).
+            const rawDuplicate =
+              readingIsNo(client.has_plugin) && readingIsYes(client.has_raw_duplicate);
+            // A detection that could not be made gets the neutral chip, not
+            // the "idle" one that means "we looked and it is not here".
+            const detectedState: Parameters<typeof StatusChip>[0]["state"] =
+              client.detected.kind === "yes"
+                ? { kind: "up" }
+                : client.detected.kind === "no"
+                  ? { kind: "idle" }
+                  : { kind: "unknown", detail: client.detected.error };
             return (
               <div key={client.client_type} className="flex flex-col gap-1">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span style={{ fontFamily: "var(--mem-font-body)", fontSize: "var(--mem-text-sm)", fontWeight: 500, color: "var(--mem-text)" }}>
                     {client.name}
                   </span>
-                  <StatusChip
-                    state={client.detected ? { kind: "up" } : { kind: "idle" }}
-                    label={
-                      client.detected
-                        ? t("settings.diagnostics.wiring.clientDetected")
-                        : t("settings.diagnostics.wiring.clientNotDetected")
-                    }
-                  />
+                  <StatusChip state={detectedState} label={detectionLabel(t, client.detected)} />
                   <span style={{ fontFamily: "var(--mem-font-body)", fontSize: "var(--mem-text-2xs)", color: "var(--mem-text-tertiary)" }}>
                     {routeLabel(t, client.route)}
                   </span>
@@ -409,7 +648,7 @@ function ClientsWiring({ clients }: { clients: ClientWire[] }) {
                   className="truncate"
                   style={{ fontFamily: "var(--mem-font-mono)", fontSize: "10px", color: "var(--mem-text-tertiary)" }}
                 >
-                  {client.config_path}
+                  {client.config_path ?? t("settings.diagnostics.wiring.clientPathUnknown")}
                 </p>
                 {doubleRegistered && <DoubleRegistrationWarning client={client} />}
                 {rawDuplicate && <RawDuplicateWarning client={client} />}

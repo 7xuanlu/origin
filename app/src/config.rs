@@ -83,7 +83,13 @@ impl Config {
     /// Returns the configured knowledge path, or the product default.
     /// Existing `~/Origin/knowledge` directories remain readable during rename.
     pub fn knowledge_path_or_default(&self) -> PathBuf {
-        self.knowledge_path_or_default_for_home(&home_dir())
+        // Resolved lazily: a configured path answers the question without ever
+        // asking the OS where home is, so the only callers that can be stopped
+        // by an unmeasurable profile are the ones that actually need it.
+        if let Some(path) = self.knowledge_path.clone() {
+            return path;
+        }
+        self.knowledge_path_or_default_for_home(&crate::identity_paths::home_base())
     }
 
     fn knowledge_path_or_default_for_home(&self, home: &std::path::Path) -> PathBuf {
@@ -113,9 +119,11 @@ fn config_path() -> PathBuf {
     crate::identity_paths::app_data_dir().join("config.json")
 }
 
-fn home_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
-}
+// The home root goes through `identity_paths::home_base()`, never
+// `dirs::home_dir()` directly: this root is where the user's *pages* are
+// written, and a local `unwrap_or(".")` both creates `./Wenlan/knowledge` in
+// whatever directory the app was launched from and bypasses the `cfg(test)`
+// guard, so a unit test reaching it writes into the real home directory.
 
 pub fn load_config() -> Config {
     let path = config_path();
@@ -172,43 +180,14 @@ fn merge_with_existing_json(path: &std::path::Path, next: Value) -> Value {
 mod tests {
     use super::*;
 
-    struct EnvGuard {
-        home: Option<std::ffi::OsString>,
-        wenlan: Option<std::ffi::OsString>,
-        origin: Option<std::ffi::OsString>,
-    }
+    use crate::test_env::EnvGuard;
 
-    impl EnvGuard {
-        fn capture() -> Self {
-            Self {
-                home: std::env::var_os("HOME"),
-                wenlan: std::env::var_os("WENLAN_DATA_DIR"),
-                origin: std::env::var_os("ORIGIN_DATA_DIR"),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match &self.wenlan {
-                Some(value) => std::env::set_var("WENLAN_DATA_DIR", value),
-                None => std::env::remove_var("WENLAN_DATA_DIR"),
-            }
-            match &self.origin {
-                Some(value) => std::env::set_var("ORIGIN_DATA_DIR", value),
-                None => std::env::remove_var("ORIGIN_DATA_DIR"),
-            }
-        }
-    }
+    const CONFIG_ENV_KEYS: &[&str] = &["HOME", "WENLAN_DATA_DIR", "ORIGIN_DATA_DIR"];
 
     #[test]
     #[serial_test::serial]
     fn config_path_prefers_wenlan_data_dir() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(CONFIG_ENV_KEYS);
         std::env::set_var("WENLAN_DATA_DIR", "/tmp/wenlan-config-test");
         std::env::set_var("ORIGIN_DATA_DIR", "/tmp/origin-config-test");
 
@@ -221,7 +200,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn config_path_falls_back_to_origin_data_dir() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(CONFIG_ENV_KEYS);
         std::env::remove_var("WENLAN_DATA_DIR");
         std::env::set_var("ORIGIN_DATA_DIR", "/tmp/origin-config-test");
 
@@ -269,7 +248,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn save_load_config_roundtrip() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(CONFIG_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         // Point config_path() at our temp dir via the env override.
         // Env mutation is process-wide, so this must not race with other tests
@@ -291,7 +270,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn save_config_preserves_daemon_only_fields() {
-        let _env = EnvGuard::capture();
+        let _env = EnvGuard::capture(CONFIG_ENV_KEYS);
         let tmp = tempfile::tempdir().unwrap();
         std::env::remove_var("WENLAN_DATA_DIR");
         std::env::set_var("ORIGIN_DATA_DIR", tmp.path());
@@ -417,6 +396,11 @@ mod tests {
         );
     }
 
+    // No `isolate_app_roots` here, deliberately: under `cfg(test)`
+    // `identity_paths::home_base()` panics the moment it is reached without
+    // one, so this test still passing is itself the assertion that a
+    // configured path short-circuits before anything asks the OS where home
+    // is. Make the resolution eager again and this test panics.
     #[test]
     fn config_knowledge_path_custom() {
         let json = r#"{"knowledge_path": "/my/custom/path"}"#;
@@ -424,6 +408,23 @@ mod tests {
         assert_eq!(
             config.knowledge_path_or_default(),
             PathBuf::from("/my/custom/path")
+        );
+    }
+
+    /// The default pages root must come from the isolated home, not from
+    /// `dirs::home_dir()` and not from a `"."` fallback. Before this went
+    /// through `identity_paths`, a unit test reaching it wrote into the
+    /// developer's real home directory and a `dirs` that could not answer
+    /// silently relocated the user's pages to the process's cwd.
+    #[test]
+    #[serial_test::serial]
+    fn knowledge_path_default_resolves_under_the_isolated_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _roots = crate::test_env::isolate_app_roots(tmp.path());
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            config.knowledge_path_or_default(),
+            tmp.path().join("Wenlan").join("knowledge")
         );
     }
 

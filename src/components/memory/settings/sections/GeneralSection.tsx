@@ -205,6 +205,22 @@ function ProfileSettingsBlock() {
   );
 }
 
+/**
+ * The sentence a rejected Tauri command carries, or `null` when there is no
+ * error to show.
+ *
+ * A command declared `Result<_, String>` rejects with the bare string, so the
+ * common case is not an `Error` at all. Anything else that is not a non-empty
+ * string is deliberately dropped rather than rendered as `[object Object]` or
+ * an empty red line: a row that shows an unreadable error is worse than a row
+ * that shows none, because it claims to be telling the user something.
+ */
+function errorMessage(error: unknown): string | null {
+  if (typeof error === "string") return error.trim() || null;
+  if (error instanceof Error) return error.message.trim() || null;
+  return null;
+}
+
 export default function GeneralSection() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -218,10 +234,49 @@ export default function GeneralSection() {
     queryKey: ["runAtLogin"],
     queryFn: isRunAtLoginEnabled,
   });
+  // `is_run_at_login_enabled` errors when launchctl could not be read, rather
+  // than answering `false`. Rendering that as an off toggle would tell the
+  // user the feature is disabled while launchd may still start Wenlan every
+  // boot, so the row says it could not be read instead.
+  const runAtLoginUnreadable = runAtLoginQuery.isError;
   const runAtLoginMutation = useMutation({
     mutationFn: setRunAtLogin,
     onSuccess: () => runAtLoginQuery.refetch(),
   });
+  // `set_run_at_login` refuses the handover when it could not confirm that
+  // Wenlan's own daemon stopped: registering launchd against a port the old
+  // daemon still holds makes two owners. The refusal names which of the two
+  // happened and what to do about it, and that sentence only exists in the
+  // rejected `invoke` promise -- without this the toggle just fails to move
+  // and the user is told nothing. `useMutation` clears `error` on the next
+  // `mutate`, so a successful retry removes the line.
+  const runAtLoginRefusal = errorMessage(runAtLoginMutation.error);
+  // The value THIS read produced, or `undefined` when the current read did not
+  // succeed.
+  //
+  // Round 5, D2. This used to be `runAtLoginQuery.data`, and `data ===
+  // undefined` answers a strictly narrower question than the one the row needs:
+  // it distinguishes "no value has ever been cached" from "a boolean is
+  // cached", NOT "the current read succeeded" from "the current read failed".
+  // React Query RETAINS the last `data` across a failed refetch, so the
+  // reachable state `data === false, isError === true` painted an enabled,
+  // left-positioned "off" switch — a claim about launchd from an earlier
+  // instant — beside the very notice saying the state could not be read. A
+  // screen reader heard "not pressed", and a click computed `mutate(true)` from
+  // that stale reading (symmetrically, a retained `true` sent `mutate(false)`).
+  // `isSuccess` is the status of the LATEST read, so a failed refresh drops the
+  // row back to unknown instead of quietly re-asserting the old answer.
+  const runAtLoginState = runAtLoginQuery.isSuccess ? runAtLoginQuery.data : undefined;
+  // Both failures can be live at once -- the state went unreadable AND a
+  // handover was refused -- and they say different things. Joined rather than
+  // ranked, because the refusal is the half that names the remedy.
+  const runAtLoginProblem =
+    [
+      runAtLoginUnreadable ? t("settings.general.runAtLoginUnreadable") : null,
+      runAtLoginRefusal,
+    ]
+      .filter(Boolean)
+      .join(" ") || null;
 
   return (
     <>
@@ -272,8 +327,26 @@ export default function GeneralSection() {
           <SettingRow
             title={t("settings.general.runAtLoginTitle")}
             description={t("settings.general.runAtLoginDescription")}
-            enabled={runAtLoginQuery.data ?? false}
-            onToggle={() => runAtLoginMutation.mutate(!(runAtLoginQuery.data ?? false))}
+            enabled={runAtLoginState ?? false}
+            // Not measured is not `false`, and a value left over from a read
+            // that has since FAILED is not measured either. Without this the
+            // row paints the switch off -- a claim about launchd nobody read,
+            // or read at some earlier instant -- and the click below computes
+            // its new value from that same fiction.
+            valueUnknown={runAtLoginState === undefined}
+            onToggle={() => {
+              // `!(undefined ?? false)` is `true` whatever launchd actually
+              // holds, so an unread state must not reach `mutate` even if the
+              // disabled control were somehow activated. The measurement, not
+              // the widget, is what makes this action safe.
+              if (runAtLoginState === undefined) return;
+              runAtLoginMutation.mutate(!runAtLoginState);
+            }}
+            // Both sentences, when there are both. These are independent
+            // failures -- the state became unreadable AND one attempt to
+            // change it was refused -- and showing only the first drops the
+            // one that names what to actually do about it.
+            error={runAtLoginProblem}
           />
           {/* Re-run setup wizard — a proper row with an inline two-step
               confirm; data is preserved regardless. */}
