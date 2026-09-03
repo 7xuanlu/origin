@@ -13,7 +13,7 @@ vi.mock("../lib/tauri", () => ({
   shouldShowWizard: vi.fn().mockResolvedValue(true),
   setSetupCompleted: vi.fn().mockResolvedValue(undefined),
   detectMcpClients: vi.fn().mockResolvedValue([]),
-  writeMcpConfig: vi.fn().mockResolvedValue(undefined),
+  writeMcpConfig: vi.fn().mockResolvedValue([]),
   installClientPlugin: vi.fn().mockResolvedValue(undefined),
   listAgents: vi.fn().mockResolvedValue([]),
   getWenlanMcpEntry: vi.fn().mockResolvedValue({ command: "npx", args: ["-y", "wenlan-mcp"] }),
@@ -133,6 +133,7 @@ import {
   deleteMemory,
 } from "../lib/tauri";
 import { deriveOnboardingPins, DoneStep } from "./SetupWizard";
+import { NO, YES, unreadable } from "../test/readings";
 
 /** An agent write that lands AFTER the wizard was entered — the only kind that
  *  proves the config we just wrote actually works. `wizardEnteredAt` is stamped
@@ -175,7 +176,7 @@ describe("SetupWizard", () => {
     vi.clearAllMocks();
     await i18n.changeLanguage("en");
     (detectMcpClients as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-    (writeMcpConfig as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (writeMcpConfig as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (installClientPlugin as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (listAgents as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (setApiKey as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
@@ -236,6 +237,59 @@ describe("SetupWizard", () => {
     // R3 typography ladder: on-scale size only, never an off-scale 15px.
     expect(tagline).toHaveStyle({ fontSize: "var(--mem-text-lg)" });
     expect(body).toHaveStyle({ fontSize: "var(--mem-text-lg)" });
+  });
+
+  // The wizard window is `titleBarStyle: "Overlay"` on macOS: no top bar of its
+  // own and no native bar to grab, so this strip is the ONLY way to move it. A
+  // Mac whose WebView UA has been customised past recognition reads as
+  // `hostPlatform() === "unknown"`, and giving that case a zero-height strip
+  // leaves the window unmovable. `dragStripHeight` therefore decides `unknown`
+  // toward macOS; this pins the wiring, not just the number.
+  it("leaves an unrecognised host a drag strip, so the window can never be unmovable", () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    Object.defineProperty(globalThis, "navigator", {
+      value: { userAgent: "Wenlan/1.0" },
+      configurable: true,
+    });
+    try {
+      const { container } = renderWizard();
+      const dragStrip = container.querySelector("[data-tauri-drag-region]") as HTMLElement;
+      expect(dragStrip).toBeTruthy();
+      // parseInt because React and jsdom disagree on how a zero length
+      // serialises ("0" vs "0px"); the number is what matters either way.
+      expect(parseInt(dragStrip.style.height || "0", 10)).toBe(32);
+    } finally {
+      if (original) {
+        Object.defineProperty(globalThis, "navigator", original);
+      } else {
+        Reflect.deleteProperty(globalThis, "navigator");
+      }
+    }
+  });
+
+  // The measured non-macOS case is unchanged: Windows draws a real title bar
+  // above the webview, which already drags, so the strip stays at zero.
+  it("reserves no drag strip on a measured Windows host", () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    Object.defineProperty(globalThis, "navigator", {
+      value: {
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+      },
+      configurable: true,
+    });
+    try {
+      const { container } = renderWizard();
+      const dragStrip = container.querySelector("[data-tauri-drag-region]") as HTMLElement;
+      expect(dragStrip).toBeTruthy();
+      expect(parseInt(dragStrip.style.height || "0", 10)).toBe(0);
+    } finally {
+      if (original) {
+        Object.defineProperty(globalThis, "navigator", original);
+      } else {
+        Reflect.deleteProperty(globalThis, "navigator");
+      }
+    }
   });
 
   it("renders Welcome step in Simplified Chinese when selected", async () => {
@@ -346,21 +400,151 @@ describe("SetupWizard", () => {
     });
   });
 
+  // ── Round 5, defect 4 ──────────────────────────────────────────────────
+  //
+  // The rule the test above encodes ("an undetected tool is invisible") was
+  // applied to a BOOLEAN, so it swallowed a third case it was never written
+  // for: a tool whose detection FAILED. `.filter((c) => c.detected)` dropped
+  // it, and this step titles the surviving list "detected on your machine" and
+  // shows "we could not find any tools" when it is empty — so a read that
+  // failed was rendered as a machine with nothing installed.
+  it("a tool whose detection failed still gets a row, and the row says why", async () => {
+    (detectMcpClients as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        name: "Cursor",
+        client_type: "cursor",
+        config_path: "/path/to/cursor",
+        detected: unreadable("Access is denied. (os error 5)"),
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
+      },
+      {
+        name: "Claude Code",
+        client_type: "claude_code",
+        config_path: "/path/to/claude.json",
+        detected: NO,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
+      },
+    ]);
+
+    renderWizard({ initialStep: "connect" });
+
+    // Present, not dropped.
+    expect(await screen.findByLabelText("Cursor")).toBeInTheDocument();
+    // With the reason, so the row is not silently indistinguishable from a
+    // tool that was found.
+    expect(screen.getByText(/could not check whether this is installed/i)).toBeInTheDocument();
+    expect(screen.getByText(/Access is denied/)).toBeInTheDocument();
+    // A MEASURED absence is still invisible - that behaviour is unchanged.
+    expect(screen.queryByLabelText("Claude Code")).not.toBeInTheDocument();
+  });
+
+  // Preselection is a claim ("we found this, tick it for you"). A failed read
+  // makes no such claim, so the box starts empty and the user decides.
+  it("an unreadable detection is offered unticked, never preselected", async () => {
+    (detectMcpClients as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        name: "Cursor",
+        client_type: "cursor",
+        config_path: "/path/to/cursor",
+        detected: unreadable("Access is denied. (os error 5)"),
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
+      },
+      {
+        name: "Gemini CLI",
+        client_type: "gemini_cli",
+        config_path: "/path/to/gemini.json",
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
+      },
+    ]);
+
+    renderWizard({ initialStep: "connect" });
+
+    expect(await screen.findByLabelText("Cursor")).not.toBeChecked();
+    expect(screen.getByLabelText("Gemini CLI")).toBeChecked();
+  });
+
+  // ROUND 6, D6a. Detection succeeded, so the old rule preselected this row —
+  // and Continue on the next step then wrote `mcpServers.wenlan` into
+  // `claude_desktop_config.json` while the chat-side PLUGIN state had not been
+  // read. If the plugin was in fact enabled, that is a plugin+raw double
+  // registration produced with no user action beyond pressing the default
+  // button. The write stays available; it stops being the default.
+  it("a client whose plugin state could not be read is not preselected, and says why", async () => {
+    (detectMcpClients as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        name: "Claude Desktop",
+        client_type: "claude_desktop",
+        config_path: "/path/to/claude_desktop_config.json",
+        detected: YES,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: unreadable("Access is denied. (os error 5)"),
+        already_configured: unreadable("Access is denied. (os error 5)"),
+      },
+      {
+        name: "Cursor",
+        client_type: "cursor",
+        config_path: "/path/to/cursor",
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
+      },
+    ]);
+
+    renderWizard({ initialStep: "connect" });
+
+    const desktop = await screen.findByLabelText("Claude Desktop");
+    expect(desktop).not.toBeChecked();
+    // …while a sibling whose plugin state IS measured keeps its preselection,
+    // so this is not "detection got stricter".
+    expect(screen.getByLabelText("Cursor")).toBeChecked();
+
+    // SEES, and a screen reader HEARS with the checkbox: what could not be
+    // read, and what ticking it would do.
+    expect(desktop.getAttribute("aria-describedby")).toBe(
+      "client-row-desc-claude_desktop",
+    );
+    expect(document.getElementById("client-row-desc-claude_desktop")).toHaveTextContent(
+      /second registration/i,
+    );
+  });
+
   it("only detected tools render a row — an undetected tool is invisible, not a disabled row", async () => {
     (detectMcpClients as ReturnType<typeof vi.fn>).mockResolvedValue([
       {
         name: "Cursor",
         client_type: "cursor",
         config_path: "/path/to/cursor",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
       {
         name: "Claude Code",
         client_type: "claude_code",
         config_path: "/path/to/claude.json",
-        detected: false,
-        already_configured: false,
+        detected: NO,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
 
@@ -386,8 +570,11 @@ describe("SetupWizard", () => {
         name: "Claude Code",
         client_type: "claude_code",
         config_path: "/path/to/claude.json",
-        detected: false,
-        already_configured: false,
+        detected: NO,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
 
@@ -409,8 +596,11 @@ describe("SetupWizard", () => {
         name: "Cursor",
         client_type: "cursor",
         config_path: "/path/to/cursor",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
 
@@ -442,15 +632,21 @@ describe("SetupWizard", () => {
         name: "Cursor",
         client_type: "cursor",
         config_path: "/path/to/cursor",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
       {
         name: "Windsurf",
         client_type: "windsurf",
         config_path: "/path/to/windsurf.json",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
 
@@ -479,8 +675,11 @@ describe("SetupWizard", () => {
         name: "Cursor",
         client_type: "cursor",
         config_path: "/path/to/cursor",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
     (writeMcpConfig as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("permission denied"));
@@ -520,15 +719,21 @@ describe("SetupWizard", () => {
         name: "Claude Code",
         client_type: "claude_code",
         config_path: "/path/to/claude.json",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
       {
         name: "Cursor",
         client_type: "cursor",
         config_path: "/path/to/cursor",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
 
@@ -573,8 +778,11 @@ describe("SetupWizard", () => {
         name: "Codex CLI",
         client_type: "codex_cli",
         config_path: "/path/to/config.toml",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
 
@@ -612,15 +820,21 @@ describe("SetupWizard", () => {
         name: "Cursor",
         client_type: "cursor",
         config_path: "/path/to/cursor",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
       {
         name: "Claude Code",
         client_type: "claude_code",
         config_path: "/path/to/claude.json",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
 
@@ -670,8 +884,11 @@ describe("SetupWizard", () => {
         name: "Cursor",
         client_type: "cursor",
         config_path: "/path/to/cursor",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
     (listAgents as ReturnType<typeof vi.fn>).mockResolvedValue([
@@ -800,15 +1017,21 @@ describe("SetupWizard", () => {
         name: "Cursor",
         client_type: "cursor",
         config_path: "/path/to/cursor",
-        detected: true,
-        already_configured: true,
+        detected: YES,
+        already_configured: YES,
+        has_raw_entry: YES,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
       {
         name: "Windsurf",
         client_type: "windsurf",
         config_path: "/path/to/windsurf.json",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
 
@@ -883,15 +1106,21 @@ describe("SetupWizard", () => {
         name: "Claude Desktop",
         client_type: "claude_desktop",
         config_path: "/path/to/claude_desktop_config.json",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
       {
         name: "Gemini CLI",
         client_type: "gemini_cli",
         config_path: "/path/to/gemini/settings.json",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
 
@@ -925,8 +1154,11 @@ describe("SetupWizard", () => {
         name: "Gemini CLI",
         client_type: "gemini_cli",
         config_path: "/path/to/gemini/settings.json",
-        detected: true,
-        already_configured: true,
+        detected: YES,
+        already_configured: YES,
+        has_raw_entry: YES,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
 
@@ -974,8 +1206,11 @@ describe("SetupWizard", () => {
         name: "Cursor",
         client_type: "cursor",
         config_path: "/path/to/cursor",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
 
@@ -1046,8 +1281,11 @@ describe("SetupWizard", () => {
         name: "Cursor",
         client_type: "cursor",
         config_path: "/path/to/cursor",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
     // A fresh agent drives the done screen to the full "all set" branch.
@@ -1668,11 +1906,14 @@ describe("SetupWizard", () => {
         name: "Cursor",
         client_type: "cursor",
         config_path: "/path/to/cursor",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
-    (writeMcpConfig as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (writeMcpConfig as ReturnType<typeof vi.fn>).mockResolvedValue([]);
 
     renderWizard({ initialStep: "connect" });
 
@@ -1736,11 +1977,14 @@ describe("SetupWizard", () => {
         name: "Cursor",
         client_type: "cursor",
         config_path: "/path/to/cursor",
-        detected: true,
-        already_configured: false,
+        detected: YES,
+        already_configured: NO,
+        has_raw_entry: NO,
+        has_raw_duplicate: NO,
+        has_plugin: NO,
       },
     ]);
-    (writeMcpConfig as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (writeMcpConfig as ReturnType<typeof vi.fn>).mockResolvedValue([]);
 
     renderWizard({ initialStep: "connect" });
 

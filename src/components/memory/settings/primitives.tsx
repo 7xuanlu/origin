@@ -5,11 +5,21 @@ import { useTranslation } from "react-i18next";
 export function Toggle({
   enabled,
   onToggle,
+  valueUnknown = false,
   "aria-label": ariaLabel,
   "aria-describedby": ariaDescribedby,
 }: {
   enabled: boolean;
   onToggle: () => void;
+  /**
+   * The current value could not be MEASURED — distinct from measuring it as
+   * `false`. A switch has no honest off-position for that: painting the knob
+   * left claims "off", and a click would compute the new value as the
+   * complement of a value nobody read. So an unknown switch sits in a third,
+   * centred position, is not clickable, and drops `aria-pressed` rather than
+   * announcing a state it does not have.
+   */
+  valueUnknown?: boolean;
   /** Required in practice: the switch renders only a decorative knob, so
    *  without this a screen reader announces "button, pressed" and never says
    *  WHAT is being toggled. Callers pass the visible row/panel title. */
@@ -18,17 +28,22 @@ export function Toggle({
 }) {
   return (
     <button
-      onClick={onToggle}
-      aria-pressed={enabled}
+      onClick={valueUnknown ? undefined : onToggle}
+      disabled={valueUnknown}
+      aria-pressed={valueUnknown ? undefined : enabled}
       aria-label={ariaLabel}
       aria-describedby={ariaDescribedby}
       className={`relative w-11 h-[26px] rounded-full transition-colors shrink-0 focus-visible:outline-2 focus-visible:outline-[var(--mem-focus-ring)] focus-visible:outline-offset-2 ${
-        enabled ? "bg-[var(--mem-accent-indigo)]" : "bg-[var(--mem-hover-strong)]"
+        valueUnknown
+          ? "bg-[var(--mem-hover-strong)] opacity-50 cursor-not-allowed"
+          : enabled
+            ? "bg-[var(--mem-accent-indigo)]"
+            : "bg-[var(--mem-hover-strong)]"
       }`}
     >
       <span
         className={`absolute top-[3px] w-5 h-5 rounded-full bg-white shadow-sm transition-transform ${
-          enabled ? "left-[22px]" : "left-[3px]"
+          valueUnknown ? "left-[12px]" : enabled ? "left-[22px]" : "left-[3px]"
         }`}
       />
     </button>
@@ -58,7 +73,9 @@ type SettingRowBaseProps = {
 
 type SettingRowProps = SettingRowBaseProps &
   (
-    | { enabled: boolean; onToggle: () => void; control?: never } // toggle row (today's API)
+    // Toggle row (today's API). `valueUnknown` is for the case where the
+    // current value could not be read at all — see `Toggle`.
+    | { enabled: boolean; onToggle: () => void; valueUnknown?: boolean; control?: never }
     | { control: React.ReactNode; enabled?: never; onToggle?: never } // custom-control row
   );
 
@@ -88,6 +105,7 @@ export function SettingRow(props: SettingRowProps) {
             <Toggle
               enabled={props.enabled}
               onToggle={props.onToggle}
+              valueUnknown={props.valueUnknown}
               aria-label={title}
               aria-describedby={describedBy}
             />
@@ -630,6 +648,14 @@ export type ProbeState =
   | { kind: "probing" }
   | { kind: "up"; detail?: string } // e.g. "Ollama 0.6.2"
   | { kind: "down"; detail?: string } // e.g. "connection refused"
+  // Round 5, D5. A measurement that WAS attempted and did not come back with
+  // an answer: the OS refused to look at a candidate path, an input the paths
+  // hang off could not be determined, a sidecar stop could not be confirmed.
+  // Deliberately its own kind rather than `down`, which is the tone for a
+  // MEASURED negative — rendering "could not confirm it ended" in the same
+  // red as "still running" asserts a state nobody observed. Deliberately not
+  // `idle`/`stale` either: those mean nobody looked yet, and something did.
+  | { kind: "unknown"; detail?: string }
   | { kind: "stale" }; // input edited since last probe
 
 export interface StatusChipProps {
@@ -652,6 +678,15 @@ const STATUS_CHIP_TONE: Record<
     bg: "bg-[var(--mem-status-danger-bg)]",
     text: "text-[var(--mem-status-danger-text)]",
     border: "border-[var(--mem-status-danger-border)]",
+  },
+  // Warning tokens, and a HOLLOW dot: filled dots are for the two states that
+  // assert something (up, down). This one asserts nothing — it reports that
+  // the reading did not come back.
+  unknown: {
+    dot: "border border-[var(--mem-status-warning-text)] rounded-full",
+    bg: "bg-[var(--mem-status-warning-bg)]",
+    text: "text-[var(--mem-status-warning-text)]",
+    border: "border-[var(--mem-status-warning-border)]",
   },
   probing: {
     dot: "bg-[var(--mem-text-tertiary)] rounded-full animate-pulse",
@@ -677,7 +712,7 @@ export function StatusChip({ state, label }: StatusChipProps) {
   const { t } = useTranslation();
   const tone = STATUS_CHIP_TONE[state.kind];
   const detail =
-    state.kind === "up" || state.kind === "down"
+    state.kind === "up" || state.kind === "down" || state.kind === "unknown"
       ? state.detail
       : state.kind === "stale"
         ? t("status.notVerified")

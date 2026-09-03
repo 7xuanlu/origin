@@ -282,3 +282,29 @@ describe("SettingRow", () => {
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 });
+
+// Round 5, D5. `could_not_measure` had no chip kind of its own, so it was
+// rendered as `down` — the same red, the same tone, as a MEASURED negative.
+// The label kept the words apart; colour is read first and said "bad" about a
+// state nobody observed. This kind exists so the two are not the same picture.
+describe("StatusChip unknown state", () => {
+  const chipFor = (label: string) =>
+    screen.getByText(new RegExp(label)).closest("span[aria-live]") as HTMLElement;
+
+  it("renders the warning token triplet, not the danger one", () => {
+    render(<StatusChip state={{ kind: "unknown" }} label="Last stop" />);
+    const chip = chipFor("Last stop");
+    expect(chip.className).toContain("bg-[var(--mem-status-warning-bg)]");
+    expect(chip.className).toContain("text-[var(--mem-status-warning-text)]");
+    expect(chip.className).toContain("border-[var(--mem-status-warning-border)]");
+    // The whole point: not the colour a measured negative gets.
+    expect(chip.className).not.toContain("var(--mem-status-danger-bg)");
+    expect(chip.className).not.toContain("var(--mem-status-success-bg)");
+  });
+
+  it("carries its own detail rather than borrowing the stale-state wording", () => {
+    render(<StatusChip state={{ kind: "unknown", detail: "pid identity was lost" }} label="Last stop" />);
+    expect(screen.getByText("Last stop · pid identity was lost")).toBeInTheDocument();
+    expect(screen.queryByText(/Not verified yet/)).toBeNull();
+  });
+});
