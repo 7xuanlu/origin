@@ -74,6 +74,14 @@ trap finish EXIT
 
 failures=0
 PORT=17931
+# The row this script writes is read back by a DIFFERENT process: the channel
+# starts afterwards, finds the row above its own window mark, and restates its
+# verdict as one of its own rows. In a reused GAUNTLET_OUT the carried region
+# holds every earlier run's rows too, so without something in the row naming the
+# run that took the measurement, one PASS left behind by an earlier run is
+# carried into every later one. `free` asserts the token reaches the detail
+# column; `no-run-token` asserts an unbindable row is a FAIL and not a pass.
+RUN_TOKEN="control-run-77"
 
 # --- the listener table the probe reads --------------------------------------
 # Real netstat shape on Windows; the POSIX branch of the probe reads lsof, so
@@ -107,6 +115,7 @@ run_case() { # name, script_under_test, mode, expect_rc, expect_row, expect_stde
   local name="$1" subject="$2" mode="$3" want_rc="$4" want_row="$5" want_err="$6"
   local case_dir="$work/case-$RANDOM$RANDOM"
   local bin="$case_dir/bin" out="$case_dir/out" rc=0 row="" stderr_text=""
+  local token="$RUN_TOKEN"
   mkdir -p "$bin"
 
   case "$mode" in
@@ -135,14 +144,33 @@ run_case() { # name, script_under_test, mode, expect_rc, expect_row, expect_stde
       printf 'not a directory\n' >"$case_dir/blocker"
       out="$case_dir/blocker/nested"
       ;;
+    no-run-token)
+      # The port is free and perfectly measurable. The only thing missing is the
+      # value that ties the row to THIS run -- and a row nothing downstream can
+      # attribute is not evidence, so it must FAIL rather than leave one more
+      # anonymous PASS for the next run into this directory to inherit.
+      write_stubs "$bin" "$(emit "$table_without_port")" 'exit 1'
+      mkdir -p "$out"
+      token=""
+      ;;
     *) printf '  FAIL %-22s unknown mode %s\n' "$name" "$mode"; return 1 ;;
   esac
 
   local shim_path="$bin"
   if command -v cygpath >/dev/null 2>&1; then shim_path="$(cygpath -u "$bin")"; fi
   local err_file="$case_dir/stderr"
-  PATH="$shim_path:$PATH" GAUNTLET_OUT="$out" GAUNTLET_CHANNEL="control" \
-    bash "$subject" "$PORT" >"$case_dir/stdout" 2>"$err_file" || rc=$?
+  # `env -u` and not an empty assignment: this harness can itself be run from a
+  # shell that exports GAUNTLET_RUN_TOKEN, and a case about an UNSET variable
+  # that quietly inherits one measures nothing.
+  if [[ -n "$token" ]]; then
+    PATH="$shim_path:$PATH" GAUNTLET_OUT="$out" GAUNTLET_CHANNEL="control" \
+      GAUNTLET_RUN_TOKEN="$token" \
+      bash "$subject" "$PORT" >"$case_dir/stdout" 2>"$err_file" || rc=$?
+  else
+    PATH="$shim_path:$PATH" GAUNTLET_OUT="$out" GAUNTLET_CHANNEL="control" \
+      env -u GAUNTLET_RUN_TOKEN \
+      bash "$subject" "$PORT" >"$case_dir/stdout" 2>"$err_file" || rc=$?
+  fi
   stderr_text="$(cat "$err_file" 2>/dev/null || true)"
   if [[ -f "$out/findings.tsv" ]]; then row="$(cat "$out/findings.tsv")"; fi
 
@@ -171,10 +199,18 @@ run_case() { # name, script_under_test, mode, expect_rc, expect_row, expect_stde
 # said FAIL and nothing read it, because a precheck runs before any Evaluate and
 # the POSIX channels have none. The row and the exit status now carry the same
 # verdict, and these two rows are what pin that.
+#
+# `free` asserts the RUN TOKEN in the detail column, not merely the word "free".
+# The row is read back by the channel process that starts after this one, out of
+# a carried region that in a reused GAUNTLET_OUT also holds every earlier run's
+# rows; the token is the only thing in the row that says which run measured the
+# port. Drop it and this case still says "measured free" while the row it
+# describes is indistinguishable from a corpse.
 CASES=(
-  "free|free|0|	PASS	0	measured free|"
+  "free|free|0|	PASS	0	measured free; run=control-run-77|"
   "busy|busy|1|	FAIL	0	BUSY: pid 4242|"
   "unmeasurable|unmeasurable|1|	FAIL	0	could not measure|"
+  "no-run-token|no-run-token|1|	FAIL	0	no run token to bind this precheck to|"
   "ledger-unwritable|ledger-unwritable|3||was measured and LOST"
   "out-uncreatable|out-uncreatable|3||cannot create"
 )
@@ -334,23 +370,23 @@ echo "controls:"
 
 control nc-unmeasurable-is-free \
   'a listener table that could not run is recorded as a free port' \
-  '  *)
-    st=FAIL
-    detail="could not measure whether $port is free; recorded as unusable, not as free"
-    ;;' \
-  '  *)
-    st=PASS
-    detail="measured free"
-    ;;' \
-  unmeasurable -- free busy ledger-unwritable out-uncreatable
+  '    *)
+      st=FAIL
+      detail="could not measure whether $port is free; recorded as unusable, not as free; run=$run_token"
+      ;;' \
+  '    *)
+      st=PASS
+      detail="measured free; run=$run_token"
+      ;;' \
+  unmeasurable -- free busy no-run-token ledger-unwritable out-uncreatable
 
 control nc-busy-is-informational \
   'a busy shared port is recorded as INFO, which no ledger rule counts' \
-  '    st=FAIL
-    detail="BUSY: pid $LISTENER_PROBE_PID is listening on $port"' \
-  '    st=INFO
-    detail="BUSY: pid $LISTENER_PROBE_PID is listening on $port"' \
-  busy -- free unmeasurable ledger-unwritable out-uncreatable
+  '      st=FAIL
+      detail="BUSY: pid $LISTENER_PROBE_PID is listening on $port; run=$run_token"' \
+  '      st=INFO
+      detail="BUSY: pid $LISTENER_PROBE_PID is listening on $port; run=$run_token"' \
+  busy -- free unmeasurable no-run-token ledger-unwritable out-uncreatable
 
 control nc-ledger-loss-is-not-fatal \
   'the measured verdict row is lost and the script still exits 0' \
@@ -360,13 +396,13 @@ fi' \
   '  echo "[LEDGER] exiting 3 rather than letting an unrecorded FAIL read as a pass" >&2
   :
 fi' \
-  ledger-unwritable -- free busy unmeasurable out-uncreatable
+  ledger-unwritable -- free busy unmeasurable no-run-token out-uncreatable
 
 control nc-verdict-swallowed-at-exit \
   'the measured verdict is recorded and then thrown away by an unconditional exit 0' \
   '[ "$st" = PASS ]' \
   'exit 0' \
-  busy unmeasurable -- free ledger-unwritable out-uncreatable
+  busy unmeasurable no-run-token -- free ledger-unwritable out-uncreatable
 
 control nc-outdir-unchecked \
   'the output directory cannot be created and the script says the wrong thing' \
@@ -375,7 +411,19 @@ control nc-outdir-unchecked \
   exit 3
 fi' \
   'mkdir -p "$GAUNTLET_OUT" 2>/dev/null || true' \
-  out-uncreatable -- free busy unmeasurable ledger-unwritable
+  out-uncreatable -- free busy unmeasurable no-run-token ledger-unwritable
+
+# The half of the run-token remedy that lives in THIS script: an unset token is
+# a FAIL, not a shrug. Revert it and the precheck reports a pass for a row no
+# later reader can attribute to a run -- which is the corpse the channel then
+# carries in, exactly as it did before the token existed.
+control nc-unbound-precheck-is-a-pass \
+  'a precheck with no run token to bind it to is recorded as a passing measurement' \
+  '  st=FAIL
+  detail="no run token to bind this precheck to: GAUNTLET_RUN_TOKEN is unset, so this row cannot be told from one an earlier run left in this reused GAUNTLET_OUT"' \
+  '  st=PASS
+  detail="measured free"' \
+  no-run-token -- free busy unmeasurable ledger-unwritable out-uncreatable
 
 # --- the harness's own aim ---------------------------------------------------
 if [[ "$(cat "$script")" != "$script_before" ]]; then
