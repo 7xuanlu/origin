@@ -404,12 +404,26 @@ fn modified_unix_seconds(metadata: &fs::Metadata) -> i64 {
 /// never sees it. Folder ingestion feeds untrusted PDFs through here, so a
 /// crafted file in a watched folder can still take the daemon down.
 ///
-/// We are knowingly still exposed. The fix is lopdf `>= 0.42`, whose only route
-/// is `pdf-extract` 0.12 (it requires `lopdf ^0.42`) — and 0.12 is the version
-/// `tests/pdf_per_page_font_decoding.rs` exists to keep out, because it caches
-/// fonts by local resource name and silently returns wrong text as `Ok`. A
-/// crash we recover from beat corrupt memories we cannot detect. Revisit when
-/// pdf-extract ships the per-page font fix (jrmuizel/pdf-extract#157).
+/// Worse, the abort repeats. Startup requeues rows left `in_progress` by a
+/// crash (`MemoryDB::reset_in_progress_documents`) and clears their retry
+/// schedule, and the macOS service is installed with launchd `KeepAlive` on
+/// failure, so the same file is re-read after each restart until someone
+/// removes it. `app/src/sources/local_files.rs` parses PDFs with no guard at
+/// all.
+///
+/// We are knowingly still exposed, because no *published* `pdf-extract` gives
+/// both properties. 0.12 is the first to require `lopdf ^0.42` (there is no
+/// 0.11), and 0.12 is exactly what `tests/pdf_per_page_font_decoding.rs` exists
+/// to keep out: it caches fonts by local resource name for the whole document,
+/// so a later `/F1` decodes with an earlier font and extraction returns wrong
+/// text as `Ok`. Corrupt memories are silent; this crash is at least loud.
+///
+/// The open path is a pinned `pdf-extract` 0.10.0 whose only change is its
+/// `lopdf` requirement raised to 0.42. That combination has been verified to
+/// compile unmodified and to keep both font tests passing, but it needs a
+/// vendored or forked source, so it is a dependency-policy call rather than a
+/// version bump. Otherwise, wait for the per-page font fix upstream
+/// (jrmuizel/pdf-extract#157).
 pub fn extract_pdf_text(bytes: &[u8]) -> Result<String, String> {
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pdf_extract::extract_text_from_mem(bytes)
