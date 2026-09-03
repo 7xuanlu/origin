@@ -24,9 +24,31 @@ installer moves it.
 In sidecar mode (no service registration) a quit or SIGTERM asks the daemon to shut
 down over HTTP and kills it through the child handle if it has not released the port
 within 3 s. On Windows the sidecar is also bound to a kill-on-close job object, so an
-app crash takes it down too; when that binding fails the app logs it and keeps the
-daemon running, and the crash case is then not covered. A launchd, systemd, or Task
-Scheduler daemon is service-owned and outlives the app by design.
+app crash takes it down too. That binding can fail (a restricted token, a job
+assignment the OS refuses), and the outcome is recorded on the sidecar handle as
+`daemon_start::JobBinding` rather than only logged: `sidecar_job_binding()` answers
+`Bound`, `Unbound { reason }`, or `NotSupported`, and never assumes. Startup still
+continues on `Unbound` — refusing to start would leave the user with no daemon at all
+— but the quit path then verifies its kill against the recorded pid *and* process
+start time and reissues it.
+
+**Ending the daemon is best-effort, and which cases are covered is a measurement, not
+a promise.** `daemon_start::stop_sidecar` returns a `SidecarStopOutcome` —
+`Ended`, `StillRunning { reason }`, `CouldNotMeasure { reason }`, or `NoSidecar` —
+and the last one is on the diagnostics wire as `daemon.last_sidecar_stop` (`null`
+until the app has tried to stop one; `null` is not `ended`). Concretely:
+
+| Case | Does the daemon end? |
+|---|---|
+| Windows, `JobBinding::Bound` | Yes, on every exit including a hard kill: the job object ends it when the app's last handle closes. This is the only categorical case. |
+| Any platform, app code runs, the daemon answers the shutdown request | Yes, and it is measured: the port is released and the recorded process is confirmed gone. |
+| Any platform, app code runs, the daemon must be killed | Usually — the child handle kill, plus a kill by pid when the binding did not take. The outcome says which. |
+| `Unbound` **and** the sidecar's start time could not be captured | **No guarantee.** The process cannot be identified, so no kill by pid is issued (killing an unidentified pid is worse than not killing) and the result is `CouldNotMeasure`. |
+| `Unbound` and the kill by pid failed | **No.** Reported as `StillRunning`; the next launch meets it as a held port. |
+| Hard kill of the app (Task Manager, a crash, `Stop-Process`) while `Unbound`, or on macOS/Linux, which have no job object | **No.** No app code runs, so nothing ends the daemon. |
+
+A launchd, systemd, or Task Scheduler daemon is service-owned and outlives the app by
+design.
 
 On macOS the app registers the launchd job first on a fresh install and starts its
 own sidecar only when launchd does not end up with a loaded job for the selected
@@ -37,9 +59,17 @@ button cannot both spawn a sidecar. Turning on "Run at Login" stops an app-owned
 sidecar before it hands the daemon to launchd, and starts one again if the handover
 fails.
 
+`lifecycle::launchd_owns_server_daemon` answers `Owns` / `DoesNot` / `Unknown`, and
+`Unknown` is a real third answer: `launchctl list` that will not run, exits nonzero,
+or exits 0 without printing its `PID/Status/Label` table, or a server plist that
+exists and cannot be read. Both owner decisions take a port-health measurement
+first, so an unknown owner only ever spawns against a silent port — and when it does,
+the app records it: `daemon.sidecar_spawned_on_unknown_owner` on the diagnostics wire
+is `true` for the rest of that run.
+
 ## llama-cpp-2 backend
 
-macOS builds use Metal, Windows x86_64 builds use Vulkan with observable CPU/OpenMP fallback, and Linux builds remain CPU/OpenMP. Windows setup, device selection, CI/release prerequisites, and physical Qwen live-smoke commands are in [`windows-vulkan.md`](windows-vulkan.md).
+macOS builds use Metal, Windows x86_64 builds use Vulkan, and Linux builds remain CPU/OpenMP. The Windows CPU/OpenMP fallback was observed on 2026-07-25 on a machine with a working vendor ICD — forced CPU and an injected bad device index both reloaded the model with zero GPU layers and reported a `fallback_reason`. It has never been observed on a machine with **no** ICD, because that path sits downstream of `LlamaBackend::init()`; the Vulkan SDK is a build-time prerequisite only, but the end-user impact of a missing vendor driver is unproven in both directions. Windows setup, device selection, CI/release prerequisites, physical Qwen live-smoke commands, and the driverless-VM gate that would settle the end-user question are in [`windows-vulkan.md`](windows-vulkan.md).
 
 ## ORT (ONNX Runtime) on Windows
 
@@ -48,6 +78,8 @@ If you see `Failed to load onnxruntime.dll` or version-mismatch errors on Window
 ## Manual Windows verification
 
 The CI matrix includes `windows-2022` for Windows-affecting PRs, but hosted runners do not prove physical GPU inference. Follow [`windows-vulkan.md`](windows-vulkan.md) on a real Windows 11 GPU machine and run all three Qwen live-smoke legs: Vulkan/device assertion, forced CPU, and injected CPU fallback.
+
+A fourth leg is defined but **has never been run**: the same install on a clean Windows VM or Windows Sandbox with *no* vendor ICD, from the real signed installer or release ZIP, loading a real GGUF and asserting `/api/status` reports `backend=cpu` and `gpu_layers=0`. The three legs above all ran on a machine with working drivers, so none of them covers it. Until that leg runs, the driverless end-user path is unproven — do not assert either that users are unaffected or that they are affected.
 
 ## Linux smoke from macOS
 

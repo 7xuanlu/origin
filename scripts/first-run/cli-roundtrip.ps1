@@ -11,6 +11,11 @@
 $ErrorActionPreference = "Continue"
 . (Join-Path $PSScriptRoot "lib.ps1")
 
+# This helper owes four rows on every path, including the WENLAN_BIN guard
+# below, which records cli-status and stops: the other three then read as
+# never run, which is what they are.
+Expect-Rows -Names @("cli-status", "cli-capture", "cli-memories", "cli-search")
+
 # Never let a connect failure start a registered daemon; the gauntlet boots its own.
 if (-not $env:WENLAN_NO_AUTOSTART) { $env:WENLAN_NO_AUTOSTART = "1" }
 # An empty WENLAN_HOST would reach the CLI as a real (invalid) value.
