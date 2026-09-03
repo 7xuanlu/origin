@@ -16,6 +16,9 @@
 #   Assert-Version -Url u -Expected v
 #   Collect path...                                  copy into $GAUNTLET_OUT/logs
 #   Expect-Rows -Names @("a","b")                    declare the PASS/FAIL rows this process contracts to record
+#   Record-CarriedRow -Name n                        judge a row the workflow recorded BEFORE this process started
+#                                                    (it is above the mark, so Evaluate never judges it) and record
+#                                                    the verdict as `n-carried` in this run's window
 #   Check-Helper -Name n -Interpreter i -Path p      run a helper script through an interpreter AS a recorded check
 #     -MustDeclare "^mcp-"                         ... and FAIL unless the helper declared a row matching it
 #   Evaluate                                         print table; return $true when no FAIL row and no declared row is missing
@@ -268,8 +271,22 @@ function Count-Declared([string]$pattern) {
     # -ErrorAction Stop: a read that FAILED must not return 0. The before-count
     # is taken outside Check, so a silent 0 there plus a working after-read is a
     # positive delta over rows this run never declared.
-    if (-not (Test-Path $script:GauntletExpectedFile)) { return 0 }
-    return @(Get-Content $script:GauntletExpectedFile -ErrorAction Stop | Where-Object {
+    #
+    # Which is why `Test-Path` is not the absence test here either, for the
+    # reason Measure-LedgerBaseline gives: it answers $false to a failed lookup
+    # as well as to a missing file, and a 0 from the first is the silent 0 the
+    # paragraph above is about. Only ItemNotFoundException is an absence.
+    $lines = $null
+    try {
+        $lines = Read-Ledger $script:GauntletExpectedFile
+    } catch {
+        if ($_.Exception -and
+            $_.Exception.GetType().FullName -eq "System.Management.Automation.ItemNotFoundException") {
+            return 0
+        }
+        throw
+    }
+    return @($lines | Where-Object {
         $c = $_ -split "`t"
         $c.Count -ge 2 -and $c[0] -eq $script:GauntletChannel -and $c[1] -cmatch $pattern
     }).Count
@@ -446,6 +463,70 @@ function Expect-Rows {
         Assert-RowName $n
         Write-Ledger $script:GauntletExpectedFile ("{0}`t{1}" -f $script:GauntletChannel, $n)
     }
+}
+
+function Record-CarriedRow {
+    # A row the WORKFLOW recorded in its own step before this process started,
+    # so it sits above the mark and Evaluate reports it as carried in, never
+    # judges it -- and a declaration of it could therefore never be balanced.
+    # This restates its verdict as one row, `<Name>-carried`, inside this run's
+    # window, which is the row a channel declares instead.
+    #
+    #   PASS  exactly one carried row of this channel is named $Name and PASSed.
+    #   FAIL  it FAILed, or it is absent (the workflow step did not record it),
+    #         or it appears more than once and they cannot be told apart.
+    #   no row at all when findings.tsv could not be READ: nothing was measured,
+    #         so this sets GauntletLedgerBroken and Evaluate refuses, exactly as
+    #         it does for a ledger that could not be written.
+    param([Parameter(Mandatory)][string]$Name)
+    Assert-RowName $Name
+    $rowName = "$Name-carried"
+    # An unusable mark makes "the carried region" meaningless, and Evaluate is
+    # already refusing on it; a row recorded here would only add a verdict to a
+    # run that has none.
+    if ($script:GauntletWindowBroken) { return }
+    $lines = @()
+    try {
+        $lines = Read-Ledger $script:GauntletTsv
+    } catch {
+        if ($_.Exception -and
+            $_.Exception.GetType().FullName -eq "System.Management.Automation.ItemNotFoundException") {
+            $lines = @()
+        } else {
+            if (-not $script:GauntletLedgerBroken) {
+                $script:GauntletLedgerBroken = "cannot read $script:GauntletTsv to look for the carried '$Name' row: $($_.Exception.Message)"
+            }
+            Write-Host "[LEDGER] cannot read $script:GauntletTsv to look for the carried '$Name' row: $($_.Exception.Message)"
+            return
+        }
+    }
+    $carried = @()
+    if ($script:GauntletFindingsBase -gt 0) {
+        $carried = @($lines | Select-Object -First $script:GauntletFindingsBase)
+    }
+    # -ceq, because Evaluate matches declared against recorded names with an
+    # ordinal comparer; a name that differs by case is a different row there.
+    $hits = @()
+    foreach ($line in $carried) {
+        $cols = $line -split "`t"
+        if ($cols.Count -ge 3 -and $cols[0] -eq $script:GauntletChannel -and $cols[1] -ceq $Name) {
+            $hits += , $cols
+        }
+    }
+    if ($hits.Count -eq 0) {
+        Record-Row FAIL $rowName 1 ("no '$Name' row for $script:GauntletChannel was carried into this run: " +
+            "the workflow step that records it before this script starts did not record it")
+        return
+    }
+    if ($hits.Count -gt 1) {
+        Record-Row FAIL $rowName 1 ("$($hits.Count) '$Name' rows for $script:GauntletChannel were carried into " +
+            "this run, so which one this run started behind cannot be told")
+        return
+    }
+    $cols = $hits[0]
+    $detail = if ($cols.Count -ge 5) { $cols[4] } else { "" }
+    if ($cols[2] -eq "PASS") { Record-Row PASS $rowName 0 $detail }
+    else { Record-Row FAIL $rowName 1 ("the carried '$Name' row is $($cols[2]): " + $detail) }
 }
 
 function Check-Helper {

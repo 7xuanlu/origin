@@ -925,9 +925,10 @@ function Remove-Retry([string]$Target) {
 # The rows this channel owes, declared before the run rather than derived from
 # it. The helpers declare their own (cli-*, mcp-*) from their own inputs.
 Expect-Rows -Names @(
-    # Recorded by the workflow's precheck step, before this script starts, and
-    # declared here because Evaluate now fails on an undeclared row.
-    "port-7878-precheck",
+    # The workflow's precheck step records `port-7878-precheck` before this
+    # script starts, so that row is carried in; Record-CarriedRow below restates
+    # its verdict as a row of this run's.
+    "port-7878-precheck-carried",
     "download-setup",
     "nsis-silent-install",
     "app-exe-found",
@@ -955,6 +956,7 @@ Expect-Rows -Names @(
     "teardown-sidecar-gone",
     "no-leftover-dirs"
 )
+Record-CarriedRow -Name "port-7878-precheck"
 
 try {
     New-Item -ItemType Directory -Force -Path $Work | Out-Null

@@ -386,6 +386,60 @@ if ($Case) {
             $swapped = @($lines[1], $lines[0])
             Set-Content -LiteralPath $script:GauntletExpectedFile -Value $swapped -Encoding utf8
         }
+        "carried-row-passing" {
+            # The workflow records port-7878-precheck in its own step, before
+            # this process starts, so the row is above the mark and Evaluate
+            # never judges it. Record-CarriedRow restates its verdict here.
+            Expect-Rows -Names @("port-7878-precheck-carried")
+            Record-CarriedRow -Name "port-7878-precheck"
+        }
+        "carried-row-failing" {
+            Expect-Rows -Names @("port-7878-precheck-carried")
+            Record-CarriedRow -Name "port-7878-precheck"
+        }
+        "carried-row-absent" {
+            # Nothing seeded: the workflow step did not record its row, which is
+            # the state a declaration of it exists to catch.
+            Expect-Rows -Names @("port-7878-precheck-carried")
+            Record-CarriedRow -Name "port-7878-precheck"
+        }
+        "carried-row-declared-the-old-way" {
+            # The shape being replaced, kept as its own case so the fix is not a
+            # no-op: declaring the carried row itself can never be balanced,
+            # because the row it names is above the mark and is never counted as
+            # recorded. Declared once, recorded zero times, GONE, on every run.
+            Expect-Rows -Names @("port-7878-precheck", "a")
+            Check -Name "a" -Script { Write-Output "ok" }
+        }
+        "declaration-count-lookup-answers-absent" {
+            # Test-Path answers $false to "not there" AND to "the lookup itself
+            # failed". The shadow fails the FIRST lookup of expected.tsv, which
+            # is Check-Helper's before-count: a 0 from it turns the earlier run's
+            # carried cli-* declaration into a delta this helper never declared.
+            Expect-Rows -Names @("driver")
+            $helper = Join-Path $script:GauntletOut "silent.ps1"
+            Set-Content -Path $helper -Value 'Write-Output "returned before Expect-Rows"; exit 0' -Encoding utf8
+            $script:FailNextExpectedLookup = $true
+            function Test-Path {
+                param(
+                    [Parameter(Position = 0)][string]$Path,
+                    [string]$LiteralPath,
+                    [string]$PathType
+                )
+                $target = if ($LiteralPath) { $LiteralPath } else { $Path }
+                if ($script:FailNextExpectedLookup -and $target -eq $script:GauntletExpectedFile) {
+                    $script:FailNextExpectedLookup = $false
+                    return $false
+                }
+                if ($LiteralPath) { return (Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath) }
+                return (Microsoft.PowerShell.Management\Test-Path -Path $Path)
+            }
+            Check-Helper -Name "driver" -Interpreter (Get-Process -Id $PID).Path `
+                -InterpreterArgs @("-NoProfile", "-File") -Path $helper -MustDeclare "^cli-"
+            # The lie is spent on the before-count; everything after it, Evaluate
+            # included, gets the real answer.
+            $script:FailNextExpectedLookup = $false
+        }
         default { Write-Host "unknown case: $Case"; exit 99 }
     }
     if (Evaluate) { exit 0 } else { exit 1 }
@@ -602,6 +656,44 @@ Assert-Case -Name "helper-declaration-count-unreadable" -ExpectExit 1 `
     -ExpectText @("[FAIL] driver", "cannot count the rows already declared",
                   "[PASS] after-the-driver") `
     -RejectText @("GONE")
+
+# Test-Path answers $false to a failed lookup as well as to a missing file, so
+# the before-count returned 0 for a file it could not look up and the after-count
+# then read the PREVIOUS run's declarations as this helper's own.
+Assert-Case -Name "declaration-count-lookup-answers-absent" -ExpectExit 1 `
+    -SeedExpected @("libtest`tcli-roundtrip") `
+    -ExpectText @("[FAIL] driver", "declared no NEW row matching '^cli-'", "before=1 after=1") `
+    -RejectText @("declared 1 new")
+
+# --- rows the workflow records before the channel starts -------------------
+# The precheck step appends its row to findings.tsv before the channel script
+# dot-sources this library, so the row lands above the mark: reported as carried
+# in, never judged. Declaring it was therefore a contract that could never be
+# balanced -- GONE on every run -- and dropping the declaration would leave
+# nothing checking the step ran at all. Record-CarriedRow judges it here instead.
+Assert-Case -Name "carried-row-passing" -ExpectExit 0 `
+    -SeedFindings @("libtest`tport-7878-precheck`tPASS`t0`tmeasured free") `
+    -ExpectText @("[PASS] port-7878-precheck-carried",
+                  "0 FAIL row(s), 0 declared row(s) never recorded, 0 undeclared") `
+    -RejectText @("GONE", "DRIFT")
+
+Assert-Case -Name "carried-row-failing" -ExpectExit 1 `
+    -SeedFindings @("libtest`tport-7878-precheck`tFAIL`t0`tBUSY: pid 4321 is listening on 7878") `
+    -ExpectText @("[FAIL] port-7878-precheck-carried",
+                  "the carried 'port-7878-precheck' row is FAIL", "BUSY: pid 4321") `
+    -RejectText @("GONE", "DRIFT")
+
+Assert-Case -Name "carried-row-absent" -ExpectExit 1 `
+    -ExpectText @("[FAIL] port-7878-precheck-carried",
+                  "the workflow step that records it before this script starts did not record it") `
+    -RejectText @("GONE", "DRIFT")
+
+# The negative control for the three above: the OLD declaration, with the row
+# seeded before the subject starts exactly as the workflow leaves it. If this
+# went green the rename would be a no-op.
+Assert-Case -Name "carried-row-declared-the-old-way" -ExpectExit 1 `
+    -SeedFindings @("libtest`tport-7878-precheck`tPASS`t0`tmeasured free") `
+    -ExpectText @("GONE", "port-7878-precheck", "1 declared row(s) never recorded")
 
 # --------------------------------------------------------------------------
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue

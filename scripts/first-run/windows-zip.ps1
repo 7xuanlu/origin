@@ -1444,11 +1444,10 @@ function Stop-Daemon {
 # list generated from the checks that executed would shrink silently with them.
 # The helpers declare their own rows (cli-*, mcp-*) from their own inputs.
 Expect-Rows -Names @(
-    # Recorded by the workflow's precheck step, before this script starts. It
-    # is declared here because Evaluate now treats an undeclared row as drift
-    # and fails on it: an undeclared check leaves a hole its own size, since
-    # nothing would notice it disappearing.
-    "port-7878-precheck",
+    # The workflow's precheck step records `port-7878-precheck` before this
+    # script starts, so that row is carried in; Record-CarriedRow below restates
+    # its verdict as a row of this run's.
+    "port-7878-precheck-carried",
     "download-zip",
     "zip-members",
     "wenlan-on-path",
@@ -1476,6 +1475,7 @@ Expect-Rows -Names @(
     "no-leftover-dirs",
     "port-7878-closed"
 )
+Record-CarriedRow -Name "port-7878-precheck"
 
 try {
     # OWNERSHIP FIRST, before a single byte is installed or started, because
