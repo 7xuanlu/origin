@@ -2209,10 +2209,9 @@ jobs:
           bash scripts/validate-versions.test.sh
 
   # The Authenticode half of scripts/release-workflow-contract.test.py needs a
-  # Windows host. On Ubuntu -- the `docs` lane, which is where that suite runs
-  # today -- Get-AuthenticodeSignature does not exist, so five of the truth
-  # table's six rows and four of its five mutations print UNCHECKED and the
-  # suite exits 0. That is the repository's own recurring defect: a measurement
+  # Windows host. No CI job ran that suite before this one; on an Ubuntu lane
+  # Get-AuthenticodeSignature does not exist, so five of the truth table's six
+  # rows and four of its five mutations print UNCHECKED and the suite exits 0. That is the repository's own recurring defect: a measurement
   # that could not be taken, reported in a way that reads like one that came
   # back clean. WENLAN_REQUIRE_AUTHENTICODE=1 turns those UNCHECKED lines fatal,
   # and it is set HERE and only here, because a lane that cannot run the check
