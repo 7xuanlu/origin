@@ -15,7 +15,6 @@ part of packaging behavior, not generic local helpers.
 | Isolated dev runtime | `dev-runtime.sh`, `dev-all.sh` | worktree-owned daemon/UI ports, data dir, debug MCP socket, PID, and teardown |
 | Host process primitives | `lib/host-process.sh` | sourced by `dev-runtime.sh` and both smokes; tri-state port/liveness/image probes, path spelling, identity-checked kill |
 | Evidence wrapper | `attest.sh` | portable replacement for the personal `~/.claude/bin/attest.sh`; appends to `.claude/attest.jsonl` and fails when it cannot |
-| Negative controls | `negative-controls/` | each reverts one half of a shipped remedy and FAILS if the defending suite stays green; see its README |
 | Surface smokes | `smoke-cli.sh`, `smoke-mcp.sh` | isolated port + data dir + pages dir; asserted teardown; exact ledger multiset |
 | Version lockstep | `release-version-sync.test.ts` | app, Cargo, Tauri versions must match |
 | Sidecar tests | `prepare-sidecars.test.ts` | locks path and cloudflared behavior |
@@ -195,35 +194,6 @@ bash -n scripts/smoke-mcp.sh
 bash -n scripts/attest.sh
 bash scripts/prepare-sidecars.sh --print-paths
 pnpm vitest run scripts/prepare-sidecars.test.ts scripts/release-version-sync.test.ts scripts/dev-runtime.test.ts scripts/host-process.test.ts scripts/attest.test.ts
-
-# A green suite does not prove the suite would notice the bug. Before changing
-# host-process.sh, dev-runtime.sh's process scan or ownership record,
-# first-run/lib.ps1, first-run/port-precheck.sh, first-run/windows-zip.ps1 or
-# first-run/windows-nsis.ps1 (their port, health and process-liveness probes),
-# the Authenticode step in release.yml, or a drift_guard tooth, run the control
-# that defends it -- no PR lane runs these negative-control harnesses,
-# lib.test.ps1 or the first-run channels, so these are a pre-merge step by hand.
-# Run the sweep, not the individual harnesses. Eleven separate command lines
-# produce eleven separate results and no aggregate: run eight of them, read eight
-# greens, and conclude the suite swept -- a partial run that looks exactly like
-# a complete one. run-all.sh holds a registry, refuses a harness that exited 0
-# without reaching its completion marker, refuses a marker that contradicts the
-# exit status, and prints one verdict. ~50 min; the posix harness is ~26 of it.
-bash scripts/negative-controls/run-all.sh
-
-# Individual harnesses, for iterating on one control. A green here is evidence
-# about that harness only -- it is not a sweep, and must not be reported as one.
-python3 scripts/negative-controls/posix-probes-negative-controls.py
-bash    scripts/negative-controls/lib-ps1-negative-controls.sh
-python3 scripts/negative-controls/authenticode-step-receipt.py
-python3 scripts/negative-controls/a-drift-guard-inventory.py
-python3 scripts/negative-controls/a-drift-guard-replica.py
-bash    scripts/negative-controls/port-precheck-controls.sh
-bash    scripts/negative-controls/dev-runtime-scan-controls.sh
-bash    scripts/negative-controls/dev-runtime-record-controls.sh
-bash    scripts/negative-controls/dev-runtime-stage-controls.sh
-bash    scripts/negative-controls/dev-runtime-lock-race-controls.sh
-python3 scripts/negative-controls/windows-probes-negative-controls.py
 ```
 
 - Creating and destroying need different evidence. A name being free beforehand
@@ -239,10 +209,3 @@ python3 scripts/negative-controls/windows-probes-negative-controls.py
   were spelled that way and none of them measured what its name claimed. Where a
   control's pass condition is an exception, the control must check *which*
   exception, by matching text that only its own rule emits.
-- The two Windows first-run channels must never be RUN to check a change to
-  them: `windows-zip.ps1` and `windows-nsis.ps1` each `Remove-Item -Recurse
-  -Force` `%LOCALAPPDATA%\wenlan`, which on a developer machine is the real
-  memorydb, config and logs. `windows-probes-negative-controls.py` extracts
-  their probes and the `Check` blocks that call them and drives those in
-  isolation; verification of these two files is static analysis plus that
-  harness, never execution.
