@@ -1524,7 +1524,7 @@ describe("dev runtime daemon staging", () => {
     // Called, and only on the Windows path.
     const calls = body.match(/^\s*stage_windows_daemon\b.*$/gm) ?? [];
     expect(calls, "start_runtime does not call stage_windows_daemon").toHaveLength(1);
-    const call = calls[0];
+    const call = calls[0]!;
     const guard = body.slice(0, body.indexOf(call));
     expect(
       guard.slice(guard.lastIndexOf("if ")),
@@ -1872,7 +1872,7 @@ describe("dev runtime lock release and recovery", () => {
   // is exactly one temp directory in play and no ordering between node and bash
   // to get wrong — and, more to the point, the owner file has to be written with
   // the DRIVER's `$$`, which only the driver knows.
-  const releaseRun = (shims: Record<string, string> = {}): Run =>
+  const releaseRun = (shims: Record<string, string> = {}): Run & { dir: string } =>
     drive(['eval "$WENLAN_TEST_FIXTURE"', RELEASE_DRIVER].join("\n"), releaseFns, { shims });
 
   // The owner file carries this run's acquisition token, which is what the
