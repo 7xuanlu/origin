@@ -35,9 +35,8 @@ $SnapshotDoubt = "not recorded"
 # process sweep above uses. `Remove-Retry $DataDir` ran unconditionally, and
 # $DataDir is %LOCALAPPDATA%\wenlan -- the developer's real memorydb, config
 # and logs. Sixteen lines above that call this file records
-# `data-dir-survives-uninstall` with the note "user data is not removed by
-# the uninstaller", so the invariant was already written down here; the
-# teardown simply broke it afterwards, where nobody was reading.
+# `user-data-survives-uninstall`, so the invariant was already written down
+# here; the teardown simply broke it afterwards, where nobody was reading.
 #
 # Absent before AND present after this run installed. Absent-before alone
 # licenses creating and nothing else; a pre-existing tree is never this
@@ -51,6 +50,11 @@ $SnapshotDoubt = "not recorded"
 # ABOUT. See WHAT BINDS A TREE TO THIS RUN.
 $preDataDir = $null
 $preInstall = $null
+# The user's files under $DataDir as they were on the statement before the
+# uninstaller ran. `finally` does not read it, but the Check that does runs
+# late enough that an abort before the snapshot must leave it recognisably
+# unset rather than undefined.
+$preDataSnapshot = $null
 # The install dir's post-read is KEPT for the log; nothing decides on it.
 $postInstall = $null
 $DataDirMark = $null
@@ -561,6 +565,40 @@ function Get-DirPresence([string]$Path) {
     }
 }
 
+# Every file under a tree, by relative path and SHA-256. Two states: taken, or
+# unmeasurable. A PARTIAL snapshot is unmeasurable rather than short, because
+# the files it failed to read are exactly the ones a later comparison would
+# report as untouched.
+#
+# The ownership marker is left out: it is this run's file, not the user's, and
+# it is DeleteOnClose, so it is present in the pre-read and absent from any
+# read taken after the handle goes.
+function Get-TreeFileDigests([string]$Root) {
+    $files = @{}
+    try {
+        $items = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction Stop)
+    } catch {
+        return [pscustomobject]@{ State = "unmeasurable"; Files = $files
+            Detail = "$Root could not be enumerated ($($_.Exception.GetType().FullName): $($_.Exception.Message))" }
+    }
+    $prefix = "$Root".TrimEnd('\') + '\'
+    foreach ($f in $items) {
+        $full = "$($f.FullName)"
+        $rel = if ($full.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $full.Substring($prefix.Length)
+        } else { $full }
+        if ($rel -eq $script:OwnerMarkerName) { continue }
+        try { $h = Get-FileHash -LiteralPath $full -Algorithm SHA256 -ErrorAction Stop }
+        catch {
+            return [pscustomobject]@{ State = "unmeasurable"; Files = $files
+                Detail = "$full could not be hashed ($($_.Exception.GetType().FullName): $($_.Exception.Message)); a snapshot missing a file cannot say that file survived" }
+        }
+        $files[$rel] = "$($h.Hash)"
+    }
+    return [pscustomobject]@{ State = "taken"; Files = $files
+        Detail = "$($files.Count) files under $Root, SHA-256 each, the ownership marker excluded" }
+}
+
 # --- WHAT BINDS A TREE TO THIS RUN -----------------------------------------
 #
 # "Absent before AND present after" is a SEQUENCE OF STATES, and round-5 review
@@ -947,6 +985,7 @@ Expect-Rows -Names @(
     "uninstall-silent",
     "uninstall-removes-dir",
     "uninstall-removes-registry-key",
+    "user-data-survives-uninstall",
     # Recorded from the `finally`, so they exist on every run including one that
     # aborted on its first statement. `sidecar-sweep-measured` grades the READ
     # -- can this run account for its own daemons -- and the two `teardown-*`
@@ -1207,6 +1246,14 @@ try {
     # this run is holding, and the reader needs to be told which it was.
     $InstallMarkRelease = Close-OwnerMark $InstallMark
     Info "install-dir-claim-released" "$($InstallMarkRelease.State) -- $($InstallMarkRelease.Detail)"
+    # The claim on the DATA dir is deliberately still held here, which is why
+    # the row below cannot be a read of the root: this run holds a
+    # DeleteOnClose handle inside that tree with FileShare.Delete withheld, and
+    # that alone is what keeps the directory undeletable (measured, see WHAT
+    # BINDS A TREE TO THIS RUN). The files are what the uninstaller can still
+    # take, so the files are what gets snapshotted.
+    $preDataSnapshot = Get-TreeFileDigests $DataDir
+    Info "user-data-before-uninstall" "$($preDataSnapshot.State) -- $($preDataSnapshot.Detail)"
     Check -Name "uninstall-silent" -Script {
         if (-not $Uninstaller -or -not (Test-Path $Uninstaller)) { throw "no uninstaller at '$Uninstaller'" }
         $proc = Start-Process -FilePath $Uninstaller -ArgumentList '/S' -Wait -PassThru
@@ -1253,13 +1300,51 @@ try {
         if ($after.State -eq "present") { throw "uninstall entry still present: $($after.Entry.PSPath)" }
         throw "could not measure whether the uninstall entry is gone: $($after.Detail); recorded as unproven, not as removed"
     }
-    # `Test-Path` again, and here the EXPECTED answer is "still there", so the
-    # collapse ran the other way: a data root that could not be read printed
-    # False and read as "the uninstaller removed the user's data", which is the
-    # loudest thing this row could possibly say and it could say it wrongly.
+    # THE ROOT'S SURVIVAL IS NOT EVIDENCE, so it is logged and decides nothing.
+    # This run is still holding the DeleteOnClose marker inside $DataDir with
+    # FileShare.Delete withheld, which makes the directory undeletable by
+    # anyone -- so "present" here is a fact about this script's own handle. An
+    # uninstaller that erased every file underneath would produce it too.
     $dataAfterUninstall = Get-DirPresence $DataDir
-    Info "data-dir-survives-uninstall" ("$($dataAfterUninstall.State) -- $($dataAfterUninstall.Detail) " +
-                                        "(expected present -- user data is not removed by the uninstaller)")
+    Info "data-dir-root-after-uninstall" ("$($dataAfterUninstall.State) -- $($dataAfterUninstall.Detail) " +
+                                          "(this run holds a handle inside it, so its presence witnesses nothing)")
+    # The claim itself, file by file. Three outcomes: every pre-existing file
+    # still there with the same SHA-256 (PASS), one missing or rewritten
+    # (FAIL), either snapshot not taken (unproven, never survived).
+    #
+    # It attributes a difference to the uninstaller because the app and the
+    # sidecar are measured gone by the two rows above, so nothing of this run's
+    # is still writing under $DataDir. A process this run does not own -- the
+    # developer's own daemon -- would make this row fail for someone else's
+    # write, and that is not distinguishable from here.
+    $postDataSnapshot = Get-TreeFileDigests $DataDir
+    Info "user-data-after-uninstall" "$($postDataSnapshot.State) -- $($postDataSnapshot.Detail)"
+    Check -Name "user-data-survives-uninstall" -Script {
+        if ($null -eq $preDataSnapshot -or $preDataSnapshot.State -ne "taken") {
+            $pre = if ($null -eq $preDataSnapshot) { "never taken" } else { "$($preDataSnapshot.State) -- $($preDataSnapshot.Detail)" }
+            throw "could not measure whether the user's data survived: the pre-uninstall snapshot of $DataDir was $pre; recorded as unproven, not as survived"
+        }
+        if ($postDataSnapshot.State -ne "taken") {
+            throw "could not measure whether the user's data survived: $($postDataSnapshot.Detail); recorded as unproven, not as survived"
+        }
+        # Nothing to lose is not proof that nothing was lost.
+        if ($preDataSnapshot.Files.Count -lt 1) {
+            throw "there were no files under $DataDir before the uninstall, so this run cannot show the uninstaller left any; recorded as unproven, not as survived"
+        }
+        $missing = @()
+        $changed = @()
+        foreach ($rel in $preDataSnapshot.Files.Keys) {
+            if (-not $postDataSnapshot.Files.ContainsKey($rel)) { $missing += $rel; continue }
+            if ($postDataSnapshot.Files[$rel] -ne $preDataSnapshot.Files[$rel]) { $changed += $rel }
+        }
+        if ($missing.Count -ne 0 -or $changed.Count -ne 0) {
+            $first = @(@($missing) + @($changed) | Select-Object -First 5)
+            throw ("the uninstaller took $($missing.Count) and rewrote $($changed.Count) of the " +
+                   "$($preDataSnapshot.Files.Count) files under ${DataDir}: " + ($first -join ", ") +
+                   "; user data is not the uninstaller's to remove")
+        }
+        Write-Output "all $($preDataSnapshot.Files.Count) files under $DataDir are byte-for-byte what they were before the uninstall"
+    }
 } finally {
     # THE GUI KILL RECEIPT IS KEPT. `Stop-ProcessByImage` is tri-state --
     # killed / gone / refused / unmeasurable -- and every one of those went to
