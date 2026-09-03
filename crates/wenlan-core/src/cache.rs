@@ -85,4 +85,24 @@ mod tests {
         assert_eq!(cache.get("query2"), Some(vec![2.0]));
         assert_eq!(cache.get("query3"), Some(vec![3.0]));
     }
+
+    /// A hit must make an entry most-recently-used, so the *other* entry is the
+    /// one evicted next. `test_lru_eviction` only inserts, so it still passes if
+    /// `get` stops promoting; this pins the recency half of the contract.
+    #[test]
+    fn test_get_promotes_entry() {
+        let mut cache = EmbeddingCache::new(2);
+
+        cache.put("query1", vec![1.0]);
+        cache.put("query2", vec![2.0]);
+
+        // Touch query1 so query2 becomes the least-recently-used entry.
+        assert_eq!(cache.get("query1"), Some(vec![1.0]));
+
+        cache.put("query3", vec![3.0]); // Should evict query2, not query1
+
+        assert_eq!(cache.get("query2"), None);
+        assert_eq!(cache.get("query1"), Some(vec![1.0]));
+        assert_eq!(cache.get("query3"), Some(vec![3.0]));
+    }
 }
