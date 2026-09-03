@@ -617,7 +617,7 @@ pub async fn handle_distill(
                         "force": true,
                         "page_id": page_id,
                         "updated": false,
-                        "hint": "force rebuild needs an LLM in the daemon — install an on-device model or set an Anthropic key via `wenlan setup` / `/origin:doctor`",
+                        "hint": "force rebuild needs an LLM in the daemon — install an on-device model or set an Anthropic key via `wenlan setup` / `/wenlan:setup`",
                     })));
                 }
                 db.clear_user_edited(page_id)
@@ -882,7 +882,7 @@ pub async fn handle_distill(
             let hint = if model_available {
                 "No page-sized cluster formed in this scope: nothing grouped into 3 or more related memories that fit one page. Capture more related memories, or check the daemon log for dropped clusters."
             } else {
-                "No synthesis model is configured or reachable: install an on-device model or set an Anthropic key via `wenlan setup` / `/origin:doctor` before distilling."
+                "No synthesis model is configured or reachable: install an on-device model or set an Anthropic key via `wenlan setup` / `/wenlan:setup` before distilling."
             };
             map.insert("hint".into(), serde_json::json!(hint));
         }
@@ -953,7 +953,7 @@ pub async fn handle_redistill(
         Ok(Json(serde_json::json!({
             "status": "skipped",
             "updated": false,
-            "hint": "page re-distill needs an LLM in the daemon — install an on-device model or set an Anthropic key via `wenlan setup` / `/origin:doctor`",
+            "hint": "page re-distill needs an LLM in the daemon — install an on-device model or set an Anthropic key via `wenlan setup` / `/wenlan:setup`",
         })))
     }
 }
