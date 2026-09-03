@@ -817,9 +817,65 @@ jobs:
     name: Build Windows desktop app bundle
     needs: [resolve-promotion, bind-release-tag]
     runs-on: windows-2022
-    timeout-minutes: 120
+    # A job timeout starts when the JOB starts, not when the signing step does,
+    # so budgeting only the SignPath wait would let a slow compile kill the job
+    # before the action ever reaches its own limit -- the same trap the macOS
+    # comment above describes. Measured on this repository's last four tag
+    # releases (runs 33043452863, 33121699208, 33284603345, 33291555184) the
+    # job took 38m21s to 39m00s end to end; in the most recent of those the
+    # bundle build alone was 36m10s and the whole post-build tail -- stage, DLL
+    # check, upload -- was 15s. So:
+    #    40  measured pre-signing work
+    #   +10  a 62 MB installer up to Actions, on to SignPath, and back down
+    #   +90  the wait-for-completion-timeout-in-seconds: 5400 set below, which
+    #        is waiting for a human approver, not for a machine
+    #   + 5  replace, re-sign, stage, verify Authenticode
+    #   +20  margin
+    #   =165
+    # Raise the wait and this together, and with them the exact value pinned in
+    # scripts/release-workflow-contract.test.py.
+    timeout-minutes: 165
     permissions:
+      # The SignPath action's github-token reads this run's job details and
+      # downloads the artifact the step before it uploaded; contents:read alone
+      # does not allow either. An explicit permissions block sets every scope it
+      # does not list to none, so this has to be spelled out.
+      actions: read
       contents: read
+    env:
+      # TWO questions, because they have different answers and the gap between
+      # them is where an unsigned installer ships green.
+      #
+      # SIGNPATH_CONFIGURED -- ARE the secrets here? Derived from all four, not
+      # from the token alone. The token-only form was not a bypass (the
+      # unconditional check below rejects any 1-to-3-of-4 combination before the
+      # build starts) but it said something false: a reader saw a sentinel that
+      # claimed to mean "SignPath is configured" while measuring one fifth of it.
+      # A set-but-empty secret still reads as empty to `!= ''`, which is why this
+      # is a boolean computed here rather than a bash test on the secret itself.
+      #
+      # SIGNPATH_REQUIRED -- MUST this build be signed? Nothing about the
+      # secrets. It is true only in the upstream repository AND only once
+      # signing has been switched on deliberately, and it is what turns
+      # "SignPath is not configured" from a description of the world into a
+      # failure. Without it, the day the Foundation accepts the application, a
+      # repository whose secrets were never installed -- or were installed in
+      # the wrong environment, or resolve as empty -- looks EXACTLY like this
+      # one does today: zero of four, every signing step skipped, the original
+      # unsigned installer staged, hashed, uploaded, and the job green. An
+      # accepted-but-unwired repository would be indistinguishable, at the
+      # release conclusion, from a pending one.
+      #
+      # `vars.` and not `secrets.`, deliberately, and it is the first Actions
+      # variable in this repository. A secret's value cannot be read back by a
+      # human or printed in a log, so a switch stored as a secret is a switch
+      # nobody can audit; this one is a visible, single flip in the repository
+      # settings, and signpath-status.yml reports on the day it is missing.
+      # Comparing to the literal 'true' rather than testing emptiness means
+      # `vars.SIGNPATH_ACTIVE` set to `false`, `0` or `no` reads as off instead
+      # of as on.
+      SIGNPATH_CONFIGURED: ${{ secrets.SIGNPATH_API_TOKEN != '' && secrets.SIGNPATH_ORGANIZATION_ID != '' && secrets.SIGNPATH_PROJECT_SLUG != '' && secrets.SIGNPATH_SIGNING_POLICY_SLUG != '' }}
+      SIGNPATH_REQUIRED: ${{ github.repository == '7xuanlu/wenlan' && vars.SIGNPATH_ACTIVE == 'true' }}
     outputs:
       setup_filename: ${{ steps.stage.outputs.setup_filename }}
       sig_filename: ${{ steps.stage.outputs.sig_filename }}
@@ -864,6 +920,134 @@ jobs:
           if [[ "v$APP_VERSION" != "$RELEASE_TAG" ]]; then
             echo "ERROR: Milestone-B 4b lockstep guard: app/tauri.conf.json version $APP_VERSION does not match release tag $RELEASE_TAG."
             exit 1
+          fi
+
+      # Deliberately unguarded, and deliberately first. Every signing step below
+      # carries `if: env.SIGNPATH_CONFIGURED`, so if this check carried it too it
+      # would skip alongside them in exactly the configurations it exists to
+      # reject, and a green run would publish an unsigned installer. This is the
+      # one step that must run whatever the configuration is. It runs before the
+      # ~40-minute bundle build so a misconfigured repository is told in seconds
+      # rather than at the end.
+      #
+      # It answers two questions and they are not the same question:
+      #
+      #   1. ALL-OR-NOTHING. Any 1-to-3-of-4 combination is a repository where
+      #      somebody began wiring SignPath and stopped, and it fails here.
+      #   2. REQUIRED-BUT-ABSENT. Zero of four is correct behaviour TODAY -- the
+      #      Foundation application is pending and every fork is in this state --
+      #      and it becomes a critical hole the day the application is accepted,
+      #      because an accepted repository whose secrets were never installed
+      #      produces the identical green unsigned release. SIGNPATH_REQUIRED is
+      #      what tells those two apart, and this step is where it bites.
+      - name: Check SignPath configuration is all-or-nothing, and present when required
+        shell: bash
+        env:
+          # Read here rather than branched on in `if:`, so the step runs in every
+          # configuration and the decision is in the script the contract test can
+          # execute. A step whose `if:` encodes the rule is a step that skips
+          # whenever the rule is about to fire.
+          SIGNPATH_REQUIRED: ${{ env.SIGNPATH_REQUIRED }}
+          SECRET_SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          SECRET_SIGNPATH_PROJECT_SLUG: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+          SECRET_SIGNPATH_SIGNING_POLICY_SLUG: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+          SECRET_SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          # Optional to the signing action, but not optional as evidence -- see
+          # the check on it below.
+          SECRET_SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ secrets.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+        run: |
+          set -euo pipefail
+          names=(
+            SIGNPATH_ORGANIZATION_ID
+            SIGNPATH_PROJECT_SLUG
+            SIGNPATH_SIGNING_POLICY_SLUG
+            SIGNPATH_API_TOKEN
+          )
+          present=0
+          for name in "${names[@]}"; do
+            var="SECRET_${name}"
+            if [[ -n "${!var:-}" ]]; then
+              present=$((present + 1))
+            fi
+          done
+          if [[ "$present" -ne 0 && "$present" -ne "${#names[@]}" ]]; then
+            for name in "${names[@]}"; do
+              var="SECRET_${name}"
+              if [[ -z "${!var:-}" ]]; then
+                echo "ERROR: SignPath secrets must be all set or all unset; $name is missing." >&2
+              fi
+            done
+            exit 1
+          fi
+          # The artifact configuration slug is optional to the signing action --
+          # unset selects the project's default configuration in the portal --
+          # but it is not optional as evidence. Set on its own it means somebody
+          # began wiring SignPath and stopped, and since this job keys on the
+          # four required values, the release would otherwise go green and
+          # publish an UNSIGNED installer. signpath-status.yml already reports
+          # exactly this state as half-configured; without this check the two
+          # shipping controls disagree about the same repository.
+          if [[ "$present" -eq 0 && -n "${SECRET_SIGNPATH_ARTIFACT_CONFIGURATION_SLUG:-}" ]]; then
+            echo "ERROR: SIGNPATH_ARTIFACT_CONFIGURATION_SLUG is set while none of the four required SignPath secrets are." >&2
+            echo "       The optional slug on its own signs nothing. Set all four, or unset it." >&2
+            exit 1
+          fi
+          # The sentinel and the count have to agree, or the guarded steps act on
+          # a different answer than the one this step just printed.
+          if [[ "$present" -eq "${#names[@]}" && "${SIGNPATH_CONFIGURED:-}" != "true" ]]; then
+            echo "ERROR: all four SignPath secrets are set but SIGNPATH_CONFIGURED is '${SIGNPATH_CONFIGURED:-}'." >&2
+            exit 1
+          fi
+          if [[ "$present" -eq 0 && "${SIGNPATH_CONFIGURED:-}" == "true" ]]; then
+            echo "ERROR: SIGNPATH_CONFIGURED is true but no SignPath secret is set." >&2
+            exit 1
+          fi
+          # THE LATCH. Everything above measures whether the secrets are HERE.
+          # This asks whether they were supposed to be, and it is the only thing
+          # in this job that can tell an intentionally unsigned release from a
+          # repository that was meant to sign and silently did not.
+          #
+          # Ordered after the all-or-nothing check on purpose: a half-configured
+          # repository gets the more specific message, naming the one secret it
+          # is missing, rather than this one.
+          if [[ "${SIGNPATH_REQUIRED:-}" == "true" && "$present" -ne "${#names[@]}" ]]; then
+            echo "ERROR: this repository has switched SignPath signing ON (vars.SIGNPATH_ACTIVE)" >&2
+            echo "       and the secrets it needs are not all readable from this job." >&2
+            echo "" >&2
+            for name in "${names[@]}"; do
+              var="SECRET_${name}"
+              if [[ -z "${!var:-}" ]]; then
+                echo "       MISSING: $name" >&2
+              else
+                echo "       present: $name" >&2
+              fi
+            done
+            echo "" >&2
+            echo "       Every signing step in this job is guarded on SIGNPATH_CONFIGURED, so" >&2
+            echo "       without this check the job would skip all five, stage and hash the" >&2
+            echo "       ORIGINAL UNSIGNED installer, upload it, and finish green. Refusing" >&2
+            echo "       instead: a release that was required to be signed will not publish" >&2
+            echo "       an unsigned installer." >&2
+            echo "" >&2
+            echo "       If a secret is set but reads as empty here, check that it is on the" >&2
+            echo "       repository rather than on an environment this job does not use, and" >&2
+            echo "       that this workflow is running in ${GITHUB_REPOSITORY:-the upstream repository}." >&2
+            echo "       To stand signing down deliberately, unset vars.SIGNPATH_ACTIVE." >&2
+            exit 1
+          fi
+
+          if [[ "$present" -eq 0 ]]; then
+            echo "SignPath is not configured. This release publishes an UNSIGNED Windows installer."
+            echo "SIGNPATH_REQUIRED is '${SIGNPATH_REQUIRED:-false}', so that is the intended state:"
+            echo "either this is a fork, or signing has not been switched on upstream yet."
+            echo "This step measures the secrets and that switch, and nothing else. Whether"
+            echo "SignPath Foundation has ACCEPTED the application is UNMEASURED here -- an"
+            echo "accepted application whose secrets were never installed looks exactly like an"
+            echo "application still pending. signpath-status.yml is what asks that question, and"
+            echo "it runs on a schedule precisely so accepted-but-not-switched-on is noticed."
+          else
+            echo "SignPath is configured. The installer will be Authenticode-signed before staging."
+            echo "SIGNPATH_REQUIRED is '${SIGNPATH_REQUIRED:-false}'."
           fi
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-13
@@ -964,6 +1148,162 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --target x86_64-pc-windows-msvc
 
+      # ---- Authenticode signing, SignPath Foundation ----------------------
+      # Everything from here to the Authenticode assertion is guarded on
+      # SIGNPATH_CONFIGURED, so a fork and this repository (whose Foundation
+      # application is still pending) both build green with no SignPath secret
+      # present. The unguarded all-or-nothing check near the top of this job is
+      # what stops a half-configured repository from taking that same silent
+      # path.
+      #
+      # Signing has to land BEFORE *Stage app bundle assets and checksums*: that
+      # step copies and hashes the installer immediately, and promote-app-assets
+      # rechecks those exact digests. Signing after it would publish either
+      # unsigned bytes or a digest that no longer matches the file.
+      - name: Upload the unsigned installer for SignPath
+        id: unsigned-installer
+        if: env.SIGNPATH_CONFIGURED == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: unsigned-windows-installer-${{ github.run_id }}
+          # A glob that matches exactly one file, so the artifact ZIP holds that
+          # installer at its root. That root is what the SignPath artifact
+          # configuration has to describe, and it is why this upload keeps
+          # `archive` at its default rather than using `archive: false`: raw
+          # mode ignores `name:` and derives the artifact name from the
+          # basename, which makes a run-attempt-scoped name useless for
+          # collision avoidance and pairs badly with `overwrite: true`.
+          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+          # The installer is already compressed; recompressing 62 MB buys
+          # nothing, exactly as in the staged upload at the end of this job.
+          compression-level: 0
+          # A re-run of this job would otherwise collide with the previous
+          # attempt's artifact of the same name.
+          overwrite: true
+          retention-days: 1
+          if-no-files-found: error
+
+      # Pinned by SHA, and listed in EXPECTED_NODE24_ACTIONS in
+      # scripts/release-workflow-contract.test.py -- that allowlist silently
+      # skips any action it does not know, so an unpinned SignPath reference
+      # would otherwise pass unnoticed.
+      - name: Submit the installer to SignPath for signing
+        id: signpath-request
+        if: env.SIGNPATH_CONFIGURED == 'true'
+        uses: SignPath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2.3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+          # Optional in the action's own manifest: unset selects the project's
+          # default artifact configuration in the portal, which must describe a
+          # ZIP root to match the upload above.
+          artifact-configuration-slug: ${{ secrets.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          github-token: ${{ github.token }}
+          wait-for-completion: true
+          # 600 by default, and this is waiting for a person: the Foundation's
+          # terms require a team member to approve each signing request. 5400
+          # matches the macOS notary wait and is budgeted into this job's
+          # timeout-minutes above.
+          wait-for-completion-timeout-in-seconds: "5400"
+          # WITHOUT THIS THE ACTION DOWNLOADS NOTHING AND SAYS NOTHING. The
+          # input is optional and its absence is silent -- the manifest reads
+          # "If not specified, the task will not download the signed artifact
+          # from SignPath" -- so the job would go green, staging would find the
+          # original unsigned installer exactly where it left it, and the
+          # release would ship unsigned.
+          output-artifact-directory: ${{ runner.temp }}/signpath-signed
+          # Left at its default on purpose: SignPath returns the ZIP that was
+          # submitted, and false makes the action extract it into the directory
+          # above, which is where the replacement step expects a bare
+          # *-setup.exe.
+          skip-decompress: "false"
+
+      - name: Replace the unsigned installer with the signed one
+        if: env.SIGNPATH_CONFIGURED == 'true'
+        shell: pwsh
+        env:
+          SIGNED_DIR: ${{ runner.temp }}/signpath-signed
+        run: |
+          $ErrorActionPreference = "Stop"
+          $nsisDir = "target/x86_64-pc-windows-msvc/release/bundle/nsis"
+
+          if (-not (Test-Path -LiteralPath $env:SIGNED_DIR)) {
+            throw "SignPath returned nothing to $env:SIGNED_DIR. output-artifact-directory is the input that makes the download happen at all; without a downloaded file this release would ship the unsigned installer."
+          }
+
+          # Cardinality first, on both sides. `find -print -quit` in the staging
+          # step takes whichever *-setup.exe it meets first, so more than one
+          # here is not a warning, it is a coin toss over what gets published.
+          $unsigned = @(Get-ChildItem -LiteralPath $nsisDir -Filter '*-setup.exe' -File)
+          if ($unsigned.Count -ne 1) {
+            throw "expected exactly one *-setup.exe under $nsisDir, found $($unsigned.Count)"
+          }
+          $signed = @(Get-ChildItem -LiteralPath $env:SIGNED_DIR -Filter '*-setup.exe' -File -Recurse)
+          if ($signed.Count -ne 1) {
+            throw "expected exactly one signed *-setup.exe under $env:SIGNED_DIR, found $($signed.Count)"
+          }
+
+          # Then the filename, because *Stage app bundle assets and checksums*
+          # looks the installer up by shape and the updater reaches it by the
+          # URL latest.json spells out.
+          if ($signed[0].Name -ne $unsigned[0].Name) {
+            throw "SignPath returned '$($signed[0].Name)' but the build produced '$($unsigned[0].Name)'"
+          }
+
+          # Content, not mtime. An mtime comparison is unsound in both
+          # directions here, because ZIP extraction restores the archive entry's
+          # own timestamp -- a correctly signed installer can come back older
+          # than the file submitted, and an unrelated stale file can come back
+          # newer. A SHA-256 inequality is the assertion that actually holds,
+          # with Authenticode below as the authenticity gate.
+          # docs/code-signing.md step 2 says the same thing.
+          $before = (Get-FileHash -Algorithm SHA256 -LiteralPath $unsigned[0].FullName).Hash
+          $after = (Get-FileHash -Algorithm SHA256 -LiteralPath $signed[0].FullName).Hash
+          if ($before -eq $after) {
+            throw "the file SignPath returned is byte-identical to the one submitted ($before); nothing was signed"
+          }
+
+          Copy-Item -LiteralPath $signed[0].FullName -Destination $unsigned[0].FullName -Force
+          $installed = (Get-FileHash -Algorithm SHA256 -LiteralPath $unsigned[0].FullName).Hash
+          if ($installed -ne $after) {
+            throw "replacement did not take: $($unsigned[0].FullName) hashes $installed, expected $after"
+          }
+          Write-Host "unsigned $before"
+          Write-Host "signed   $after"
+          Write-Host "replaced $($unsigned[0].FullName)"
+
+      # The .sig beside the installer was computed over the UNSIGNED bytes, so
+      # Authenticode signing invalidates it and the updater would reject the
+      # download. This is the same repair the macOS path makes after stapling.
+      # TAURI_SIGNING_PRIVATE_KEY and its password are `env:` on the bundle
+      # build step alone, so this step needs its own copy of both or it cannot
+      # sign at all. Nothing may touch the installer's bytes after this point;
+      # regenerating the sidecar .sig does not disturb its Authenticode
+      # signature.
+      - name: Regenerate the updater signature over the signed installer
+        if: env.SIGNPATH_CONFIGURED == 'true'
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          nsis_dir="target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          setup="$(find "$nsis_dir" -maxdepth 1 -type f -name '*-setup.exe' -print -quit)"
+          [[ -n "$setup" && -f "$setup" ]] || { echo "ERROR: no *-setup.exe under $nsis_dir to re-sign." >&2; exit 1; }
+          sig="${setup}.sig"
+          [[ -s "$sig" ]] || { echo "ERROR: $sig is missing; the bundle build did not sign the installer." >&2; exit 1; }
+          before_sig="$(cat "$sig")"
+
+          rm -f "$sig"
+          pnpm tauri signer sign "$setup"
+          [[ -s "$sig" ]] || { echo "ERROR: re-signing produced no $sig." >&2; exit 1; }
+          [[ "$(cat "$sig")" != "$before_sig" ]] || { echo "ERROR: $sig is unchanged; it still covers the unsigned bytes." >&2; exit 1; }
+          echo "Regenerated $sig over the Authenticode-signed installer."
+
       # Staging runs before verification on purpose. Verifying the bundle
       # directory and then staging from it independently would let the two steps
       # pick different files if more than one setup.exe ever sits there; this way
@@ -1010,6 +1350,73 @@ jobs:
             echo "setup_sha256=$setup_sha256"
             echo "sig_sha256=$sig_sha256"
           } >> "$GITHUB_OUTPUT"
+
+      # Pointed at the STAGED installer -- the exact bytes that get uploaded and
+      # whose digest promote-app-assets rechecks -- rather than at the bundle
+      # directory, so this cannot pass against a different file than the one
+      # that ships. A silently skipped download (see output-artifact-directory
+      # above) leaves an unsigned installer in place, and Status would be
+      # NotSigned here; a signature from anyone else fails the subject check.
+      - name: Verify the installer carries a valid SignPath signature
+        if: env.SIGNPATH_CONFIGURED == 'true'
+        shell: pwsh
+        env:
+          STAGED_SETUP: ${{ runner.temp }}/app-bundle-windows-staging/${{ steps.stage.outputs.setup_filename }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path -LiteralPath $env:STAGED_SETUP)) {
+            throw "staged installer missing at $env:STAGED_SETUP"
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $env:STAGED_SETUP
+          Write-Host "Status: $($signature.Status)"
+          if ($signature.Status -ne 'Valid') {
+            throw "Authenticode status is '$($signature.Status)', expected 'Valid'. $($signature.StatusMessage)"
+          }
+          $certificate = $signature.SignerCertificate
+          if ($null -eq $certificate) {
+            throw "Authenticode reported Valid with no signer certificate"
+          }
+          # SignerCertificate.Subject is a full distinguished name, so a raw
+          # string comparison against the bare publisher name is either always
+          # false or a substring match that a hostile CN could satisfy. Ask the
+          # certificate for the parsed common name instead.
+          $publisher = $certificate.GetNameInfo(
+            [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+            $false)
+          # Printed BEFORE the comparison and never conditionally, because on the
+          # first real signed build these three lines are the only record of what
+          # SignPath Foundation's certificate actually says. Nobody here has seen
+          # it: the application is pending, so every string this step compares
+          # against is taken from the Foundation's published terms rather than
+          # from a certificate anyone has held. A run that FAILS the comparison
+          # must still leave the exact values behind, or diagnosing it means
+          # cutting another release to look.
+          #
+          # TODO(after the first signed release): read Subject and Thumbprint out
+          # of that run's log and pin them here -- the full distinguished name
+          # instead of the simple name, and the thumbprint as a second,
+          # independent witness. Both are written down below for exactly that.
+          # Do not invent either value in advance; a pinned string nobody has
+          # verified is a gate that fails the first real build for the wrong
+          # reason.
+          Write-Host "Publisher:  $publisher"
+          Write-Host "Subject:    $($certificate.Subject)"
+          Write-Host "Issuer:     $($certificate.Issuer)"
+          Write-Host "Thumbprint: $($certificate.Thumbprint)"
+          # -cne, not -ne. PowerShell's -ne is CASE-INSENSITIVE, so `signpath
+          # foundation` and `SIGNPATH FOUNDATION` both passed a check written to
+          # assert one exact publisher name. A certificate is an identity
+          # document; matching it loosely is how a different issuer with a
+          # similarly-cased common name gets waved through.
+          #
+          # What this still does NOT establish, said plainly rather than implied:
+          # SimpleName is the common name alone, so a DIFFERENT full
+          # distinguished name carrying the same common name passes here. Closing
+          # that needs the real Subject, which is what the TODO above is for.
+          if ($publisher -cne 'SignPath Foundation') {
+            throw "installer publisher is '$publisher', expected 'SignPath Foundation'"
+          }
+          Write-Host "PASS $env:STAGED_SETUP is signed by SignPath Foundation"
 
       # The same unpack-and-look check ci.yml's app-windows-bundle runs, pointed
       # at the staged installer. A release must never ship an installer that

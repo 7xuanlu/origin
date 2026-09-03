@@ -1,0 +1,704 @@
+# Ask SignPath what is wired, what SignPath makes of it, and whether this
+# repository has actually been switched on. Builds nothing.
+#
+# Three questions, and they have three different answers:
+#
+#   1. ARE the secrets here?          -- presence arithmetic, offline.
+#   2. Does SignPath ACCEPT them?     -- the API, one token, one org, and a
+#                                        differential probe for the project and
+#                                        signing-policy slugs.
+#   3. Is signing SWITCHED ON?        -- vars.SIGNPATH_ACTIVE, which is what
+#                                        release.yml's SIGNPATH_REQUIRED reads.
+#
+# The state this exists for is the gap between 2 and 3. The Foundation
+# application is pending as this is written, so today every answer is "nothing
+# is wired", and that is reported and exits 0 -- an unwired fork and an unwired
+# upstream are both the expected steady state, and a monitor that burns a red
+# run on its own steady state is one nobody looks at. The day the application is
+# accepted and the secrets are installed but vars.SIGNPATH_ACTIVE is still
+# unset, release.yml will publish a green UNSIGNED installer and nothing else in
+# this repository will say so. That state is RED here, by name, and this
+# workflow runs on a schedule so that nobody has to remember to ask.
+#
+# Every arm is one of three verdicts and they are never merged: measured-good,
+# measured-bad, and COULD NOT MEASURE. A 200 that does not parse is the third,
+# not the first -- it was previously reported as "still a working credential",
+# which is a claim about a payload nobody could read.
+name: SignPath status
+
+on:
+  workflow_dispatch:
+  # Weekly, Mondays 09:17 UTC. The offset keeps it off the hour, where hosted
+  # runner queues are worst. GitHub disables schedules on forks and after 60
+  # days without repository activity; both are acceptable here, because this is
+  # a monitor for the upstream repository's own configuration.
+  schedule:
+    - cron: "17 9 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    # One HTTPS call and some presence arithmetic. Nothing here is
+    # platform-specific, so it does not borrow the Windows runner that the
+    # release bundle job needs.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # A fork that enables Actions would otherwise get a weekly red run for a
+    # configuration it is not supposed to have. Dispatch still works everywhere,
+    # because a fork maintainer asking the question deliberately deserves the
+    # answer.
+    if: github.repository == '7xuanlu/wenlan' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Ask SignPath
+        env:
+          # All five are secrets, not `vars`. The organization id and the three
+          # slugs are identifiers rather than credentials, so `vars.` would be
+          # their natural home -- but they arrive together with the token and
+          # sharing one idiom keeps a reviewer checking one thing:
+          # `secrets.SIGNPATH_API_TOKEN != ''` reads identically to
+          # `secrets.APPLE_CERTIFICATE != ''` in release.yml.
+          SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          # The fifth value, and optional. signpath/github-action-submit-signing-request
+          # marks `artifact-configuration-slug` `required: false` in its own
+          # manifest; leaving it unset selects the project's default artifact
+          # configuration in the SignPath portal. It is reported separately so
+          # that "not set" cannot be mistaken for "not needed".
+          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ secrets.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          # The switch, and the ONLY value here that is a `vars.` rather than a
+          # `secrets.`. A secret cannot be read back by a human or printed in a
+          # log, so a switch stored as a secret is a switch nobody can audit.
+          # This is the same expression release.yml's SIGNPATH_REQUIRED is built
+          # from, and the two must stay identical: this workflow's entire job is
+          # to report on what that one will do.
+          SIGNPATH_ACTIVE: ${{ vars.SIGNPATH_ACTIVE }}
+        run: |
+          set -euo pipefail
+
+          required=(
+            SIGNPATH_ORGANIZATION_ID
+            SIGNPATH_PROJECT_SLUG
+            SIGNPATH_SIGNING_POLICY_SLUG
+            SIGNPATH_API_TOKEN
+          )
+
+          present=0
+          echo "== Configuration =="
+          for name in "${required[@]}"; do
+            if [[ -n "${!name:-}" ]]; then
+              echo "  $name: set"
+              present=$((present + 1))
+            else
+              echo "  $name: absent"
+            fi
+          done
+          if [[ -n "${SIGNPATH_ARTIFACT_CONFIGURATION_SLUG:-}" ]]; then
+            echo "  SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: set (optional)"
+            artifact_configuration=set
+          else
+            echo "  SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: absent (optional)"
+            artifact_configuration=absent
+          fi
+          # Compared to the literal 'true', exactly as release.yml compares it,
+          # so `false`, `0`, `no` and `TRUE` all read as off in both places.
+          if [[ "${SIGNPATH_ACTIVE:-}" == "true" ]]; then
+            active=true
+          else
+            active=false
+          fi
+          echo "  vars.SIGNPATH_ACTIVE: '${SIGNPATH_ACTIVE:-}' -> signing required: $active"
+          echo
+
+          if [[ "$present" -eq 0 && "$artifact_configuration" == "absent" ]]; then
+            if [[ "$active" == "true" ]]; then
+              echo "RESULT: SWITCHED ON WITH NOTHING WIRED." >&2
+              echo "vars.SIGNPATH_ACTIVE is 'true', so release.yml's SIGNPATH_REQUIRED is" >&2
+              echo "true, and no SIGNPATH_* secret is set. The next tag release will fail" >&2
+              echo "in app-bundle-windows before it builds anything -- which is the" >&2
+              echo "designed behaviour, and better found here than there. Install the four" >&2
+              echo "secrets, or unset vars.SIGNPATH_ACTIVE." >&2
+              exit 1
+            fi
+            echo "RESULT: nothing is wired in this repository."
+            echo "No SIGNPATH_* secret is set, so release.yml's SIGNPATH_CONFIGURED"
+            echo "sentinel is false and every signing step in app-bundle-windows"
+            echo "skips. Installers ship unsigned. vars.SIGNPATH_ACTIVE is unset, so"
+            echo "SIGNPATH_REQUIRED is false and that is the INTENDED state."
+            echo
+            echo "This run canNOT tell you whether SignPath Foundation has accepted"
+            echo "the application. With no token there is nothing to ask the API with,"
+            echo "so the acceptance state is UNMEASURED here, not 'pending' -- an"
+            echo "accepted application whose secrets were never added looks exactly"
+            echo "like this. Acceptance arrives by email; the repository-side signal"
+            echo "is this workflow going from 'nothing wired' to a validated token."
+            echo
+            echo "Exiting 0: an unwired fork and an unwired upstream are both the"
+            echo "expected steady state, and a monitor that burns a red run on its"
+            echo "own steady state is one nobody dispatches."
+            exit 0
+          fi
+
+          if [[ "$present" -ne "${#required[@]}" ]]; then
+            echo "RESULT: half-configured. This is the state that would ship an" >&2
+            echo "unsigned installer from a green release run." >&2
+            for name in "${required[@]}"; do
+              if [[ -z "${!name:-}" ]]; then
+                echo "  missing: $name" >&2
+              fi
+            done
+            if [[ "$present" -eq 0 ]]; then
+              echo "  SIGNPATH_ARTIFACT_CONFIGURATION_SLUG is set while none of the" >&2
+              echo "  four required values are; the optional slug alone signs nothing." >&2
+            fi
+            echo >&2
+            echo "release.yml's SIGNPATH_CONFIGURED is false unless all four are set," >&2
+            echo "so every signing step skips and the companion check fails the job." >&2
+            echo "Set all four together or none of them." >&2
+            exit 1
+          fi
+
+          # The token stays off every command line. curl's -H @file form reads
+          # one header per line out of a file, which is the closest thing curl
+          # has to notarytool's keychain profile: nothing sensitive appears in
+          # the process list, and the file is 0600 and removed on exit.
+          umask 077
+          header_file="$RUNNER_TEMP/signpath-auth-header"
+          cleanup() { rm -f "$header_file"; }
+          trap cleanup EXIT
+          printf 'Authorization: Bearer %s\n' "$SIGNPATH_API_TOKEN" > "$header_file"
+
+          base="https://app.signpath.io/API/v1/${SIGNPATH_ORGANIZATION_ID}"
+
+          # One place that talks to the network. Prints the code on stdout,
+          # leaves the body in $2, and RETURNS CURL'S OWN STATUS.
+          #
+          # ROUND 5. This ended `|| true`, and that discarded the only signal
+          # that says the transfer failed. `-w '%{http_code}'` prints the status
+          # line curl received, which it has as soon as the headers arrive --
+          # so a request that gets `200` and then times out, or ends on a
+          # Content-Length mismatch, or has its connection reset mid-body,
+          # prints `200` and exits 28, 18 or 56. With the status thrown away the
+          # body that DID land was parsed as though the transfer had completed:
+          # a truncated list that happens to still be valid JSON reads as a
+          # working credential, and with SIGNPATH_ACTIVE=true the whole workflow
+          # exits 0 on a measurement that failed. A monitor whose subject is
+          # "an unmeasured thing must not look measured" cannot swallow the one
+          # status that tells it which of the two it is holding.
+          #
+          # `|| true` was not there for nothing -- the step runs under `set -e`
+          # and a bare non-zero curl would end the job before it reached its own
+          # summary. `rc` keeps that property and hands the answer over as well,
+          # which is the same correction the dev runtime's trap took.
+          signpath_get() {
+            local rc=0
+            curl -sS \
+              -H @"$header_file" \
+              -H 'Accept: application/json' \
+              -o "$2" \
+              -w '%{http_code}' \
+              --max-time 60 \
+              "$1" || rc=$?
+            return "$rc"
+          }
+
+          # ---- the verdict, in THREE states, decided at the very end ----
+          #
+          #   0  everything this run looked at answered affirmatively
+          #   1  something answered NEGATIVELY: a rejected credential, a slug
+          #      the API does not know, an accepted-but-not-switched-on repo
+          #   2  something COULD NOT BE MEASURED
+          #
+          # 2 exists because this workflow had recreated, at its own outermost
+          # boundary, the defect it was built to detect. `status` became 0 the
+          # moment the credential request succeeded, and only an `absent` slug
+          # turned it back to 1, so BOTH slugs coming back "NOT validated --
+          # this run could not measure it" exited 0: identical, to anything
+          # reading the workflow result, to both slugs resolving. A monitor
+          # whose entire subject is "an unmeasured thing must not look
+          # measured" cannot report its own unmeasured state as success.
+          #
+          # Precedence, when a run is in more than one state: a measured
+          # negative outranks an unmeasured one. Both are non-zero, both are
+          # named in full in the summary below, and what the exit code carries
+          # is "this is wrong" versus "this run did not find out".
+          verdict=affirmative
+          note_negative()   { verdict=negative; }
+          note_unmeasured() { [[ "$verdict" == "negative" ]] || verdict=unmeasured; }
+
+          body_file="$RUNNER_TEMP/signpath-response.json"
+          url="$base/SigningRequests"
+          echo "== GET $url =="
+          curl_rc=0
+          http_code="$(signpath_get "$url" "$body_file")" || curl_rc=$?
+          echo "HTTP ${http_code:-<curl produced no status>} (curl exited $curl_rc)"
+          echo
+
+          # THREE credential verdicts, never two. `unmeasured` is not a polite
+          # spelling of `ok`: it is what this prints when the run learned
+          # nothing, and it is red for the same reason a skipped test is not a
+          # passing test.
+          credential=unmeasured
+          # A FAILED TRANSFER IS NOT AN HTTP OUTCOME, and it is decided before
+          # the code is looked at. Everything in the `case` below reasons from a
+          # status line and a body that arrived together; a non-zero curl says
+          # exactly that they may not have. The affirmative arm is the one this
+          # matters for -- `200` plus a body cut off mid-list is how a run
+          # reports a validated credential it never validated -- but a `401`
+          # from a transfer that then failed is not promoted to a measured
+          # negative either: nothing here re-reads it, and a negative outranks
+          # an unmeasured one in the verdict, so guessing would be the more
+          # confident of the two wrong answers.
+          if (( curl_rc != 0 )); then
+            credential=unmeasured
+            note_unmeasured
+            echo "RESULT: COULD NOT MEASURE the credential -- curl exited $curl_rc." >&2
+            echo "It printed HTTP '${http_code:-<none>}', which is the status line it had" >&2
+            echo "received when the transfer failed: 28 is a timeout, 18 a body shorter" >&2
+            echo "than its Content-Length, 56 a reset. The response was NOT completely" >&2
+            echo "received, so neither the code nor the body below is evidence about the" >&2
+            echo "token. This is not a negative answer about it either." >&2
+          else
+          case "$http_code" in
+            200)
+              # A 200 whose body does not parse is not evidence of a working
+              # credential. It was reported as one until round 14: "That is
+              # still a working credential; the shape of the payload changed."
+              # A captive portal, a proxy error page and an API rewrite all
+              # produce exactly that, and the summary below would then have
+              # claimed the organization id and token were validated by a
+              # response nobody could read.
+              # A POSITIVE shape assertion, not "something with a length".
+              #
+              # Round 15, measured on this host with jq 1.8.2 against the
+              # expression this replaces --
+              #   if type == "object" then (.values // .items // []) else . end | length
+              #     {}             -> 0    credited as a working credential
+              #     "proxy error"  -> 11   a JSON string's length is its characters
+              #     42             -> 42   a number's length is its absolute value
+              #     null           -> 0
+              # -- only non-JSON and booleans were rejected. The negative
+              # control fed it HTML, which is the half that fails; every
+              # malformed-but-valid JSON body walked straight through. What
+              # that verdict certified was "this parsed", printed as "the
+              # organization id and the API token are both good".
+              #
+              # The body must now BE a list envelope: a top-level array, or an
+              # object whose `values` or `items` IS an array. Everything else
+              # yields `empty`, `jq -e` exits 4, and the credential is
+              # UNMEASURED. SignPath's real envelope is unknown here -- no
+              # token has ever existed -- so if the real reply is some third
+              # shape this says COULD NOT MEASURE, which is loud and wrong in
+              # the safe direction, rather than green.
+              if count="$(jq -e '
+                    if type == "array" then length
+                    elif type == "object" then
+                      if (.values | type) == "array" then (.values | length)
+                      elif (.items | type) == "array" then (.items | length)
+                      else empty end
+                    else empty end
+                  ' < "$body_file" 2>/dev/null)"; then
+                credential=ok
+                echo "RESULT: the organization id and the API token are both good."
+                # A count is enough of an answer and keeps request metadata out
+                # of the log.
+                echo "Signing requests visible to this token: $count"
+              else
+                credential=unmeasured
+                note_unmeasured
+                echo "RESULT: COULD NOT MEASURE the credential." >&2
+                echo "HTTP 200, but the body is not a signing-request list: it did not" >&2
+                echo "parse as JSON, or it parsed as something that is not a list --" >&2
+                echo "{} , a bare string and a bare number all reach this branch, and" >&2
+                echo "not one of them is an answer about the credential. This is" >&2
+                echo "NOT 'the token works and the payload changed shape' -- a proxy" >&2
+                echo "error page, a captive portal and an API rewrite all look like" >&2
+                echo "this, and none of them tells you the credential is good." >&2
+              fi
+              ;;
+            401)
+              credential=bad
+              note_negative
+              echo "RESULT: 401 Unauthorized -- SIGNPATH_API_TOKEN is wrong, expired, or revoked." >&2
+              ;;
+            403)
+              credential=bad
+              note_negative
+              echo "RESULT: 403 Forbidden -- the token authenticated but is not permitted to" >&2
+              echo "read signing requests for organization $SIGNPATH_ORGANIZATION_ID." >&2
+              echo "Check the token's scope and which user it belongs to." >&2
+              ;;
+            404)
+              credential=bad
+              note_negative
+              echo "RESULT: 404 Not Found -- SIGNPATH_ORGANIZATION_ID does not name an" >&2
+              echo "organization this token can see. The id is a GUID from the portal URL," >&2
+              echo "not the organization's display name." >&2
+              ;;
+            "")
+              credential=unmeasured
+              note_unmeasured
+              echo "RESULT: COULD NOT MEASURE -- curl produced no HTTP status at all." >&2
+              echo "DNS, TLS, the proxy, or the runner's network. Nothing was learned" >&2
+              echo "about the credential; this is not a negative answer about it." >&2
+              ;;
+            *)
+              credential=unmeasured
+              note_unmeasured
+              echo "RESULT: COULD NOT MEASURE -- unexpected HTTP $http_code from SignPath." >&2
+              echo "Not a documented outcome of this route, so it says nothing either" >&2
+              echo "way about the token." >&2
+              ;;
+          esac
+          fi
+
+          if [[ "$credential" != "ok" ]]; then
+            echo "-- response body (first 40 lines) --" >&2
+            head -n 40 "$body_file" >&2 || true
+          fi
+
+          # ---- the project and signing-policy slugs ----
+          #
+          # The organization-scoped route above exercises the org id and the
+          # token and NOTHING else, which the old summary said plainly and then
+          # left as the end of the story: a mistyped project or signing-policy
+          # slug returns 200 there and fails at the first real release.
+          #
+          # Resolving them is a filtered read -- but a filtered read is only a
+          # measurement if the server actually applies the filter. An API that
+          # ignores an unknown query parameter answers 200 for a project that
+          # does not exist, and "200" would then mean "validated" for any string
+          # whatsoever. So each slug is probed TWICE: once as configured, and
+          # once with a slug that cannot exist. The verdict is the DIFFERENCE
+          # between the two answers, which is the only thing here that co-varies
+          # with the claim:
+          #
+          #   configured answers 200 with a signing-request list, no item in
+          #   which names a different slug, and the control is rejected
+          #                                    -> the filter is real and the
+          #                                       slug resolved.       RESOLVED
+          #   configured rejected, control rejected
+          #                                    -> the filter is real and the
+          #                                       slug did not resolve.  ABSENT
+          #   both 200 (or anything else)      -> the filter is not being
+          #                                       applied, the reply is not a
+          #                                       list, an item names another
+          #                                       slug, or the route does not
+          #                                       answer this question.
+          #                                                          UNMEASURED
+          #
+          # UNMEASURED is the honest answer when SignPath's API does not support
+          # this filter at all, and it is why this cannot report a slug as good
+          # on the strength of a route that never looked at it.
+          # ROUND 6. A CONTROL THAT DIFFERS IN MORE THAN ONE WAY MEASURES THE
+          # WRONG DIFFERENCE. The control slug was the fixed prefix
+          # `wenlan-no-such-project-` plus an epoch and a pid, so it differed
+          # from the configured slug in its LENGTH, its character content and
+          # its number of separators as well as in the one property the probe
+          # is about -- whether it names anything. A server with a length cap,
+          # a charset rule, or a rule about segments then rejects the control
+          # for its SPELLING, the affirmative arm below reads "configured 200,
+          # control rejected", and `resolved` is printed for a slug the server
+          # never looked up. The differential would have validated SYNTAX while
+          # reporting that it had validated EXISTENCE.
+          #
+          # The control is now the configured slug with every alphanumeric
+          # rotated one place: a->b, z->a, A->B, Z->A, 0->1, 9->0, and every
+          # other character left exactly where it is. Length, the position of
+          # every separator, and the character CLASS at every position are all
+          # identical to the configured slug, so any rule that admits the
+          # configured spelling admits this one, and the only difference left
+          # between the two requests is whether the slug names something.
+          #
+          # Two residuals, stated rather than closed. A rule about slug CONTENT
+          # rather than shape -- a required prefix, a reserved word, an
+          # allow-list of known projects -- can still separate the two, and
+          # nothing here can tell that apart from a genuine "no such slug". And
+          # the rotation could land on a slug that really does exist, in which
+          # case the control answers 200 and the pair reads `unmeasured`: still
+          # wrong, but wrong in the direction that refuses to claim.
+          #
+          # Neither slug is printed. Both are secrets, and a rotation of a
+          # secret is not a secret GitHub knows to mask.
+          rotate_slug() { printf '%s' "$1" | tr 'a-zA-Z0-9' 'b-zaB-ZA1-90'; }
+          project_probe="$(rotate_slug "$SIGNPATH_PROJECT_SLUG")"
+          policy_probe="$(rotate_slug "$SIGNPATH_SIGNING_POLICY_SLUG")"
+          project_state=unmeasured
+          policy_state=unmeasured
+          if [[ "$credential" == "ok" ]]; then
+            probe_body="$RUNNER_TEMP/signpath-probe.json"
+
+            # ROUND 6. THE BODY IS READ HERE TOO, AND SO ARE THE ITEMS.
+            # `slug_answer` reduced the response to its status line and threw
+            # the payload away, so `200` was affirmative whatever arrived with
+            # it: the proxy error page, the captive portal and the API rewrite
+            # that the credential arm rejects BY NAME three screens above all
+            # read as "this slug resolved" down here. The same POSITIVE shape
+            # assertion is now made on the slug replies -- a top-level array, or
+            # an object whose `values` or `items` IS an array -- and anything
+            # else is 2, could-not-measure, not 1.
+            #
+            # Then the items themselves, which nothing here has ever looked at.
+            # `$k` is the query parameter this very request filtered on, so an
+            # item carrying a field of that name is an item whose slug the
+            # server has told us; if any of them names something other than what
+            # was asked for, the filter was NOT applied and the 200 says nothing
+            # about the configured slug. This can only ever REFUTE. Items that
+            # carry no such field are no evidence either way -- SignPath's real
+            # envelope is unknown here, no token has ever existed -- and then
+            # the differential below carries the verdict by itself, exactly as
+            # it did before this check existed. It cannot manufacture an
+            # affirmative, only withdraw one.
+            slug_list_probe='
+              def envelope:
+                if type == "array" then .
+                elif type == "object" then
+                  if (.values | type) == "array" then .values
+                  elif (.items | type) == "array" then .items
+                  else empty end
+                else empty end;
+              envelope
+              | [ length,
+                  ( map(select(type == "object"
+                               and has($k)
+                               and (.[$k] | type) == "string"
+                               and .[$k] != $v))
+                    | length ) ]
+              | @tsv
+            '
+
+            # 0 = the server rejected this slug, 1 = it answered 200 with a
+            # signing-request list that contradicts nothing, 2 = it said
+            # something this cannot interpret.
+            #
+            # A transfer that failed goes to 2 for the same reason as above: the
+            # differential below is only a measurement if BOTH answers came from
+            # completed requests, and 2 on either side makes `resolve_slug`
+            # answer `unmeasured`, which is exactly what a probe nobody could
+            # complete deserves. With curl's status dropped, a timed-out
+            # configured probe that had already printed 200 and a control probe
+            # that really was rejected produced `resolved` -- the affirmative --
+            # off a request that never finished.
+            slug_answer() {
+              # $1 URL, $2 the query parameter it filtered on, $3 the value it
+              # asked for.
+              local code rc=0 parsed count wrong
+              code="$(signpath_get "$1" "$probe_body")" || rc=$?
+              if (( rc != 0 )); then
+                echo 2
+                return 0
+              fi
+              case "$code" in
+                400|404) echo 0; return 0 ;;
+                200)     ;;
+                *)       echo 2; return 0 ;;
+              esac
+              # `-r`, or `@tsv` comes back as a JSON string with a literal \t in
+              # it and neither field below is ever a number. Measured on this
+              # host with jq 1.8.2: without -r, `[]` yields the six characters
+              # "0\t0" and the digit test rejects every reply there is.
+              if ! parsed="$(jq -e -r --arg k "$2" --arg v "$3" \
+                    "$slug_list_probe" < "$probe_body" 2>/dev/null)"; then
+                echo 2
+                return 0
+              fi
+              # Two fields, asserted before either is read. `@tsv` over a
+              # two-element array always emits exactly one tab, so a reply with
+              # none of them is a reply this program did not produce -- and
+              # without the assertion `${parsed%%\t*}` and `${parsed##*\t}` BOTH
+              # return the whole string, so a lone `0` would set count=0 and
+              # wrong=0 and read as the affirmative. Same rule as the table
+              # parsers in scripts/lib/host-process.sh: refuse the shape rather
+              # than index into it and hope.
+              if [[ "$parsed" != *$'\t'* ]]; then
+                echo 2
+                return 0
+              fi
+              count="${parsed%%$'\t'*}"
+              wrong="${parsed##*$'\t'}"
+              if [[ ! "$count" =~ ^[0-9]+$ || ! "$wrong" =~ ^[0-9]+$ ]]; then
+                echo 2
+                return 0
+              fi
+              if (( wrong > 0 )); then
+                echo 2
+                return 0
+              fi
+              echo 1
+            }
+
+            resolve_slug() {
+              # $1 configured URL, $2 control URL, $3 the query parameter both
+              # of them filtered on, $4 the configured slug, $5 the control.
+              local real control
+              # A rotation that landed back on the configured slug -- a slug
+              # with no alphanumeric in it at all -- makes the two probes the
+              # SAME request, and a differential against itself is not one.
+              if [[ "$4" == "$5" ]]; then
+                echo unmeasured
+                return 0
+              fi
+              real="$(slug_answer "$1" "$3" "$4")"
+              control="$(slug_answer "$2" "$3" "$5")"
+              if [[ "$real" == "1" && "$control" == "0" ]]; then
+                echo resolved
+              elif [[ "$real" == "0" && "$control" == "0" ]]; then
+                echo absent
+              else
+                echo unmeasured
+              fi
+            }
+
+            project_state="$(resolve_slug \
+              "$base/SigningRequests?projectSlug=${SIGNPATH_PROJECT_SLUG}" \
+              "$base/SigningRequests?projectSlug=${project_probe}" \
+              projectSlug "$SIGNPATH_PROJECT_SLUG" "$project_probe")"
+            policy_state="$(resolve_slug \
+              "$base/SigningRequests?projectSlug=${SIGNPATH_PROJECT_SLUG}&signingPolicySlug=${SIGNPATH_SIGNING_POLICY_SLUG}" \
+              "$base/SigningRequests?projectSlug=${SIGNPATH_PROJECT_SLUG}&signingPolicySlug=${policy_probe}" \
+              signingPolicySlug "$SIGNPATH_SIGNING_POLICY_SLUG" "$policy_probe")"
+            rm -f "$probe_body"
+          fi
+
+          if [[ "$project_state" == "absent" || "$policy_state" == "absent" ]]; then
+            note_negative
+            echo >&2
+            echo "RESULT: a configured slug does not resolve." >&2
+            # if-blocks, not `[[ ]] && echo`: under `set -e` a false test at the
+            # head of an AND-list leaves the list non-zero, and this script's
+            # whole job is to reach its own summary and exit with a verdict.
+            if [[ "$project_state" == "absent" ]]; then
+              echo "  SIGNPATH_PROJECT_SLUG does not name a project this token can see." >&2
+            fi
+            if [[ "$policy_state" == "absent" ]]; then
+              echo "  SIGNPATH_SIGNING_POLICY_SLUG does not name a signing policy of that project." >&2
+            fi
+            echo "The release job would upload the installer and then fail at the" >&2
+            echo "signing request, after the ~40-minute bundle build." >&2
+          fi
+
+          # The third state, which until now had no consequence whatsoever. The
+          # differential probe above exists to answer `unmeasured` when the
+          # server does not apply the filter -- and that answer then exited 0
+          # and shared its headline with `resolved`. Gated on a credential that
+          # worked, because when it did not the slugs were never probed at all
+          # and the credential verdict already carries the run.
+          if [[ "$credential" == "ok" ]] \
+            && [[ "$project_state" == "unmeasured" || "$policy_state" == "unmeasured" ]]; then
+            note_unmeasured
+            echo >&2
+            echo "RESULT: COULD NOT MEASURE a configured slug." >&2
+            if [[ "$project_state" == "unmeasured" ]]; then
+              echo "  SIGNPATH_PROJECT_SLUG: the impossible control slug was NOT rejected" >&2
+              echo "  differently from the configured one, so 200 here says nothing." >&2
+            fi
+            if [[ "$policy_state" == "unmeasured" ]]; then
+              echo "  SIGNPATH_SIGNING_POLICY_SLUG: same -- the filter was not applied," >&2
+              echo "  or this route does not answer the question." >&2
+            fi
+            echo "This is NOT 'the slugs are fine'. A mistyped slug looks exactly like" >&2
+            echo "this from here and fails at the first real signing request, after" >&2
+            echo "the ~40-minute bundle build. Confirm both in the SignPath portal" >&2
+            echo "until this run can tell the two apart." >&2
+          fi
+
+          # ---- the switch ----
+          #
+          # This is the state the whole workflow is for. Everything resolved,
+          # and the repository still not switched on: release.yml's
+          # SIGNPATH_REQUIRED is false, so a tag release skips every signing
+          # step, stages the ORIGINAL unsigned installer, hashes it, uploads it
+          # and finishes GREEN. Nothing in the release run says a word about it,
+          # which is exactly why this run must.
+          echo
+          echo "== Activation =="
+          if [[ "$credential" == "ok" && "$active" != "true" ]] \
+            && [[ "$project_state" != "resolved" || "$policy_state" != "resolved" ]]; then
+            # Accepted, off, and NOT fully verified. Telling an operator to
+            # throw the switch from here would make release.yml require a
+            # signed installer on the strength of slugs this run could not
+            # resolve: a recommendation carrying a measurement nobody took.
+            note_negative
+            echo "RESULT: ACCEPTED, NOT ACTIVATED, AND NOT FULLY VERIFIED." >&2
+            echo "The API accepted the organization id and the token, and" >&2
+            echo "vars.SIGNPATH_ACTIVE is '${SIGNPATH_ACTIVE:-unset}' -- not 'true'." >&2
+            echo "Do NOT switch signing on yet: the project and signing-policy slugs" >&2
+            echo "are not both resolved above (see 'What this run validated'), and" >&2
+            echo "SIGNPATH_REQUIRED=true with an unresolved slug fails every release" >&2
+            echo "after its ~40-minute bundle build. Settle the slugs first, then set" >&2
+            echo "the variable." >&2
+          elif [[ "$credential" == "ok" && "$active" != "true" ]]; then
+            note_negative
+            echo "RESULT: ACCEPTED BUT NOT ACTIVATED." >&2
+            echo "The API accepted this repository's SignPath credentials, and" >&2
+            echo "vars.SIGNPATH_ACTIVE is '${SIGNPATH_ACTIVE:-unset}' -- not 'true'." >&2
+            echo "release.yml therefore computes SIGNPATH_REQUIRED=false, and a tag" >&2
+            echo "release will skip every signing step and publish an UNSIGNED" >&2
+            echo "installer, green, with no other signal anywhere that it did." >&2
+            echo >&2
+            echo "Set the repository variable SIGNPATH_ACTIVE to the literal string" >&2
+            echo "'true' (Settings -> Secrets and variables -> Actions -> Variables)." >&2
+            echo "It is a variable and not a secret on purpose: a switch nobody can" >&2
+            echo "read back is a switch nobody can audit." >&2
+          elif [[ "$active" == "true" ]]; then
+            echo "  vars.SIGNPATH_ACTIVE is 'true': release.yml requires a signed"
+            echo "  installer and fails the Windows bundle job if the secrets are"
+            echo "  not all readable there."
+          else
+            echo "  vars.SIGNPATH_ACTIVE is not 'true': signing is not required."
+            echo "  That is only the intended state while the credentials do not"
+            echo "  work, which is what the section above measures."
+          fi
+
+          # Say plainly which fields this run actually tested, and say it from
+          # the variables that hold what happened rather than from a fixed list.
+          # A hard-coded summary is a claim that cannot be wrong about the run
+          # and therefore cannot be right about it either.
+          echo
+          echo "== What this run validated =="
+          describe() {
+            case "$2" in
+              ok|resolved) echo "  $1: validated against the SignPath API" ;;
+              bad|absent)  echo "  $1: REJECTED by the SignPath API" ;;
+              *)           echo "  $1: NOT validated -- this run could not measure it" ;;
+            esac
+          }
+          describe SIGNPATH_ORGANIZATION_ID "$credential"
+          describe SIGNPATH_API_TOKEN "$credential"
+          describe SIGNPATH_PROJECT_SLUG "$project_state"
+          describe SIGNPATH_SIGNING_POLICY_SLUG "$policy_state"
+          if [[ "$artifact_configuration" == "set" ]]; then
+            echo "  SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: presence only -- NOT validated"
+          else
+            echo "  SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: not set; the project's default"
+            echo "    artifact configuration in the portal will be used. release.yml"
+            echo "    uploads a ZIP artifact, so that default must have a <zip-file>"
+            echo "    root or the first real signing request fails. Not checkable"
+            echo "    from here -- confirm it in the portal."
+          fi
+
+          # The exit code says which of the three states the run ended in, and
+          # the line above it says the same thing in words: a reader who sees
+          # only the red X on a scheduled run must be able to tell "SignPath
+          # says no" from "this run learned nothing".
+          echo
+          case "$verdict" in
+            affirmative)
+              echo "VERDICT: everything this run looked at answered. Exiting 0."
+              status=0
+              ;;
+            negative)
+              echo "VERDICT: something answered NEGATIVELY above. Exiting 1." >&2
+              status=1
+              ;;
+            *)
+              echo "VERDICT: something COULD NOT BE MEASURED above -- this run does" >&2
+              echo "not know whether it is right or wrong. Exiting 2, which is neither" >&2
+              echo "the green of a validated setup nor the red of a rejected one." >&2
+              status=2
+              ;;
+          esac
+          exit "$status"

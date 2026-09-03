@@ -12,21 +12,21 @@
         "agent_coding_err_logging",
         "agent_coding_neg_err_test",
         "agent_coding_err_validation",
-        "agent_coding_neg_err_retry",
         "agent_coding_neg_err_payment",
         "agent_coding_neg_err_db",
+        "agent_coding_neg_err_retry",
         "agent_coding_neg_err_monitoring",
         "agent_coding_neg_err_circuit"
       ],
       "scores": [
         0.09230279,
-        0.08389525,
-        0.08015681,
-        0.07909242,
+        0.08444633,
+        0.08074288,
+        0.07969726,
         0.078737155,
-        0.07446509,
-        0.073728114,
-        0.070988245,
+        0.072555095,
+        0.07155643,
+        0.05541747,
         0.050591722,
         0.046426047
       ]
@@ -36,25 +36,25 @@
       "query": "which database did we pick and why",
       "ranked_ids": [
         "agent_coding_db_decision",
+        "agent_coding_neg_db_backup",
         "agent_coding_neg_db_json",
         "agent_coding_db_schema_approach",
-        "agent_coding_neg_db_backup",
-        "agent_coding_neg_db_read_replica",
-        "agent_coding_db_cache",
-        "agent_coding_neg_db_pool",
         "agent_coding_neg_db_test",
-        "agent_coding_neg_db_index"
+        "agent_coding_neg_db_index",
+        "agent_coding_db_cache",
+        "agent_coding_neg_db_read_replica",
+        "agent_coding_neg_db_pool"
       ],
       "scores": [
-        0.09419571,
-        0.08170668,
-        0.07759279,
+        0.075445704,
         0.07493519,
-        0.07023886,
-        0.07016061,
-        0.06914701,
+        0.06203455,
+        0.059131257,
         0.05745293,
-        0.05337923
+        0.05337923,
+        0.051978793,
+        0.050884027,
+        0.05009939
       ]
     },
     {
@@ -64,20 +64,20 @@
         "agent_coding_test_framework",
         "agent_coding_neg_test_snapshots",
         "agent_coding_test_frontend",
-        "agent_coding_neg_test_contracts",
         "agent_coding_neg_test_load",
+        "agent_coding_neg_test_contracts",
         "agent_coding_neg_test_mock",
         "agent_coding_neg_test_e2e",
         "agent_coding_neg_test_ci",
         "agent_coding_test_coverage"
       ],
       "scores": [
-        0.09017222,
-        0.08801257,
+        0.09081738,
+        0.087684706,
         0.0842046,
-        0.07796163,
         0.07785118,
-        0.07565016,
+        0.077337116,
+        0.07595738,
         0.06299728,
         0.06170878,
         0.048786446
@@ -88,27 +88,27 @@
       "query": "how does the authentication flow work",
       "ranked_ids": [
         "agent_coding_auth_flow",
-        "agent_coding_neg_auth_webhook",
         "agent_coding_auth_provider",
+        "agent_coding_neg_auth_webhook",
         "agent_coding_neg_auth_audit",
         "agent_coding_auth_middleware",
         "agent_coding_auth_roles",
-        "agent_coding_neg_auth_api_key",
         "agent_coding_neg_auth_rate",
+        "agent_coding_neg_auth_api_key",
         "agent_coding_neg_auth_session",
         "agent_coding_neg_auth_cors"
       ],
       "scores": [
         0.08759888,
-        0.084235914,
         0.083625816,
-        0.07919595,
-        0.07806675,
-        0.07667609,
-        0.0728881,
-        0.07284207,
-        0.07053263,
-        0.06984949
+        0.0660541,
+        0.061804645,
+        0.059605215,
+        0.05732126,
+        0.05519501,
+        0.0541381,
+        0.052622177,
+        0.050801873
       ]
     },
     {
@@ -116,25 +116,25 @@
       "query": "what are the known bugs in the payment module",
       "ranked_ids": [
         "agent_coding_neg_pay_provider",
-        "agent_coding_neg_pay_test",
         "agent_coding_neg_pay_flow",
-        "agent_coding_pay_bug_refund",
+        "agent_coding_neg_pay_test",
         "agent_coding_pay_bug_idempotency",
-        "agent_coding_neg_pay_currency",
         "agent_coding_neg_pay_retry",
-        "agent_coding_pay_bug_webhook",
-        "agent_coding_neg_pay_invoice"
+        "agent_coding_neg_pay_invoice",
+        "agent_coding_pay_bug_refund",
+        "agent_coding_neg_pay_currency",
+        "agent_coding_pay_bug_webhook"
       ],
       "scores": [
-        0.08670498,
-        0.084294975,
-        0.084119916,
-        0.082290955,
-        0.07777079,
-        0.07431256,
-        0.073931046,
-        0.073053755,
-        0.0645859
+        0.08846667,
+        0.084985726,
+        0.08429498,
+        0.0777708,
+        0.07563884,
+        0.06366377,
+        0.062936135,
+        0.055264957,
+        0.054303765
       ]
     },
     {
@@ -145,24 +145,24 @@
         "gc_api_gateway",
         "gc_f12",
         "gc_f13",
-        "gc_f09",
         "gc_api_rest_decision",
-        "gc_f18",
         "gc_api_openapi",
         "gc_api_rate_limit",
-        "gc_f23"
+        "gc_f09",
+        "gc_f18",
+        "gc_api_pagination"
       ],
       "scores": [
-        0.087524384,
-        0.08599391,
-        0.08100577,
-        0.078995585,
-        0.078275256,
-        0.077868804,
-        0.076906316,
-        0.07448161,
-        0.07243896,
-        0.065588444
+        0.08722675,
+        0.08599389,
+        0.081927896,
+        0.07899558,
+        0.0775515,
+        0.0744816,
+        0.07213174,
+        0.06346045,
+        0.05925926,
+        0.05771725
       ]
     },
     {
@@ -200,25 +200,25 @@
         "gc_goal_personal_learn",
         "gc_goal_q2_saas",
         "gc3_f22",
-        "gc3_f11",
         "gc3_f31",
         "gc_goal_launch",
         "gc_goal_milestone_v1",
-        "gc3_f14",
-        "gc3_f08",
-        "gc3_f28"
+        "gc3_f28",
+        "gc3_f26",
+        "gc3_f10",
+        "gc_goal_eval"
       ],
       "scores": [
         0.0825066,
         0.0796413,
         0.06968546,
-        0.06773856,
-        0.066905424,
+        0.06690543,
         0.06671115,
-        0.06541537,
-        0.063295595,
-        0.059333093,
-        0.05930697
+        0.06541538,
+        0.059306987,
+        0.056420706,
+        0.05473624,
+        0.053585466
       ]
     },
     {
@@ -228,53 +228,53 @@
         "identity_name_role",
         "identity_background",
         "identity_neg_project",
-        "identity_family",
-        "identity_expertise",
-        "identity_neg_routine",
         "identity_neg_goals",
         "identity_open_source",
         "identity_neg_work_style",
-        "identity_location"
+        "identity_location",
+        "identity_family",
+        "identity_expertise",
+        "identity_neg_routine"
       ],
       "scores": [
-        0.07759038,
-        0.074102886,
-        0.07047693,
-        0.06535605,
-        0.062884346,
-        0.061786074,
+        0.077918254,
+        0.074420184,
+        0.052015387,
         0.050471626,
         0.049633168,
         0.04782214,
-        0.046397798
+        0.046397798,
+        0.04535605,
+        0.04383672,
+        0.043036073
       ]
     },
     {
       "key": "what are my coding preferences␟␟pref_code_style,pref_comments,pref_deps,pref_error_handling,pref_git,pref_lang_choice,pref_testing",
       "query": "what are my coding preferences",
       "ranked_ids": [
-        "pref_code_style",
         "pref_neg_communication",
-        "pref_comments",
-        "pref_git",
+        "pref_code_style",
         "pref_lang_choice",
         "pref_error_handling",
         "pref_deps",
+        "pref_comments",
         "pref_neg_books",
+        "pref_git",
         "pref_testing",
         "pref_neg_project_stack"
       ],
       "scores": [
-        0.08688375,
         0.07808749,
-        0.07547253,
-        0.07232337,
+        0.067528926,
         0.06309702,
         0.061659053,
         0.060151707,
+        0.055800408,
         0.054547705,
+        0.053275745,
         0.048888642,
-        0.047989197
+        0.047989205
       ]
     },
     {
@@ -284,25 +284,25 @@
         "goal_neg_community",
         "goal_saas_revenue",
         "goal_personal_learn",
-        "goal_neg_saas_backlog",
         "goal_personal_fitness",
         "goal_origin_launch",
         "goal_neg_origin_completed",
         "goal_neg_team",
         "goal_neg_career",
-        "goal_origin_eval"
+        "goal_origin_eval",
+        "goal_neg_saas_backlog"
       ],
       "scores": [
-        0.0875201,
-        0.08404666,
-        0.082666084,
-        0.070350654,
-        0.06410975,
+        0.08782732,
+        0.08436396,
+        0.082993954,
+        0.06440736,
         0.06127086,
-        0.05675905,
+        0.05675904,
         0.055420484,
         0.053243704,
-        0.0511517
+        0.0511517,
+        0.050350647
       ]
     },
     {
@@ -313,24 +313,24 @@
         "agent_multi_db_schema_chatgpt",
         "agent_multi_db_schema_claude",
         "agent_multi_db_schema_desktop",
+        "agent_multi_db_schema_index",
+        "agent_multi_neg_db_read",
         "agent_multi_neg_db_partitioning",
         "agent_multi_neg_db_cache",
         "agent_multi_neg_db_backup",
-        "agent_multi_db_schema_index",
-        "agent_multi_neg_db_search",
-        "agent_multi_neg_db_read"
+        "agent_multi_neg_db_test"
       ],
       "scores": [
         0.08771129,
         0.08322269,
         0.08213385,
         0.07728534,
-        0.077145316,
-        0.07280076,
-        0.069549054,
         0.06677597,
-        0.06501888,
-        0.06445573
+        0.06445573,
+        0.060243916,
+        0.055153716,
+        0.052406196,
+        0.051586017
       ]
     },
     {
@@ -339,8 +339,8 @@
       "ranked_ids": [
         "agent_multi_neg_style_review",
         "agent_multi_neg_style_editor",
-        "agent_multi_style_fn_size",
         "agent_multi_neg_style_git",
+        "agent_multi_style_fn_size",
         "agent_multi_neg_style_lib",
         "agent_multi_style_naming",
         "agent_multi_neg_style_infra",
@@ -349,16 +349,16 @@
         "agent_multi_neg_style_deploy"
       ],
       "scores": [
-        0.08804228,
-        0.08305401,
-        0.08167578,
-        0.08112263,
-        0.07788888,
-        0.07709165,
+        0.08494369,
+        0.08330246,
+        0.08207501,
+        0.0819555,
+        0.07813033,
+        0.077355035,
         0.07500112,
         0.073475726,
-        0.06900388,
-        0.06816109
+        0.069275245,
+        0.06844956
       ]
     },
     {
@@ -422,27 +422,27 @@
       "query": "how does the caching layer work",
       "ranked_ids": [
         "noisy_cache_strategy",
+        "noisy_cache_invalidation",
+        "noisy1_f15",
+        "noisy1_f19",
         "noisy1_f03",
         "noisy_cache_hit_rate",
-        "noisy1_f06",
+        "noisy1_f12",
         "noisy_cache_eviction",
-        "noisy1_f20",
-        "noisy_cache_invalidation",
-        "noisy1_f11",
-        "noisy1_f15",
-        "noisy1_f01"
+        "noisy1_f06",
+        "noisy1_f20"
       ],
       "scores": [
         0.09122953,
-        0.089313075,
-        0.07671126,
-        0.072368495,
-        0.07197615,
-        0.06993156,
         0.06495775,
-        0.0632879,
         0.063218676,
-        0.06310952
+        0.06213004,
+        0.060280826,
+        0.05931997,
+        0.05694103,
+        0.054329097,
+        0.053320885,
+        0.05202111
       ]
     },
     {
@@ -483,22 +483,22 @@
         "noisy_ratelimit_storage",
         "noisy_ratelimit_tier",
         "noisy3_f17",
-        "noisy3_f16",
         "noisy3_f11",
         "noisy3_f07",
-        "noisy3_f13"
+        "noisy3_f13",
+        "noisy3_f19"
       ],
       "scores": [
-        0.104222715,
-        0.09287036,
-        0.09179451,
-        0.08513322,
-        0.08337031,
-        0.07215819,
-        0.063084766,
-        0.06290849,
-        0.061350945,
-        0.055714812
+        0.10422273,
+        0.09258191,
+        0.09211182,
+        0.08539662,
+        0.0839385,
+        0.07305149,
+        0.06317987,
+        0.061350953,
+        0.05571482,
+        0.046839382
       ]
     },
     {
@@ -507,26 +507,26 @@
       "ranked_ids": [
         "noisy_enc_keys",
         "noisy_enc_at_rest",
-        "noisy_enc_passwords",
         "noisy4_f10",
         "noisy4_f08",
         "noisy_enc_in_transit",
         "noisy_enc_pii",
         "noisy4_f01",
+        "noisy_enc_passwords",
         "noisy4_f06",
-        "noisy4_f16"
+        "noisy4_f04"
       ],
       "scores": [
-        0.08491457,
-        0.0818146,
-        0.077135935,
-        0.074444056,
-        0.069467425,
-        0.068838075,
-        0.06699315,
-        0.06633557,
-        0.06407539,
-        0.059736032
+        0.08460737,
+        0.08181461,
+        0.07444407,
+        0.06975589,
+        0.068252005,
+        0.066993155,
+        0.06694041,
+        0.05895413,
+        0.04668409,
+        0.04499915
       ]
     },
     {
@@ -626,11 +626,11 @@
         "mem_tangential"
       ],
       "scores": [
-        0.09273073,
-        0.08630186,
-        0.08365397,
-        0.07987079,
-        0.07001692
+        0.092730746,
+        0.08630188,
+        0.08365399,
+        0.079870805,
+        0.07001693
       ]
     },
     {
@@ -664,7 +664,7 @@
         0.093594156,
         0.086889274,
         0.08420028,
-        0.07421533
+        0.05546533
       ]
     },
     {
@@ -681,8 +681,8 @@
         0.14869507,
         0.14423253,
         0.11915153,
-        0.116047144,
-        0.06036175
+        0.11604716,
+        0.060361758
       ]
     },
     {
@@ -695,10 +695,10 @@
         "mem_auth_refresh_edge"
       ],
       "scores": [
-        0.084921755,
-        0.08054137,
-        0.07983069,
-        0.07502491
+        0.08601454,
+        0.08252635,
+        0.077869944,
+        0.0741463
       ]
     },
     {
@@ -710,8 +710,8 @@
         "mem_embed_migration"
       ],
       "scores": [
-        0.09519099,
-        0.08856212,
+        0.096449636,
+        0.08743815,
         0.07891145
       ]
     },
@@ -749,8 +749,8 @@
         "mem_other_person"
       ],
       "scores": [
-        0.08357787,
-        0.061433256
+        0.063577875,
+        0.041761123
       ]
     },
     {
@@ -762,23 +762,23 @@
         "hca_db_noise_schema",
         "hca_db_noise_lancedb",
         "hca_db_noise_session",
-        "hca_db_noise_postgres",
-        "hca_db_noise_fk",
         "hca_db_manual",
         "hca_db_noise_params",
-        "hca_db_noise_mutex"
+        "hca_db_noise_postgres",
+        "hca_db_noise_mutex",
+        "hca_db_noise_fk"
       ],
       "scores": [
-        0.0961828,
-        0.09294488,
-        0.08582424,
-        0.07899354,
-        0.07800269,
-        0.0747998,
-        0.07158908,
+        0.096182786,
+        0.092944875,
+        0.086410314,
+        0.078705065,
+        0.077705055,
         0.07024701,
-        0.070095494,
-        0.054793537
+        0.07009549,
+        0.05661798,
+        0.05479353,
+        0.05367863
       ]
     },
     {
@@ -801,7 +801,7 @@
         0.06025092,
         0.059024204,
         0.056944456,
-        0.0518338,
+        0.05183381,
         0.050896343
       ]
     },
@@ -814,23 +814,23 @@
         "hd_chunking_lang",
         "hd_d43",
         "hd_d17",
+        "hd_d32",
+        "hd_d41",
         "hd_d37",
         "hd_d34",
-        "hd_d19",
-        "hd_d30",
-        "hd_d32"
+        "hd_d36"
       ],
       "scores": [
         0.09762002,
         0.09473752,
         0.09239719,
-        0.08110847,
-        0.07624023,
-        0.07143272,
-        0.07121859,
-        0.06740454,
-        0.06369926,
-        0.06195186
+        0.0813882,
+        0.076528676,
+        0.06224948,
+        0.061208572,
+        0.05521651,
+        0.053308144,
+        0.052211985
       ]
     },
     {
@@ -838,27 +838,27 @@
       "query": "what triggers a memory to be archived",
       "ranked_ids": [
         "hd2_archive_trigger",
-        "hd2_d21",
         "hd2_d02",
+        "hd2_d21",
         "hd2_neg_supersede",
         "hd2_archive_decay",
-        "hd2_neg_quality_gate",
-        "hd2_d27",
         "hd2_d08",
-        "hd2_d22",
-        "hd2_d09"
+        "hd2_d09",
+        "hd2_d20",
+        "hd2_d15",
+        "hd2_d25"
       ],
       "scores": [
-        0.09917484,
-        0.090540186,
-        0.087881,
-        0.08729695,
-        0.08245629,
-        0.07715207,
-        0.07514905,
-        0.072930075,
-        0.06928189,
-        0.06912004
+        0.09917485,
+        0.08883339,
+        0.08793149,
+        0.08729696,
+        0.083887145,
+        0.07444523,
+        0.07114323,
+        0.06876554,
+        0.067020245,
+        0.064076975
       ]
     },
     {
@@ -874,13 +874,13 @@
         "hdb_pagination_a"
       ],
       "scores": [
-        0.090374164,
-        0.08876492,
-        0.08343119,
-        0.081277795,
-        0.07816204,
-        0.07619699,
-        0.06766409
+        0.090691455,
+        0.0890928,
+        0.085372396,
+        0.08084446,
+        0.07787358,
+        0.07707621,
+        0.046941895
       ]
     },
     {
@@ -894,11 +894,11 @@
         "hdb_capture_heartbeat_a"
       ],
       "scores": [
-        0.09304567,
-        0.08651602,
-        0.08183163,
-        0.07968205,
-        0.07428143
+        0.093373545,
+        0.08727859,
+        0.081419036,
+        0.079374835,
+        0.055233832
       ]
     },
     {
@@ -908,15 +908,15 @@
         "hnv_embed_gen",
         "hnv_neg_migration",
         "hnv_neg_search",
-        "hnv_embed_prefix",
-        "hnv_neg_cache"
+        "hnv_neg_cache",
+        "hnv_embed_prefix"
       ],
       "scores": [
-        0.095748305,
-        0.08468994,
-        0.08328874,
-        0.06530418,
-        0.063044615
+        0.09607617,
+        0.086483054,
+        0.0812908,
+        0.06507831,
+        0.06323103
       ]
     },
     {
@@ -930,8 +930,8 @@
         "hnv_neg_ui"
       ],
       "scores": [
-        0.102002345,
-        0.10069974,
+        0.10337981,
+        0.09937141,
         0.09556414,
         0.095025286,
         0.09083558
@@ -953,16 +953,16 @@
         "htd_distractor_libsql"
       ],
       "scores": [
-        0.09397946,
-        0.09242564,
-        0.089654215,
-        0.077413276,
-        0.075072005,
-        0.068198115,
-        0.068124965,
-        0.054819576,
-        0.045883648,
-        0.044961635
+        0.09397948,
+        0.092425644,
+        0.08965423,
+        0.07741328,
+        0.07507201,
+        0.06819812,
+        0.06812497,
+        0.05481958,
+        0.045883656,
+        0.044961642
       ]
     },
     {
@@ -970,23 +970,23 @@
       "query": "what is the current authentication approach",
       "ranked_ids": [
         "htd_auth_v1",
-        "htd_hard_neg_projecta",
         "htd_auth_v2",
+        "htd_hard_neg_projecta",
+        "htd_auth_v3",
         "htd_distractor_oauth",
         "htd_distractor_trust",
         "htd_distractor_remote",
-        "htd_distractor_cors",
-        "htd_auth_v3"
+        "htd_distractor_cors"
       ],
       "scores": [
-        0.087908335,
-        0.080148794,
-        0.079403125,
-        0.07526949,
-        0.07392366,
-        0.06835268,
-        0.065725744,
-        0.058135256
+        0.08823618,
+        0.07907525,
+        0.061687246,
+        0.058135252,
+        0.056519486,
+        0.054568827,
+        0.050170857,
+        0.046678115
       ]
     },
     {
@@ -1019,10 +1019,10 @@
         "mem_api_other_project"
       ],
       "scores": [
-        0.08836082,
-        0.084914565,
+        0.08836083,
+        0.08491457,
         0.082325466,
-        0.08176644
+        0.08176646
       ]
     },
     {
@@ -1035,10 +1035,10 @@
         "mem_libsql_fts"
       ],
       "scores": [
-        0.09364113,
-        0.09177087,
+        0.09732317,
+        0.09058893,
         0.08045842,
-        0.07621969
+        0.0744047
       ]
     },
     {
@@ -1051,10 +1051,10 @@
         "mem_recap_penalty"
       ],
       "scores": [
-        0.08949415,
-        0.08420731,
-        0.06363877,
-        0.061541893
+        0.090657845,
+        0.086312465,
+        0.0615859,
+        0.060565036
       ]
     },
     {
@@ -1067,8 +1067,8 @@
       ],
       "scores": [
         0.090016484,
-        0.06063027,
-        0.059428014
+        0.06162421,
+        0.058469497
       ]
     },
     {
@@ -1120,8 +1120,8 @@
         "dup_rust_medium"
       ],
       "scores": [
-        0.0927219,
-        0.08490911,
+        0.09304977,
+        0.08458124,
         0.08180278,
         0.07890731,
         0.078376
@@ -1157,9 +1157,9 @@
         "dup_font_session5"
       ],
       "scores": [
-        0.10322574,
-        0.101941146,
-        0.09664617,
+        0.10354303,
+        0.10226902,
+        0.09600101,
         0.08646659,
         0.08359669,
         0.08024131
@@ -1178,11 +1178,11 @@
       ],
       "scores": [
         0.10493758,
-        0.101419225,
+        0.10111201,
         0.09958161,
-        0.09524451,
-        0.08872626,
-        0.08597333
+        0.09555174,
+        0.088437796,
+        0.086261794
       ]
     },
     {
@@ -1224,12 +1224,12 @@
         "noise_generic_editor_1"
       ],
       "scores": [
-        0.109616265,
+        0.10994413,
         0.08836617,
         0.08528054,
-        0.081841536,
+        0.08119637,
         0.075719655,
-        0.07509479,
+        0.07541209,
         0.07046374
       ]
     },
@@ -1245,29 +1245,29 @@
         "noise_generic_db_2"
       ],
       "scores": [
-        0.09791629,
-        0.09290036,
+        0.097916305,
+        0.092900366,
         0.0876376,
-        0.07498958,
-        0.06406463,
-        0.061949186
+        0.074989595,
+        0.06406464,
+        0.06194919
       ]
     },
     {
       "key": "food allergies or dietary restrictions␟␟mem_diet_1,mem_diet_2",
       "query": "food allergies or dietary restrictions",
       "ranked_ids": [
-        "noise_dup_diet_1",
         "noise_sysprompt_diet_1",
         "noise_sysprompt_diet_2",
+        "noise_dup_diet_1",
         "mem_diet_1",
         "mem_diet_2",
         "noise_generic_diet_1"
       ],
       "scores": [
-        0.09409519,
         0.088045225,
-        0.08203316,
+        0.08235045,
+        0.07442307,
         0.066040345,
         0.060208004,
         0.058819346
@@ -1278,20 +1278,20 @@
       "query": "preferred programming languages and when to use each",
       "ranked_ids": [
         "noise_vague_lang_1",
-        "mem_lang_pref_1",
         "noise_generic_lang_1",
         "noise_generic_lang_2",
+        "mem_lang_pref_1",
         "mem_lang_pref_2",
         "noise_status_lang_2",
         "noise_status_lang_1"
       ],
       "scores": [
         0.1049446,
-        0.08760894,
-        0.08387614,
-        0.08017781,
-        0.07854949,
-        0.06870449,
+        0.08450065,
+        0.080782644,
+        0.0691474,
+        0.058877353,
+        0.04934966,
         0.04441745
       ]
     },
@@ -1300,16 +1300,16 @@
       "query": "how should the app be distributed to users",
       "ranked_ids": [
         "mem_distrib_decision_1",
-        "noise_meta_distrib_1",
         "noise_generic_distrib_1",
+        "noise_meta_distrib_1",
         "noise_tool_output_2",
         "mem_distrib_decision_2",
         "noise_tool_output_3"
       ],
       "scores": [
-        0.087159835,
-        0.08123506,
-        0.07870115,
+        0.08683197,
+        0.079029016,
+        0.061880216,
         0.055736747,
         0.053934626,
         0.05052764
@@ -1329,9 +1329,9 @@
       "scores": [
         0.094053276,
         0.08832646,
-        0.08431435,
+        0.084016725,
         0.07974995,
-        0.07658859,
+        0.076886214,
         0.05886208
       ]
     },
@@ -1374,9 +1374,9 @@
         0.09589234,
         0.09012105,
         0.08528813,
-        0.07738095,
-        0.07614845,
-        0.07020671
+        0.077101216,
+        0.075859986,
+        0.07077489
       ]
     },
     {
@@ -1414,25 +1414,25 @@
         "junk_onboard_obvious",
         "junk_onboard_generic_rwlock",
         "mem_onboard_state_arch",
-        "mem_onboard_setup_gotcha",
         "junk_onboard_restate",
+        "mem_onboard_setup_gotcha",
+        "junk_onboard_generic_arc",
         "mem_onboard_llm_bridge",
         "mem_onboard_atomic_flags",
         "junk_onboard_ack1",
-        "junk_onboard_sysprompt",
-        "junk_onboard_generic_arc"
+        "junk_onboard_sysprompt"
       ],
       "scores": [
-        0.09374051,
-        0.09119977,
-        0.08811459,
-        0.080099665,
-        0.08009397,
-        0.07584963,
-        0.07445015,
-        0.06972174,
-        0.06360166,
-        0.061273083
+        0.09404773,
+        0.09152764,
+        0.087807365,
+        0.0797661,
+        0.06270836,
+        0.061273083,
+        0.057939183,
+        0.0568031,
+        0.050971743,
+        0.045419835
       ]
     },
     {
@@ -1474,49 +1474,49 @@
         "mem_plan_two_stage",
         "mem_plan_no_llm_gate",
         "mem_plan_novelty_threshold",
-        "junk_plan_generic_best_practice",
         "junk_plan_rejected_idea2",
+        "junk_plan_generic_best_practice",
         "junk_plan_rejected_idea1"
       ],
       "scores": [
-        0.10023685,
-        0.09284534,
-        0.09059791,
-        0.08652937,
-        0.08377914,
-        0.08237276,
-        0.078704394,
-        0.076098226,
-        0.07483126,
-        0.06743591
+        0.10023686,
+        0.09222084,
+        0.09059793,
+        0.087080464,
+        0.084298305,
+        0.08290753,
+        0.07927259,
+        0.075753406,
+        0.07469768,
+        0.048974376
       ]
     },
     {
       "key": "what tech stack is used for the main project␟␟rmh_finance_sub,rmh_fitness,rmh_food_diet,rmh_goal_launch,rmh_health_allergy,rmh_health_sleep,rmh_identity_role,rmh_identity_values,rmh_pref_coffee,rmh_pref_comms,rmh_pref_editor,rmh_pref_music,rmh_pref_os,rmh_pref_reading,rmh_proj_db,rmh_proj_deploy,rmh_proj_embed,rmh_proj_license,rmh_proj_llm,rmh_proj_pnpm,rmh_proj_react,rmh_proj_rust,rmh_proj_tauri,rmh_proj_testing,rmh_recap_week,rmh_travel_home",
       "query": "what tech stack is used for the main project",
       "ranked_ids": [
-        "rmh_proj_react",
         "rmh_proj_license",
+        "rmh_identity_role",
+        "rmh_identity_values",
+        "rmh_proj_react",
+        "rmh_proj_testing",
         "rmh_proj_rust",
         "rmh_proj_deploy",
-        "rmh_proj_pnpm",
         "rmh_proj_tauri",
-        "rmh_identity_role",
-        "rmh_pref_editor",
-        "rmh_identity_values",
-        "rmh_recap_week"
+        "rmh_proj_pnpm",
+        "rmh_pref_editor"
       ],
       "scores": [
-        0.08511736,
-        0.082549006,
-        0.07846705,
-        0.075846046,
-        0.074007966,
-        0.073527284,
+        0.08222114,
         0.068984136,
-        0.06870467,
-        0.06810118,
-        0.0680599
+        0.068429045,
+        0.06665582,
+        0.06504963,
+        0.059717048,
+        0.058703184,
+        0.056135982,
+        0.054960355,
+        0.05248845
       ]
     },
     {
@@ -1565,14 +1565,14 @@
       "scores": [
         0.06503078,
         0.056280863,
-        0.053728607,
+        0.05372861,
         0.04889169,
-        0.047647282,
-        0.045789685,
+        0.04764729,
+        0.04578969,
         0.044052172,
-        0.043111555,
+        0.043111563,
         0.04163926,
-        0.04082865
+        0.040828675
       ]
     },
     {
@@ -1582,81 +1582,81 @@
         "rmh4_tools",
         "rmh4_terminal",
         "rmh4_proj_license",
+        "rmh4_proj_tauri",
         "rmh4_editor",
+        "rmh4_identity_role",
         "rmh4_goal_launch",
+        "rmh4_proj_llm",
         "rmh4_proj_react",
-        "rmh4_proj_rust",
-        "rmh4_proj_testing",
-        "rmh4_recap_week",
-        "rmh4_proj_tauri"
+        "rmh4_pref_music"
       ],
       "scores": [
-        0.08439411,
-        0.07640549,
-        0.07459043,
-        0.07201825,
-        0.07193452,
-        0.06760958,
-        0.065125465,
-        0.0621694,
-        0.056517363,
-        0.05648296
+        0.0643941,
+        0.05849504,
+        0.057447564,
+        0.056482956,
+        0.055351585,
+        0.05428756,
+        0.052262392,
+        0.051246412,
+        0.048561953,
+        0.04757529
       ]
     },
     {
       "key": "how should I plan a dinner for the user␟␟rmh5_allergy,rmh5_caffeine,rmh5_diet,rmh5_finance_sub,rmh5_fitness,rmh5_goal_launch,rmh5_grocery,rmh5_health_sleep,rmh5_identity_role,rmh5_identity_values,rmh5_pref_comms,rmh5_pref_editor,rmh5_pref_music,rmh5_pref_os,rmh5_pref_reading,rmh5_proj_db,rmh5_proj_embed,rmh5_proj_llm,rmh5_proj_react,rmh5_proj_rust,rmh5_proj_tauri,rmh5_proj_testing,rmh5_recap_week,rmh5_recipe,rmh5_schedule,rmh5_travel_home",
       "query": "how should I plan a dinner for the user",
       "ranked_ids": [
-        "rmh5_recipe",
         "rmh5_diet",
-        "rmh5_goal_launch",
+        "rmh5_recipe",
         "rmh5_pref_comms",
+        "rmh5_goal_launch",
+        "rmh5_grocery",
         "rmh5_schedule",
-        "rmh5_proj_react",
         "rmh5_identity_role",
+        "rmh5_proj_react",
         "rmh5_pref_editor",
-        "rmh5_proj_rust",
         "rmh5_proj_db"
       ],
       "scores": [
-        0.074949026,
-        0.0743073,
-        0.07279448,
-        0.07159629,
-        0.067677245,
-        0.06548159,
-        0.06439208,
-        0.06358582,
-        0.0622052,
-        0.060999632
+        0.05851782,
+        0.056487486,
+        0.054453436,
+        0.05279449,
+        0.049684178,
+        0.04862963,
+        0.047490668,
+        0.046126753,
+        0.045404002,
+        0.043608326
       ]
     },
     {
       "key": "what kind of person is the user␟␟rod_diet,rod_edu,rod_finance_sub,rod_fitness,rod_goal_launch,rod_grocery,rod_health_allergy,rod_health_sleep,rod_identity_role,rod_identity_values,rod_music,rod_pref_coffee,rod_pref_comms,rod_pref_editor,rod_pref_os,rod_pref_reading,rod_proj_db,rod_proj_deploy,rod_proj_embed,rod_proj_license,rod_proj_llm,rod_proj_pnpm,rod_proj_react,rod_proj_rust,rod_proj_tauri,rod_proj_testing,rod_recap_week,rod_recipe,rod_travel_home,rod_travel_safari",
       "query": "what kind of person is the user",
       "ranked_ids": [
-        "rod_proj_license",
+        "rod_identity_role",
+        "rod_identity_values",
         "rod_proj_react",
+        "rod_pref_comms",
+        "rod_proj_license",
         "rod_proj_rust",
+        "rod_music",
         "rod_goal_launch",
-        "rod_health_sleep",
-        "rod_travel_home",
-        "rod_proj_tauri",
-        "rod_pref_editor",
-        "rod_recap_week",
-        "rod_identity_role"
+        "rod_health_allergy",
+        "rod_health_sleep"
       ],
       "scores": [
-        0.07137321,
-        0.07053454,
-        0.06888797,
-        0.06452776,
-        0.06278571,
-        0.060421746,
-        0.06012545,
-        0.059625044,
-        0.05738678,
-        0.05498206
+        0.05498206,
+        0.054029442,
+        0.053143244,
+        0.052280325,
+        0.051373217,
+        0.049215846,
+        0.047591865,
+        0.046880696,
+        0.045026205,
+        0.04403571
       ]
     },
     {
@@ -1735,11 +1735,11 @@
         0.05922166,
         0.055673864,
         0.052510567,
-        0.05051351,
-        0.04939587,
-        0.048442602,
+        0.050513513,
+        0.049395896,
+        0.04844261,
         0.04658073,
-        0.045859266,
+        0.04585927,
         0.044864777
       ]
     },
@@ -1749,26 +1749,26 @@
       "ranked_ids": [
         "rod5_goal_launch",
         "rod5_identity_role",
-        "rod5_proj_rust",
+        "rod5_pref_comms",
+        "rod5_identity_values",
+        "rod5_recap_week",
+        "rod5_proj_tauri",
         "rod5_proj_db",
+        "rod5_proj_rust",
         "rod5_proj_react",
-        "rod5_pref_editor",
-        "rod5_pref_os",
-        "rod5_health_allergy",
-        "rod5_travel",
-        "rod5_health_sleep"
+        "rod5_recipe"
       ],
       "scores": [
-        0.07451856,
-        0.07007568,
-        0.062426545,
-        0.061516963,
-        0.060550146,
-        0.057179905,
-        0.055159763,
-        0.052346673,
-        0.051991317,
-        0.050233033
+        0.055163722,
+        0.05242863,
+        0.050033104,
+        0.049046256,
+        0.045680497,
+        0.044952355,
+        0.043606516,
+        0.042426545,
+        0.04180014,
+        0.041027363
       ]
     },
     {
@@ -1781,22 +1781,22 @@
         "rsh_recap_week",
         "rsh_proj_license",
         "rsh_pref_editor",
+        "rsh_proj_testing",
         "rsh_proj_tauri",
         "rsh_proj_db",
-        "rsh_pref_comms",
-        "rsh_proj_llm"
+        "rsh_pref_comms"
       ],
       "scores": [
-        0.08353427,
-        0.08205958,
-        0.08012809,
-        0.07730294,
-        0.0767691,
-        0.072028175,
-        0.0718638,
-        0.067648046,
-        0.06565139,
-        0.061574496
+        0.06709591,
+        0.06330959,
+        0.061080478,
+        0.059392486,
+        0.056769095,
+        0.05581196,
+        0.05473151,
+        0.052191667,
+        0.050256744,
+        0.048508532
       ]
     },
     {
@@ -1805,54 +1805,54 @@
       "ranked_ids": [
         "rsh3_edu",
         "rsh3_proj_react",
+        "rsh3_identity_role",
         "rsh3_learning",
         "rsh3_proj_rust",
+        "rsh3_proj_db",
         "rsh3_recap_week",
         "rsh3_travel_home",
         "rsh3_pref_editor",
-        "rsh3_proj_tauri",
-        "rsh3_identity_values",
-        "rsh3_goal_launch"
+        "rsh3_identity_values"
       ],
       "scores": [
-        0.079932876,
-        0.06915895,
-        0.067722924,
-        0.063279614,
-        0.06142285,
-        0.060362335,
-        0.06004942,
-        0.05960085,
-        0.059352875,
-        0.054464314
+        0.059932876,
+        0.051767647,
+        0.05027329,
+        0.048050795,
+        0.046378206,
+        0.04548629,
+        0.044756196,
+        0.043219477,
+        0.042402353,
+        0.041171055
       ]
     },
     {
       "key": "how much does the user exercise␟␟rsh4_finance_sub,rsh4_fitness,rsh4_food_diet,rsh4_goal_launch,rsh4_health_allergy,rsh4_health_sleep,rsh4_identity_role,rsh4_identity_values,rsh4_pref_coffee,rsh4_pref_comms,rsh4_pref_editor,rsh4_pref_music,rsh4_pref_os,rsh4_pref_reading,rsh4_proj_db,rsh4_proj_embed,rsh4_proj_license,rsh4_proj_llm,rsh4_proj_react,rsh4_proj_rust,rsh4_proj_testing,rsh4_recap_week,rsh4_travel_home",
       "query": "how much does the user exercise",
       "ranked_ids": [
-        "rsh4_fitness",
-        "rsh4_goal_launch",
-        "rsh4_pref_editor",
         "rsh4_health_sleep",
-        "rsh4_proj_license",
-        "rsh4_proj_rust",
-        "rsh4_proj_react",
-        "rsh4_pref_coffee",
+        "rsh4_fitness",
         "rsh4_finance_sub",
-        "rsh4_travel_home"
+        "rsh4_identity_role",
+        "rsh4_goal_launch",
+        "rsh4_pref_os",
+        "rsh4_pref_music",
+        "rsh4_proj_llm",
+        "rsh4_pref_comms",
+        "rsh4_identity_values"
       ],
       "scores": [
-        0.07832433,
-        0.070694804,
-        0.06404776,
-        0.06342793,
-        0.061858624,
-        0.060751647,
-        0.0598457,
-        0.055170424,
-        0.054540295,
-        0.053946894
+        0.063427925,
+        0.058324322,
+        0.05454029,
+        0.053408924,
+        0.05133997,
+        0.050380096,
+        0.049174197,
+        0.047574874,
+        0.046684794,
+        0.045623664
       ]
     },
     {
@@ -1860,27 +1860,27 @@
       "query": "what does the user do for a living",
       "ranked_ids": [
         "rsh5_identity_role",
-        "rsh5_travel_home",
+        "rsh5_identity_values",
         "rsh5_pref_comms",
-        "rsh5_proj_react",
-        "rsh5_pref_editor",
+        "rsh5_travel_home",
         "rsh5_proj_db",
+        "rsh5_pref_editor",
+        "rsh5_proj_react",
         "rsh5_proj_tauri",
-        "rsh5_proj_rust",
-        "rsh5_goal_launch",
-        "rsh5_recap_week"
+        "rsh5_pref_music",
+        "rsh5_proj_rust"
       ],
       "scores": [
-        0.07571221,
-        0.069525376,
-        0.068780676,
-        0.06726387,
-        0.066556,
-        0.065901406,
-        0.06445256,
-        0.06348596,
-        0.06345508,
-        0.058112867
+        0.058569353,
+        0.05364682,
+        0.05211401,
+        0.05047776,
+        0.04946306,
+        0.048374183,
+        0.047591746,
+        0.04654212,
+        0.04565047,
+        0.04413113
       ]
     },
     {
@@ -1888,27 +1888,27 @@
       "query": "what package manager does the project use",
       "ranked_ids": [
         "rsh6_pnpm",
+        "rsh6_proj_deploy",
         "rsh6_proj_react",
         "rsh6_proj_license",
         "rsh6_proj_rust",
-        "rsh6_proj_tauri",
+        "rsh6_proj_testing",
         "rsh6_proj_cargo",
+        "rsh6_proj_tauri",
         "rsh6_pref_editor",
-        "rsh6_recap_week",
-        "rsh6_goal_launch",
-        "rsh6_proj_deploy"
+        "rsh6_recap_week"
       ],
       "scores": [
-        0.08507905,
-        0.07740475,
-        0.0762709,
-        0.075600296,
-        0.0704824,
-        0.06919567,
-        0.06839107,
-        0.064429246,
-        0.06301469,
-        0.062162887
+        0.067432,
+        0.06216289,
+        0.06001347,
+        0.057809375,
+        0.05592817,
+        0.054028243,
+        0.052052822,
+        0.050482415,
+        0.04934345,
+        0.04651884
       ]
     },
     {
@@ -1944,27 +1944,27 @@
       "query": "what project is the user currently working on",
       "ranked_ids": [
         "rt_proj_react",
-        "rt_pref_editor",
-        "rt_proj_tauri",
-        "rt_proj_rust",
-        "rt_goal_launch",
         "rt_project_current",
-        "rt_proj_llm",
+        "rt_pref_editor",
         "rt_proj_testing",
+        "rt_proj_rust",
+        "rt_proj_tauri",
         "rt_pref_comms",
-        "rt_identity_role"
+        "rt_identity_role",
+        "rt_proj_db",
+        "rt_goal_launch"
       ],
       "scores": [
-        0.124575146,
-        0.12040663,
-        0.11298793,
-        0.11075177,
-        0.10235869,
-        0.098281525,
-        0.09653655,
-        0.09153862,
+        0.099223025,
+        0.097813696,
+        0.09393605,
+        0.091538616,
+        0.08503747,
+        0.08347973,
         0.079856746,
-        0.07743779
+        0.07808296,
+        0.07601467,
+        0.07431794
       ]
     },
     {
@@ -1972,27 +1972,27 @@
       "query": "where does the user live",
       "ranked_ids": [
         "rt2_home_sf",
-        "rt2_proj_react",
-        "rt2_proj_rust",
-        "rt2_pref_editor",
-        "rt2_fitness",
         "rt2_proj_db",
-        "rt2_goal_launch",
-        "rt2_pref_coffee",
+        "rt2_proj_react",
         "rt2_pref_comms",
-        "rt2_proj_tauri"
+        "rt2_proj_rust",
+        "rt2_proj_tauri",
+        "rt2_identity_role",
+        "rt2_finance_sub",
+        "rt2_pref_os",
+        "rt2_pref_editor"
       ],
       "scores": [
-        0.07511113,
-        0.07055715,
-        0.06767369,
-        0.06181708,
-        0.056932934,
-        0.055542935,
-        0.055096556,
-        0.05295639,
+        0.057816043,
+        0.055542927,
+        0.05055714,
         0.04939506,
-        0.0466525
+        0.048001554,
+        0.0466525,
+        0.04587962,
+        0.044824723,
+        0.043991957,
+        0.042462245
       ]
     },
     {
@@ -2000,27 +2000,27 @@
       "query": "what embedding model does the project use",
       "ranked_ids": [
         "rt3_embed_v3",
+        "rt3_embed_prefix",
+        "rt3_proj_license",
         "rt3_proj_rust",
         "rt3_proj_react",
-        "rt3_embed_prefix",
-        "rt3_pref_editor",
-        "rt3_goal_launch",
-        "rt3_proj_license",
         "rt3_proj_testing",
         "rt3_proj_db",
-        "rt3_pref_comms"
+        "rt3_pref_editor",
+        "rt3_pref_comms",
+        "rt3_identity_role"
       ],
       "scores": [
         0.07860384,
-        0.078307085,
-        0.077537075,
         0.07535647,
-        0.06904286,
-        0.06423878,
         0.06187664,
+        0.05925947,
+        0.05818225,
         0.056805756,
         0.051255252,
-        0.04928544
+        0.050292864,
+        0.04928544,
+        0.048475135
       ]
     },
     {
@@ -2028,27 +2028,27 @@
       "query": "what editor does the user prefer",
       "ranked_ids": [
         "rt4_editor_cursor",
+        "rt4_pref_comms",
         "rt4_proj_rust",
         "rt4_proj_react",
-        "rt4_goal_launch",
-        "rt4_pref_comms",
         "rt4_tools_figma",
         "rt4_proj_testing",
-        "rt4_travel_home",
         "rt4_proj_tauri",
-        "rt4_identity_role"
+        "rt4_identity_role",
+        "rt4_goal_launch",
+        "rt4_recap_week"
       ],
       "scores": [
         0.08959688,
-        0.077180535,
-        0.07625919,
-        0.063198105,
         0.06086754,
+        0.05782571,
+        0.05658707,
         0.05569562,
-        0.050557893,
-        0.049492937,
-        0.047318596,
-        0.045937248
+        0.0505579,
+        0.0473186,
+        0.045937248,
+        0.045016285,
+        0.04341117
       ]
     },
     {
@@ -2067,16 +2067,16 @@
         "rt5_recap_week"
       ],
       "scores": [
-        0.06547701,
-        0.057529885,
+        0.06547702,
+        0.057529893,
         0.055508498,
         0.053386085,
-        0.051100608,
+        0.051100615,
         0.050165977,
         0.049308054,
         0.047997892,
         0.047121048,
-        0.046158448
+        0.046158474
       ]
     },
     {
@@ -2095,16 +2095,16 @@
         "rt6_proj_tauri"
       ],
       "scores": [
-        0.059042998,
+        0.059043005,
         0.052686363,
         0.050128054,
-        0.049076386,
-        0.04685854,
-        0.046081632,
+        0.049076393,
+        0.046858545,
+        0.04608166,
         0.044887584,
         0.044205908,
         0.04338195,
-        0.04256088
+        0.042560883
       ]
     },
     {
@@ -2118,11 +2118,11 @@
         "mem_build_ci"
       ],
       "scores": [
-        0.09728105,
-        0.09372956,
-        0.08772531,
-        0.085955024,
-        0.08131583
+        0.097608924,
+        0.09372955,
+        0.08804256,
+        0.08500263,
+        0.08162304
       ]
     },
     {
@@ -2136,11 +2136,11 @@
         "mem_scoring_config"
       ],
       "scores": [
-        0.09447842,
-        0.08843819,
-        0.085678756,
-        0.07540085,
-        0.059392046
+        0.094478436,
+        0.0884382,
+        0.08567881,
+        0.07540087,
+        0.059392054
       ]
     },
     {
@@ -2149,18 +2149,18 @@
       "ranked_ids": [
         "mem_search_dedup",
         "mem_dedup_core",
-        "mem_dedup_tangential",
         "mem_git_merge",
         "mem_entity_merge",
-        "mem_dedup_postingest"
+        "mem_dedup_postingest",
+        "mem_dedup_tangential"
       ],
       "scores": [
-        0.08878717,
-        0.08728422,
-        0.079882056,
-        0.07699515,
-        0.07520104,
-        0.0636058
+        0.08911502,
+        0.087601505,
+        0.07759999,
+        0.075201035,
+        0.0636058,
+        0.059882052
       ]
     },
     {
@@ -2169,17 +2169,17 @@
       "ranked_ids": [
         "mem_embed_model_inference",
         "mem_llm_eval",
-        "mem_llm_prompts",
         "mem_llm_setup",
         "mem_llm_perf",
+        "mem_llm_prompts",
         "mem_llm_noise"
       ],
       "scores": [
-        0.07185537,
-        0.064923786,
+        0.0915275,
+        0.08492378,
+        0.075862646,
+        0.067512415,
         0.06082575,
-        0.056507807,
-        0.048464797,
         0.041016147
       ]
     },
@@ -2194,11 +2194,11 @@
         "mem_supersede"
       ],
       "scores": [
-        0.07892709,
-        0.07725194,
-        0.06689694,
-        0.062301647,
-        0.055076603
+        0.078927085,
+        0.077251926,
+        0.06689693,
+        0.06230164,
+        0.055076595
       ]
     },
     {
@@ -2266,9 +2266,9 @@
         "mem_db_unconfirmed"
       ],
       "scores": [
-        0.09315181,
-        0.08534402,
-        0.080365226
+        0.09315186,
+        0.085344024,
+        0.08036524
       ]
     },
     {
@@ -2310,9 +2310,9 @@
         "mem_window_toast"
       ],
       "scores": [
-        0.06888067,
-        0.06514163,
-        0.06252633
+        0.088880666,
+        0.08449647,
+        0.08219846
       ]
     },
     {
@@ -2324,8 +2324,8 @@
         "mem_fts_neardup"
       ],
       "scores": [
-        0.07715484,
-        0.07081731,
+        0.09715483,
+        0.09048943,
         0.057242487
       ]
     },
@@ -2338,9 +2338,9 @@
         "mem_kg_partial_dup"
       ],
       "scores": [
-        0.103985235,
-        0.091266505,
-        0.077641115
+        0.10398525,
+        0.09126652,
+        0.07764112
       ]
     },
     {
@@ -2389,10 +2389,10 @@
         "mem_css_recap1"
       ],
       "scores": [
-        0.095747314,
-        0.088209845,
-        0.08426246,
-        0.081187285
+        0.09574732,
+        0.08820989,
+        0.08426251,
+        0.08118734
       ]
     },
     {
@@ -2421,9 +2421,9 @@
       ],
       "scores": [
         0.10903851,
-        0.09674552,
-        0.09130473,
-        0.07782019,
+        0.09706281,
+        0.09098743,
+        0.058772575,
         0.057263166
       ]
     },
@@ -2438,11 +2438,11 @@
         "mem_dec_agpl"
       ],
       "scores": [
-        0.088143006,
-        0.08086142,
-        0.07386289,
-        0.07027285,
-        0.06595851
+        0.087815136,
+        0.08118929,
+        0.054815266,
+        0.05152285,
+        0.046603676
       ]
     },
     {
@@ -2525,12 +2525,12 @@
         "mem_deps_trivia"
       ],
       "scores": [
-        0.08628248,
-        0.085759334,
-        0.08146798,
-        0.07992398,
-        0.076755054,
-        0.04444532
+        0.086282484,
+        0.08575934,
+        0.08146799,
+        0.07992399,
+        0.07675506,
+        0.04444533
       ]
     },
     {
