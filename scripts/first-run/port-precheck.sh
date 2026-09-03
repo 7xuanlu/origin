@@ -18,13 +18,43 @@
 # in scripts/lib/host-process.sh. "Could not measure" is recorded as FAIL,
 # because a port that cannot be measured is not a port known to be free.
 #
+# THE ROW MUST SAY WHICH RUN TOOK THE MEASUREMENT. This row is written BEFORE
+# the channel script starts, so it lands above that script's window mark and
+# lib.ps1's Record-CarriedRow finds it in the CARRIED region and restates its
+# verdict as one of this run's rows. GAUNTLET_OUT is reused -- the workflow
+# header below tells a human to keep one $PWD/gauntlet-out and run channel after
+# channel into it, and a re-run of a leg writes into the same artifact directory
+# again -- so the carried region is the union of every earlier run into that
+# directory. Position alone therefore says "before the mark", never "for this
+# run": ONE PASS row left behind by an earlier run is exactly one hit, and was
+# carried into every later run of the same channel. No precheck ran that time,
+# the port may since have gone busy, and the channel recorded a PASS anyway.
+#
+# So the detail column carries `run=$GAUNTLET_RUN_TOKEN`, and Record-CarriedRow
+# requires it to equal the token the channel process reads from the same
+# variable. An UNSET token is not a licence to skip the binding: a row nothing
+# downstream can attribute to a run is unusable evidence, so it FAILS here
+# rather than passing as one more anonymous PASS for the next run to inherit.
+# The port is not probed in that state, because there is nothing a later reader
+# could do with the answer.
+#
 # Usage: bash scripts/first-run/port-precheck.sh [port]
 #   GAUNTLET_OUT and GAUNTLET_CHANNEL must be set, as they are for the channel.
+#   GAUNTLET_RUN_TOKEN must be set to a value unique to this run, and the
+#   channel step that follows must read the SAME value -- in the workflow it is
+#   a job-level env var so both steps see one variable. No whitespace and no
+#   tab in it: it travels in an unquoted TSV column and is read back as one
+#   whitespace-delimited word, so a token with a space in it is compared as its
+#   first word and the carried row is refused as a different run's.
 set -uo pipefail
 
 port="${1:-7878}"
 : "${GAUNTLET_OUT:?GAUNTLET_OUT must be set}"
 : "${GAUNTLET_CHANNEL:?GAUNTLET_CHANNEL must be set}"
+# Not `:?`. A missing token is recorded as a FAIL ROW, not as an abort: an abort
+# leaves no row at all, and a channel that declares `port-7878-precheck-carried`
+# would then report the absence with the wrong diagnosis.
+run_token="${GAUNTLET_RUN_TOKEN:-}"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/host-process.sh
@@ -36,23 +66,30 @@ if ! mkdir -p "$GAUNTLET_OUT" 2>/dev/null; then
   exit 3
 fi
 
-probe_listener_port "$port"
-case "$LISTENER_PROBE_STATE" in
-  none)
-    st=PASS
-    detail="measured free"
-    ;;
-  found)
-    # A busy port means later health and CLI checks could pass against a daemon
-    # this channel never installed.
-    st=FAIL
-    detail="BUSY: pid $LISTENER_PROBE_PID is listening on $port"
-    ;;
-  *)
-    st=FAIL
-    detail="could not measure whether $port is free; recorded as unusable, not as free"
-    ;;
-esac
+if [ -z "$run_token" ]; then
+  # Bookkeeping, not the probe: the port may well be free, and this row still
+  # could not be told from one an earlier run left in this reused directory.
+  st=FAIL
+  detail="no run token to bind this precheck to: GAUNTLET_RUN_TOKEN is unset, so this row cannot be told from one an earlier run left in this reused GAUNTLET_OUT"
+else
+  probe_listener_port "$port"
+  case "$LISTENER_PROBE_STATE" in
+    none)
+      st=PASS
+      detail="measured free; run=$run_token"
+      ;;
+    found)
+      # A busy port means later health and CLI checks could pass against a daemon
+      # this channel never installed.
+      st=FAIL
+      detail="BUSY: pid $LISTENER_PROBE_PID is listening on $port; run=$run_token"
+      ;;
+    *)
+      st=FAIL
+      detail="could not measure whether $port is free; recorded as unusable, not as free; run=$run_token"
+      ;;
+  esac
+fi
 
 if ! printf '%s\tport-%s-precheck\t%s\t0\t%s\n' \
      "$GAUNTLET_CHANNEL" "$port" "$st" "$detail" >> "$ledger" 2>/dev/null; then

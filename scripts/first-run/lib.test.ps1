@@ -443,6 +443,24 @@ if ($Case) {
             Expect-Rows -Names @("port-7878-precheck-carried")
             Record-CarriedRow -Name "port-7878-precheck"
         }
+        "carried-row-token-missing" {
+            # A perfectly good PASS row is seeded, and this process has no token
+            # to compare it against. Nothing here can tell it from a row the
+            # PREVIOUS run into this reused directory left behind, so the only
+            # honest verdict is that the carried row is unusable.
+            Expect-Rows -Names @("port-7878-precheck-carried")
+            Record-CarriedRow -Name "port-7878-precheck"
+        }
+        "carried-row-token-mismatch" {
+            # THE DEFECT ITSELF. The seeded row is a PASS, it is the only
+            # `port-7878-precheck` row for this channel, and it sits exactly
+            # where the workflow's own step leaves one -- above the mark, in the
+            # carried region. It was recorded by an EARLIER run. Without the
+            # token comparison this run reports "the shared port was measured
+            # free" over a precheck it never took.
+            Expect-Rows -Names @("port-7878-precheck-carried")
+            Record-CarriedRow -Name "port-7878-precheck"
+        }
         "carried-row-declared-the-old-way" {
             # The shape being replaced, kept as its own case so the fix is not a
             # no-op: declaring the carried row itself can never be balanced,
@@ -507,7 +525,15 @@ function Assert-Case {
         # loaded, so their rows belong to the subject's own run; a historical row
         # has to predate the load or the case is not the case.
         [string[]]$SeedFindings = @(),
-        [string[]]$SeedExpected = @()
+        [string[]]$SeedExpected = @(),
+        # GAUNTLET_RUN_TOKEN reaches the subject the way GAUNTLET_OUT and
+        # GAUNTLET_CHANNEL already do: set on THIS process, inherited by the
+        # child. It is set (or removed) on every case rather than only on the
+        # cases that care, because this process is reused across cases and a
+        # token left over from the previous one would be the very stale-value
+        # defect these cases are about.
+        [string]$RunToken = "libtest-run-1",
+        [switch]$NoRunToken
     )
     $out = Join-Path $root $Name
     New-Item -ItemType Directory -Force -Path $out | Out-Null
@@ -519,6 +545,8 @@ function Assert-Case {
     }
     $env:GAUNTLET_OUT = $out
     $env:GAUNTLET_CHANNEL = "libtest"
+    if ($NoRunToken) { Remove-Item Env:GAUNTLET_RUN_TOKEN -ErrorAction SilentlyContinue }
+    else { $env:GAUNTLET_RUN_TOKEN = $RunToken }
     # A case that dies is a failed case, never a dead harness.
     $text = ""
     $rc = -1
@@ -544,8 +572,13 @@ Write-Host "lib.test.ps1"
 Assert-Case -Name "all-declared-recorded" -ExpectExit 0 `
     -ExpectText @("0 FAIL row(s), 0 declared row(s) never recorded") -RejectText @("GONE")
 
+# The `ledger-contract` row is the second half of this: GONE and DRIFT used to
+# live only in Evaluate's return value and on the console, so a channel whose
+# contract did not balance left a findings.tsv with no FAIL row in it and the
+# workflow's run-level grep printed "No FAIL rows" over checks that never ran.
 Assert-Case -Name "one-missing" -ExpectExit 1 `
-    -ExpectText @("GONE", "skipped-by-a-dead-block", "1 declared row(s) never recorded")
+    -ExpectText @("GONE", "skipped-by-a-dead-block", "1 declared row(s) never recorded",
+                  "[FAIL] ledger-contract")
 
 # The case that makes the whole change worth making: no FAIL row anywhere, a
 # non-empty ledger, and every contracted check absent.
@@ -720,10 +753,33 @@ Assert-Case -Name "declaration-count-lookup-answers-absent" -ExpectExit 1 `
 # in, never judged. Declaring it was therefore a contract that could never be
 # balanced -- GONE on every run -- and dropping the declaration would leave
 # nothing checking the step ran at all. Record-CarriedRow judges it here instead.
+# The seeded detail carries `run=libtest-run-1`, which is what port-precheck.sh
+# stamps from GAUNTLET_RUN_TOKEN and what the harness sets for this process. A
+# carried PASS is this run's evidence only when those two agree.
 Assert-Case -Name "carried-row-passing" -ExpectExit 0 `
-    -SeedFindings @("libtest`tport-7878-precheck`tPASS`t0`tmeasured free") `
+    -SeedFindings @("libtest`tport-7878-precheck`tPASS`t0`tmeasured free; run=libtest-run-1") `
     -ExpectText @("[PASS] port-7878-precheck-carried",
                   "0 FAIL row(s), 0 declared row(s) never recorded, 0 undeclared") `
+    -RejectText @("GONE", "DRIFT")
+
+# No token in this process at all. The row itself is impeccable -- one PASS, for
+# this channel, above the mark -- and it still cannot be attributed, which is
+# the one state where the comparison cannot be made rather than made and failed.
+# Unchecked is not a pass, so it is a FAIL row and not a silent skip.
+Assert-Case -Name "carried-row-token-missing" -ExpectExit 1 -NoRunToken `
+    -SeedFindings @("libtest`tport-7878-precheck`tPASS`t0`tmeasured free; run=libtest-run-1") `
+    -ExpectText @("[FAIL] port-7878-precheck-carried",
+                  "cannot bind the carried row to this run") `
+    -RejectText @("GONE", "DRIFT")
+
+# The finding this token exists to close: exactly the shape a reused
+# GAUNTLET_OUT produces. One PASS row, for this channel, in the carried region,
+# recorded by a run that is not this one. Both tokens are named, because "this
+# row is not yours" is unreadable without saying whose it is.
+Assert-Case -Name "carried-row-token-mismatch" -ExpectExit 1 `
+    -SeedFindings @("libtest`tport-7878-precheck`tPASS`t0`tmeasured free; run=an-earlier-run-9") `
+    -ExpectText @("[FAIL] port-7878-precheck-carried",
+                  "bound to 'an-earlier-run-9'", "not to this run 'libtest-run-1'") `
     -RejectText @("GONE", "DRIFT")
 
 Assert-Case -Name "carried-row-failing" -ExpectExit 1 `

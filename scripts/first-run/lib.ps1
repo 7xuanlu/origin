@@ -18,7 +18,9 @@
 #   Expect-Rows -Names @("a","b")                    declare the PASS/FAIL rows this process contracts to record
 #   Record-CarriedRow -Name n                        judge a row the workflow recorded BEFORE this process started
 #                                                    (it is above the mark, so Evaluate never judges it) and record
-#                                                    the verdict as `n-carried` in this run's window
+#                                                    the verdict as `n-carried` in this run's window. The row must
+#                                                    carry `run=$env:GAUNTLET_RUN_TOKEN` in its detail; a carried
+#                                                    PASS that does not is an earlier run's, not this run's
 #   Check-Helper -Name n -Interpreter i -Path p      run a helper script through an interpreter AS a recorded check
 #     -MustDeclare "^mcp-"                         ... and FAIL unless the helper declared a row matching it
 #   Evaluate                                         print table; return $true when no FAIL row and no declared row is missing
@@ -532,9 +534,12 @@ function Record-CarriedRow {
     # This restates its verdict as one row, `<Name>-carried`, inside this run's
     # window, which is the row a channel declares instead.
     #
-    #   PASS  exactly one carried row of this channel is named $Name and PASSed.
+    #   PASS  exactly one carried row of this channel is named $Name, it PASSed,
+    #         and its detail names THIS run.
     #   FAIL  it FAILed, or it is absent (the workflow step did not record it),
-    #         or it appears more than once and they cannot be told apart.
+    #         or it appears more than once and they cannot be told apart, or it
+    #         passed for a DIFFERENT run, or this process has no run token to
+    #         compare against.
     #   no row at all when findings.tsv could not be READ: nothing was measured,
     #         so this sets GauntletLedgerBroken and Evaluate refuses, exactly as
     #         it does for a ledger that could not be written.
@@ -545,6 +550,29 @@ function Record-CarriedRow {
     # already refusing on it; a row recorded here would only add a verdict to a
     # run that has none.
     if ($script:GauntletWindowBroken) { return }
+    # WHICH RUN TOOK THE MEASUREMENT.
+    #
+    # The carried region is, by construction, rows this process did not write,
+    # and in a reused GAUNTLET_OUT it is the union of every earlier run into that
+    # directory. So POSITION says "before the mark"; it never says "for this
+    # run". One PASS row left behind by an earlier run of this channel is
+    # exactly one hit below, and was carried into every later run: no precheck
+    # taken this time, the shared port possibly busy since, and a PASS recorded
+    # for it anyway. A measurement that was not taken for THIS run must never be
+    # reported as this run's result.
+    #
+    # port-precheck.sh stamps `run=<token>` into the row's detail from
+    # GAUNTLET_RUN_TOKEN, and the workflow sets that variable at the JOB level so
+    # the precheck step and this channel step read one value. No token here is
+    # not "assume it matches": it is the one state in which the comparison cannot
+    # be made at all, and an unattributable carried row is unchecked, not a pass.
+    $runToken = $env:GAUNTLET_RUN_TOKEN
+    if ([string]::IsNullOrWhiteSpace($runToken)) {
+        Record-Row FAIL $rowName 1 ("cannot bind the carried row to this run: GAUNTLET_RUN_TOKEN is not " +
+            "set in this process, so a '$Name' row left in this reused GAUNTLET_OUT by an earlier run " +
+            "cannot be told from one recorded for this run")
+        return
+    }
     $lines = @()
     try {
         $lines = Read-Ledger $script:GauntletTsv
@@ -585,8 +613,29 @@ function Record-CarriedRow {
     }
     $cols = $hits[0]
     $detail = if ($cols.Count -ge 5) { $cols[4] } else { "" }
-    if ($cols[2] -eq "PASS") { Record-Row PASS $rowName 0 $detail }
-    else { Record-Row FAIL $rowName 1 ("the carried '$Name' row is $($cols[2]): " + $detail) }
+    # The status is read BEFORE the token, because a carried FAIL is a FAIL
+    # whoever recorded it: refusing it as unbound would replace the verdict the
+    # row actually carries with a bookkeeping complaint, and the reader would
+    # lose the busy port. The binding guards the PASS, which is the only verdict
+    # that can certify this run for a measurement it never took.
+    if ($cols[2] -ne "PASS") {
+        Record-Row FAIL $rowName 1 ("the carried '$Name' row is $($cols[2]): " + $detail)
+        return
+    }
+    # Extracted and compared WHOLE, not by substring: `run=abc` is a substring of
+    # `run=abcd`, so a `Contains` test would accept a neighbouring run's row
+    # whose token merely starts with this one's.
+    $rowToken = ""
+    $tokenMatch = [regex]::Match($detail, 'run=(\S+)')
+    if ($tokenMatch.Success) { $rowToken = $tokenMatch.Groups[1].Value }
+    if ($rowToken -cne $runToken) {
+        $named = if ($rowToken) { "'$rowToken'" } else { "no run at all" }
+        Record-Row FAIL $rowName 1 ("the carried '$Name' row is bound to $named, not to this run " +
+            "'$runToken': it was recorded by a different run into this reused GAUNTLET_OUT, so nothing " +
+            "measured this for the run being judged here. The row reads: " + $detail)
+        return
+    }
+    Record-Row PASS $rowName 0 $detail
 }
 
 function Check-Helper {
@@ -1175,6 +1224,24 @@ function Evaluate {
     }
 
     Write-Host "==> $fails FAIL row(s), $missing declared row(s) never recorded, $surplus undeclared row(s)"
+    # GONE and DRIFT lived only in this function's RETURN VALUE and in the
+    # console. The run-level gate in first-run-gauntlet.yml greps findings.tsv
+    # for a FAIL row, so a channel whose contract did not balance -- declared
+    # rows that never arrived, rows nobody declared -- left a ledger with no FAIL
+    # row in it, and the gate printed "No FAIL rows" over the checks that never
+    # ran. The verdict is written down as a row so a reader of the LEDGER alone
+    # reaches it too.
+    #
+    # After the summary line and after both multisets have been walked: the
+    # counts printed above are the counts this run measured, and this row must
+    # not be able to count itself. Recorded, not declared -- Evaluate runs once
+    # per process, at the end, and the arithmetic it has just finished is not
+    # re-run over the row it adds.
+    if (($missing -gt 0) -or ($surplus -gt 0)) {
+        Record-Row FAIL "ledger-contract" 1 ("the row contract did not balance: $missing declared " +
+            "row(s) never recorded and $surplus undeclared row(s), over " +
+            "$($expected.PSBase.Count) declared name(s) for $script:GauntletChannel")
+    }
     return (($fails -eq 0) -and ($missing -eq 0) -and ($surplus -eq 0))
 }
 
