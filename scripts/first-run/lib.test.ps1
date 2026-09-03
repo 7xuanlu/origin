@@ -42,9 +42,9 @@ if ($Case) {
             Check -Name "b" -Script { Write-Output "ok" }
         }
         "only-info-rows" {
-            # AC1's exact shape: the ledger is non-empty and holds no FAIL row,
-            # so the old Evaluate returned $true while every contracted check
-            # had been skipped.
+            # The ledger is non-empty and holds no FAIL row, and every
+            # contracted check was skipped. Counting FAIL rows alone cannot
+            # tell that from a clean run.
             Expect-Rows -Names @("a", "b")
             Info "install-dir" "C:\\nowhere"
         }
@@ -98,13 +98,13 @@ if ($Case) {
         }
         "health-refused-is-a-negative" {
             # A REAL refusal, from the shell running this suite. Everything else
-            # in this file is a stub, and stubs are exactly what hid the defect
-            # this covers: they raised System.Net.WebException, which Windows
-            # PowerShell 5.1 raises and pwsh 7 -- the edition
-            # first-run-gauntlet.yml runs every channel with -- never does. So
-            # `down` and `negative`, the two answers the health probes exist to
-            # be able to give, were unreachable on the only host that runs them,
-            # and no test in the tree could see it.
+            # in this file is a stub, and a stub cannot cover this: stubs raise
+            # System.Net.WebException, which Windows PowerShell 5.1 raises and
+            # pwsh 7 -- the edition first-run-gauntlet.yml runs every channel
+            # with -- never does. Against stubs alone, `down` and `negative`,
+            # the two answers the health probes exist to give, can be
+            # unreachable on the only host that runs them and no test in the
+            # tree would see it.
             Expect-Rows -Names @("refusal-classified")
             Check -Name "refusal-classified" -Script {
                 # Bind port 0, read what the OS gave out, release it. The port
@@ -342,10 +342,10 @@ if ($Case) {
             # exactly what a previous run into a reused GAUNTLET_OUT leaves. This
             # run declares "a" and records it PASSING.
             #
-            # Evaluate used to judge every historical row for the channel, so the
-            # seeded FAIL made this run red for a check that passed. One bad
-            # manual run poisoned every later one, and the only way back was to
-            # delete the directory.
+            # An Evaluate that judges every historical row for the channel goes
+            # red on the seeded FAIL for a check this run passed: one bad manual
+            # run poisons every later one, and the only way back is deleting the
+            # directory.
             Expect-Rows -Names @("a")
             Check -Name "a" -Script { Write-Output "ok" }
         }
@@ -359,7 +359,7 @@ if ($Case) {
             Expect-Rows -Names @("a")
         }
         "carried-prefix-rewritten" {
-            # The window used to be a COUNT, and a count is not a boundary.
+            # A COUNT is not a boundary.
             #
             # Seeded: two rows from an earlier run, the second of them a PASS
             # for "a". This run declares "a" and records it FAILING, then swaps
