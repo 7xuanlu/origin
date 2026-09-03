@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import atexit
+import functools
 import hashlib
 import json
 import os
@@ -2628,10 +2630,32 @@ def _stub_curl(directory: str, replies: tuple[tuple[str, str], ...]) -> None:
     os.chmod(path, 0o755)
 
 
-def signpath_status_behaviour_violations(text: str | None = None) -> list[str]:
-    """Run the shipped status script against a fake SignPath."""
+class SignPathStatusRun(NamedTuple):
+    """What one pass over the SignPath status truth table measured.
+
+    Per ROW, like `AuthenticodeRun`, so a mutation control can demand that the
+    rows it names as catchers both ran and failed instead of settling for "some
+    violation appeared somewhere in the table".
+    """
+
+    violations: list[str]
+    ran: set[str]
+    failed: set[str]
+
+
+def signpath_status_behaviour_violations(
+    text: str | None = None, only: frozenset[str] | None = None
+) -> SignPathStatusRun:
+    """Run the shipped status script against a fake SignPath.
+
+    `only` restricts the pass to the named rows. Each row starts a bash and a
+    stub curl -- 1.7s on this host -- so a mutation control that already knows
+    which rows can catch its mutation should not pay for the other twenty.
+    """
     script = signpath_status_script(text)
     violations: list[str] = []
+    ran: set[str] = set()
+    failed: set[str] = set()
     bash = posix_bash()
     # The script parses the API response with jq, so a host without jq can only
     # ever reach the could-not-parse arm. Those rows are reported UNCHECKED by
@@ -2641,6 +2665,8 @@ def signpath_status_behaviour_violations(text: str | None = None) -> list[str]:
     for description, env, replies, expected_status, required, forbidden in (
         SIGNPATH_STATUS_TRUTH_TABLE
     ):
+        if only is not None and description not in only:
+            continue
         if not have_jq and any(reply.startswith("200|") for _, reply in replies):
             print(
                 f"UNCHECKED: SignPath status: {description}: this host has no jq, "
@@ -2698,29 +2724,214 @@ def signpath_status_behaviour_violations(text: str | None = None) -> list[str]:
                 check=False,
             )
             output = result.stdout + result.stderr
+            ran.add(description)
+            before = len(violations)
             if result.returncode != expected_status:
                 violations.append(
                     f"SignPath status: {description}: expected exit "
                     f"{expected_status}, got {result.returncode}; output="
                     f"{output.strip()[:600]!r}"
                 )
-                continue
-            for needle in required:
-                if needle not in output:
-                    violations.append(
-                        f"SignPath status: {description}: exited "
-                        f"{result.returncode} as expected but never said "
-                        f"{needle!r}; output={output.strip()[:600]!r}"
-                    )
-            for needle in forbidden:
-                if needle in output:
-                    violations.append(
-                        f"SignPath status: {description}: exited "
-                        f"{result.returncode} as expected but SAID {needle!r}, "
-                        "which is a claim this run did not earn; output="
-                        f"{output.strip()[:600]!r}"
-                    )
-    return violations
+            else:
+                for needle in required:
+                    if needle not in output:
+                        violations.append(
+                            f"SignPath status: {description}: exited "
+                            f"{result.returncode} as expected but never said "
+                            f"{needle!r}; output={output.strip()[:600]!r}"
+                        )
+                for needle in forbidden:
+                    if needle in output:
+                        violations.append(
+                            f"SignPath status: {description}: exited "
+                            f"{result.returncode} as expected but SAID {needle!r}, "
+                            "which is a claim this run did not earn; output="
+                            f"{output.strip()[:600]!r}"
+                        )
+            if len(violations) > before:
+                failed.add(description)
+    return SignPathStatusRun(violations, ran, failed)
+
+
+#: Every row whose verdict is COULD NOT MEASURE, derived rather than listed. The
+#: tri-state IS the exit status, so anything that collapses status 2 back into
+#: status 0 is visible from all of them -- and a row of that kind added later
+#: joins the catcher set instead of quietly narrowing it.
+_UNMEASURED_ROWS: frozenset[str] = frozenset(
+    description
+    for description, _, _, expected_status, _, _ in SIGNPATH_STATUS_TRUTH_TABLE
+    if expected_status == 2
+)
+
+#: The rows that reach the slug arm with something to say about it: the two that
+#: refute a slug 200 on its body, the two that cannot resolve a slug at all, and
+#: the two whose control probe decides the read was not a measurement.
+_SLUG_ROWS: frozenset[str] = frozenset({
+    "a server that rejects the control for its spelling and ignores the filters",
+    "a slug 200 that is a proxy page is not a signing-request list",
+    "a slug 200 whose items name a different slug refutes the filter",
+    "a slug probe whose transfer never completed cannot resolve the slug",
+    "a slug that rotates to itself is not its own control",
+    "the server ignores the slug filters, so the slugs stay unmeasured",
+})
+
+
+# Columns: the shipped text, what it is reverted to, the truth-table rows that
+# CAN catch that revert, and what is being reverted.
+#
+# The catcher column is measured, not guessed: each mutation was run against the
+# whole table once and the rows that failed are the rows named here. It buys two
+# things. A mutant now runs `catchers & baseline.ran` instead of all 21 rows --
+# 43 rows across the fourteen mutations rather than 294, each row a bash and a
+# stub curl -- and, because every named row must FAIL, the set is a claim about
+# which rows can see the revert rather than a bare "something went red".
+#
+# A mutation whose catchers all went unrun is a FAILURE here, not an UNCHECKED.
+# Unlike the Authenticode table these rows need no host capability beyond jq, so
+# "no live catcher" means the table changed under the mutation list, which is
+# the stale-fixture case this file exists to catch.
+SIGNPATH_STATUS_MUTATIONS: tuple[tuple[str, str, frozenset[str], str], ...] = (
+    (
+        'if [[ "$credential" == "ok" && "$active" != "true" ]]; then',
+        "if false; then",
+        frozenset({"accepted but not activated: everything resolves and the switch is off"}),
+        "the accepted-but-not-activated verdict",
+    ),
+    (
+        "                credential=unmeasured\n                note_unmeasured\n",
+        "                credential=ok\n",
+        frozenset({
+            "a 200 that does not parse is COULD NOT MEASURE, not a working credential",
+            "a 200 whose body is {}: valid JSON, countable, and not a list",
+        }),
+        "a 200 that does not parse being its own state, not a success",
+    ),
+    # THE SHAPE ASSERTION. A control that feeds HTML cannot catch this revert --
+    # HTML fails at the parser either way. The rows that catch it feed valid JSON
+    # that is not a list -- {}, a string, a number -- which is exactly what the
+    # reverted expression waves through.
+    (
+        '                    if type == "array" then length\n'
+        '                    elif type == "object" then\n'
+        '                      if (.values | type) == "array" then (.values | length)\n'
+        '                      elif (.items | type) == "array" then (.items | length)\n'
+        '                      else empty end\n'
+        '                    else empty end',
+        '                    if type == "object" then (.values // .items // [])\n'
+        '                    else . end | length',
+        frozenset({
+            "a 200 whose body is {}: valid JSON, countable, and not a list",
+            "a 200 whose body is a bare JSON string, whose length is its characters",
+            "a 200 whose body is a bare number, whose length is its own value",
+        }),
+        "the positive shape assertion on the credential response",
+    ),
+    (
+        '              if [[ "$real" == "1" && "$control" == "0" ]]; then',
+        '              if [[ "$real" == "1" ]]; then',
+        frozenset({
+            "a server that rejects the control for its spelling and ignores the filters",
+            "accepted, not activated, and the slugs could not be measured",
+            "the server ignores the slug filters, so the slugs stay unmeasured",
+        }),
+        "the control probe that makes a filtered read a measurement",
+    ),
+    # The two halves of the transfer status, mutated back to `|| true`: a curl
+    # whose status nobody reads makes an incomplete response indistinguishable
+    # from a complete one, at the credential and at each slug probe.
+    (
+        "          if (( curl_rc != 0 )); then\n",
+        "          if false; then\n",
+        frozenset({"a 200 whose transfer never completed is not a measurement"}),
+        "a failed credential transfer being distinguishable from a completed one",
+    ),
+    (
+        "              if (( rc != 0 )); then\n                echo 2\n",
+        "              if false; then\n                echo 2\n",
+        frozenset({
+            "a slug probe whose transfer never completed cannot resolve the slug",
+        }),
+        "a failed slug transfer being distinguishable from a completed one",
+    ),
+    # THE OUTERMOST BOUNDARY. A tri-state that collapses back to two at the exit
+    # is a tri-state nobody downstream can see: on a scheduled run the workflow
+    # result is the entire signal.
+    (
+        '            && [[ "$project_state" == "unmeasured" || "$policy_state" == "unmeasured" ]]; then\n            note_unmeasured\n',
+        '            && [[ "$project_state" == "unmeasured" || "$policy_state" == "unmeasured" ]]; then\n',
+        _SLUG_ROWS,
+        "an unmeasured slug having any consequence at all",
+    ),
+    (
+        "              status=2\n",
+        "              status=0\n",
+        _UNMEASURED_ROWS,
+        "could-not-measure exiting differently from measured-affirmative",
+    ),
+    (
+        '            && [[ "$project_state" != "resolved" || "$policy_state" != "resolved" ]]; then',
+        "            && false; then",
+        frozenset({"accepted, not activated, and the slugs could not be measured"}),
+        "refusing to recommend the switch on slugs that never resolved",
+    ),
+    (
+        '          describe SIGNPATH_PROJECT_SLUG "$project_state"',
+        '          echo "  SIGNPATH_PROJECT_SLUG: validated against the SignPath API"',
+        _SLUG_ROWS,
+        "the summary being derived from what the run measured",
+    ),
+    # ---- the three slug-arm remedies, each reverted on its own ----
+    #
+    # SEPARATELY and not as a block: a single mutation that undoes all three is
+    # caught by the first rule it happens to trip and says nothing about the
+    # other two.
+    #
+    # The rotation, back to the fixed impossible prefix. The control then differs
+    # from the configured slug in length, in content and in separator count as
+    # well as in whether it names anything, and `_SPELLING_RULE_SERVER` is a
+    # server that separates the two on the first of those and never applies a
+    # filter at all.
+    (
+        "rotate_slug() { printf '%s' \"$1\" | tr 'a-zA-Z0-9' 'b-zaB-ZA1-90'; }",
+        "rotate_slug() { printf '%s' \"wenlan-no-such-project-$$\"; }",
+        frozenset({
+            "a server that rejects the control for its spelling and ignores the filters",
+            "a slug that rotates to itself is not its own control",
+        }),
+        "a control slug that differs from the configured one in nothing but "
+        "whether it names something",
+    ),
+    (
+        '              if [[ "$4" == "$5" ]]; then\n',
+        "              if false; then\n",
+        frozenset({"a slug that rotates to itself is not its own control"}),
+        "refusing a differential whose two halves are the same request",
+    ),
+    # The slug body, back to the status line alone. `200) ;;` falls through to
+    # the envelope assertion and the item read below it; `200) echo 1` is the arm
+    # as it stood, where a 200 was affirmative whatever arrived with it. Narrower
+    # is not available here: an unparseable body cannot be admitted by any jq
+    # program, so the only revert that lets a proxy page through is the one that
+    # stops reading the body.
+    (
+        "                200)     ;;\n",
+        "                200)     echo 1; return 0 ;;\n",
+        frozenset({
+            "a slug 200 that is a proxy page is not a signing-request list",
+            "a slug 200 whose items name a different slug refutes the filter",
+        }),
+        "a slug 200 having to BE a signing-request list",
+    ),
+    # And the item read alone, with the envelope assertion left standing -- so
+    # the row that catches this one is refused by NOTHING else in the step: valid
+    # JSON, a real array, a completed transfer, a rejected control.
+    (
+        "              if (( wrong > 0 )); then\n",
+        "              if false; then\n",
+        frozenset({"a slug 200 whose items name a different slug refutes the filter"}),
+        "the returned items being read, and contradicting the filter",
+    ),
+)
 
 
 RESIGN_STEP = "Regenerate the updater signature over the signed installer"
@@ -3346,7 +3557,62 @@ def _authenticode_hashed_byte(data: bytes) -> tuple[int | None, str]:
     return offset, ""
 
 
+_FIXTURE_DIR: list[str] = []
+
+
+def _fixture_session_dir() -> str:
+    """One directory per process, holding the copied signature fixture."""
+    if not _FIXTURE_DIR:
+        path = tempfile.mkdtemp(prefix="wenlan-authenticode-")
+        atexit.register(shutil.rmtree, path, True)
+        _FIXTURE_DIR.append(path)
+    return _FIXTURE_DIR[0]
+
+
 def _signed_fixture(shell: str, work: str) -> FixtureResult:
+    """This host's Authenticode capability, measured once per shell and cached.
+
+    Eight callers ask for it in one run and nothing it measures can change
+    inside one, so it is measured once and the answer reused. The saving is
+    bounded by how long the search takes, which is a property of the host: it
+    stops at the first EMBEDDED signature it sees and costs 0.7s here, but its
+    ceiling is 60 `Get-AuthenticodeSignature` calls per system binary directory
+    on a host whose small binaries are all catalog-signed. `work` is the caller's
+    scratch directory and is no longer where the probe runs; it stays in the
+    signature because
+    scripts/negative-controls/authenticode-step-receipt.py calls this predicate
+    directly and rewrites its first body line to substitute a stub shell.
+
+    The binary it names is COPIED once into a session directory, because every
+    fixture row reads those bytes again and a file the suite owns cannot be
+    serviced out from under it mid-run.
+
+    The copy cannot change the CLASSIFICATION, only which path carries it. This
+    predicate answers "what can this host do", and
+    scripts/negative-controls/authenticode-step-receipt.py holds it to exactly
+    that by feeding it a stub shell that names a path which does not exist and
+    requiring `fixture` back. So a copy that fails hands back the path the probe
+    found -- what this returned before there was a copy -- and never downgrades a
+    measured capability to `probe-failed` on the strength of a file operation.
+    """
+    return _cached_signed_fixture(shell)
+
+
+@functools.lru_cache(maxsize=None)
+def _cached_signed_fixture(shell: str) -> FixtureResult:
+    with tempfile.TemporaryDirectory() as work:
+        capability, path, extra = _probe_signed_fixture(shell, work)
+    if capability != "fixture" or path is None:
+        return (capability, path, extra)
+    local = os.path.join(_fixture_session_dir(), "signed-" + os.path.basename(path))
+    try:
+        shutil.copyfile(path, local)
+    except OSError:
+        return (capability, path, extra)
+    return (capability, local, extra)
+
+
+def _probe_signed_fixture(shell: str, work: str) -> FixtureResult:
     """A real Authenticode-signed binary on this host, its publisher, and why not.
 
     `os.name == "nt"` is an OS proxy wearing a capability's name: it says where
@@ -3501,7 +3767,9 @@ class AuthenticodeRun(NamedTuple):
     capability: str = "fixture"
 
 
-def authenticode_behaviour_violations(release: str) -> AuthenticodeRun:
+def authenticode_behaviour_violations(
+    release: str, only: frozenset[str] | None = None
+) -> AuthenticodeRun:
     """Run the shipped Authenticode step against real signed and broken files.
 
     Nothing here is stubbed: Windows itself answers, over files whose signature
@@ -3524,6 +3792,13 @@ def authenticode_behaviour_violations(release: str) -> AuthenticodeRun:
     catches an early `exit 0`. The four signature-state rows need Windows. The
     caller is told which kinds ran so it can require exactly the mutations those
     rows can catch, and name the rest UNCHECKED rather than passing over them.
+
+    `only` restricts the pass to the named kinds. A mutation control already
+    knows which rows can catch its mutation, and the rows that cannot are pure
+    cost: each one builds a fixture and starts a shell to re-measure something
+    the baseline established. Restricting the pass cannot weaken the control,
+    because both of its demands -- that every catcher RAN, and that every catcher
+    FAILED -- are subsets of `only`.
     """
     script = authenticode_script(release)
     shell = _powershell()
@@ -3550,6 +3825,8 @@ def authenticode_behaviour_violations(release: str) -> AuthenticodeRun:
             f"({publisher}), which is a failed measurement, not an incapacity",
         }.get(capability, "")
         for description, kind, expected_status, required in AUTHENTICODE_TRUTH_TABLE:
+            if only is not None and kind not in only:
+                continue
             body = script
             staged = os.path.join(work, f"Wenlan_9.9.9_x64-setup-{kind}.exe")
             if kind == "missing":
@@ -4758,132 +5035,58 @@ def main() -> None:
     # states nobody can produce here -- an accepted application, a resolving
     # project slug -- so a stub server is the only way any of it is measured at
     # all before the day it matters.
-    status_violations = signpath_status_behaviour_violations()
-    if status_violations:
+    status_baseline = signpath_status_behaviour_violations()
+    if status_baseline.violations:
         raise AssertionError(
             "SignPath status behaviour contract failed:\n  "
-            + "\n  ".join(status_violations)
+            + "\n  ".join(status_baseline.violations)
         )
     status_text = SIGNPATH_STATUS_PATH.read_text(encoding="utf-8")
-    for old, new, why in (
-        (
-            'if [[ "$credential" == "ok" && "$active" != "true" ]]; then',
-            "if false; then",
-            "the accepted-but-not-activated verdict",
-        ),
-        (
-            "                credential=unmeasured\n                note_unmeasured\n",
-            "                credential=ok\n",
-            "a 200 that does not parse being its own state, not a success",
-        ),
-        # THE SHAPE ASSERTION. A control that feeds HTML cannot catch this
-        # revert -- HTML fails at the parser either way. The rows beside it feed
-        # valid JSON that is not a list -- {}, a string, a number -- which is
-        # exactly what the reverted expression waves through.
-        (
-            '                    if type == "array" then length\n'
-            '                    elif type == "object" then\n'
-            '                      if (.values | type) == "array" then (.values | length)\n'
-            '                      elif (.items | type) == "array" then (.items | length)\n'
-            '                      else empty end\n'
-            '                    else empty end',
-            '                    if type == "object" then (.values // .items // [])\n'
-            '                    else . end | length',
-            "the positive shape assertion on the credential response",
-        ),
-        (
-            '              if [[ "$real" == "1" && "$control" == "0" ]]; then',
-            '              if [[ "$real" == "1" ]]; then',
-            "the control probe that makes a filtered read a measurement",
-        ),
-        # The two halves of the transfer status, mutated back to `|| true`: a
-        # curl whose status nobody reads makes an incomplete response
-        # indistinguishable from a complete one, at the credential and at each
-        # slug probe.
-        (
-            "          if (( curl_rc != 0 )); then\n",
-            "          if false; then\n",
-            "a failed credential transfer being distinguishable from a completed one",
-        ),
-        (
-            "              if (( rc != 0 )); then\n                echo 2\n",
-            "              if false; then\n                echo 2\n",
-            "a failed slug transfer being distinguishable from a completed one",
-        ),
-        # THE OUTERMOST BOUNDARY. A tri-state that collapses back to two at
-        # the exit is a tri-state nobody downstream can see: on a scheduled
-        # run the workflow result is the entire signal.
-        (
-            '            && [[ "$project_state" == "unmeasured" || "$policy_state" == "unmeasured" ]]; then\n            note_unmeasured\n',
-            '            && [[ "$project_state" == "unmeasured" || "$policy_state" == "unmeasured" ]]; then\n',
-            "an unmeasured slug having any consequence at all",
-        ),
-        (
-            "              status=2\n",
-            "              status=0\n",
-            "could-not-measure exiting differently from measured-affirmative",
-        ),
-        (
-            '            && [[ "$project_state" != "resolved" || "$policy_state" != "resolved" ]]; then',
-            "            && false; then",
-            "refusing to recommend the switch on slugs that never resolved",
-        ),
-        (
-            '          describe SIGNPATH_PROJECT_SLUG "$project_state"',
-            '          echo "  SIGNPATH_PROJECT_SLUG: validated against the SignPath API"',
-            "the summary being derived from what the run measured",
-        ),
-        # ---- the three slug-arm remedies, each reverted on its own ----
-        #
-        # SEPARATELY and not as a block: a single mutation that undoes all three
-        # is caught by the first rule it happens to trip and says nothing about
-        # the other two.
-        #
-        # The rotation, back to the fixed impossible prefix. The control then
-        # differs from the configured slug in length, in content and in
-        # separator count as well as in whether it names anything, and
-        # `_SPELLING_RULE_SERVER` is a server that separates the two on the
-        # first of those and never applies a filter at all.
-        (
-            "rotate_slug() { printf '%s' \"$1\" | tr 'a-zA-Z0-9' 'b-zaB-ZA1-90'; }",
-            "rotate_slug() { printf '%s' \"wenlan-no-such-project-$$\"; }",
-            "a control slug that differs from the configured one in nothing but "
-            "whether it names something",
-        ),
-        (
-            '              if [[ "$4" == "$5" ]]; then\n',
-            "              if false; then\n",
-            "refusing a differential whose two halves are the same request",
-        ),
-        # The slug body, back to the status line alone. `200) ;;` falls through
-        # to the envelope assertion and the item read below it; `200) echo 1`
-        # is the arm as it stood, where a 200 was affirmative whatever arrived
-        # with it. Narrower is not available here: an unparseable body cannot
-        # be admitted by any jq program, so the only revert that lets a proxy
-        # page through is the one that stops reading the body.
-        (
-            "                200)     ;;\n",
-            "                200)     echo 1; return 0 ;;\n",
-            "a slug 200 having to BE a signing-request list",
-        ),
-        # And the item read alone, with the envelope assertion left standing --
-        # so the row that catches this one is refused by NOTHING else in the
-        # step: valid JSON, a real array, a completed transfer, a rejected
-        # control.
-        (
-            "              if (( wrong > 0 )); then\n",
-            "              if false; then\n",
-            "the returned items being read, and contradicting the filter",
-        ),
-    ):
+    status_rows = {row[0] for row in SIGNPATH_STATUS_TRUTH_TABLE}
+    for old, new, catchers, why in SIGNPATH_STATUS_MUTATIONS:
         if status_text.count(old) != 1:
             raise AssertionError(
                 f"signpath-status mutation fixture is stale "
                 f"({status_text.count(old)} matches): {old!r}"
             )
-        if not signpath_status_behaviour_violations(status_text.replace(old, new, 1)):
+        # The catcher set is checked before it is used, so a mutation cannot
+        # quietly stop being measured. An empty set, or one naming a row that no
+        # longer exists, is a stale table -- and a stale table that merely
+        # skipped would leave the mutation unmeasured while the suite still said
+        # PASS.
+        if not catchers:
+            raise AssertionError(f"the catcher set for {why} is empty")
+        unknown = catchers - status_rows
+        if unknown:
             raise AssertionError(
-                f"the SignPath status truth table did not notice a mutation of {why}"
+                f"the catcher set for {why} names {sorted(unknown)}, which is "
+                "not a row of the SignPath status truth table"
+            )
+        live = catchers & status_baseline.ran
+        if not live:
+            raise AssertionError(
+                f"no row that can catch a mutation of {why} ran here: catching "
+                f"it needs one of {sorted(catchers)} and this host ran "
+                f"{sorted(status_baseline.ran) or 'nothing'}"
+            )
+        mutant = signpath_status_behaviour_violations(
+            status_text.replace(old, new, 1), only=live
+        )
+        # Two demands, not one. "A violation appeared" is satisfied by a
+        # mutation that merely breaks a row; what is being claimed is that the
+        # rows named as catchers SAW this revert, so every one of them must have
+        # run and every one of them must have failed.
+        if not live <= mutant.ran:
+            raise AssertionError(
+                f"mutating {why} stopped {sorted(live - mutant.ran)} from "
+                "running; a row that never ran cannot be the row that caught it"
+            )
+        if not live <= mutant.failed:
+            raise AssertionError(
+                f"the SignPath status truth table did not notice a mutation of "
+                f"{why} in {sorted(live - mutant.failed)}, which the catcher set "
+                f"claims can see it (rows that did fail: "
+                f"{sorted(mutant.failed) or 'none'})"
             )
 
     # The re-signing step has the same shape of hole and none of the guard's
@@ -5040,7 +5243,9 @@ def main() -> None:
                 f"{sorted(catchers)} and this host ran {sorted(baseline.ran) or 'nothing'}"
             )
             continue
-        mutant = authenticode_behaviour_violations(release.replace(old, new, 1))
+        mutant = authenticode_behaviour_violations(
+            release.replace(old, new, 1), only=live
+        )
         # Two separate demands, because "a violation appeared" is not the same
         # claim as "the mutation was caught". Removing the publisher check, for
         # instance, also makes the `accepted` row unbuildable -- that violation
