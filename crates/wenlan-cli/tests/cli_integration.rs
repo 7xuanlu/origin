@@ -961,13 +961,13 @@ fn agents_edit_no_flags_bails() {
 }
 
 #[test]
-fn status_json_succeeds_when_daemon_is_unreachable() {
+fn status_json_prints_unreachable_but_exits_non_zero_when_daemon_is_unreachable() {
     cli()
         .env("WENLAN_HOST", "http://127.0.0.1:9")
         .env("WENLAN_NO_AUTOSTART", "1")
         .args(["status", "--format", "json"])
         .assert()
-        .success()
+        .failure()
         .stdout(predicate::str::contains("\"status\": \"unreachable\""));
 }
 
@@ -1316,7 +1316,7 @@ fn setup_background_status_roundtrip_isolated() {
     cli_with_isolated_runtime(&runtime)
         .args(["status", "--format", "json"])
         .assert()
-        .success()
+        .failure()
         .stdout(predicate::str::contains("\"status\": \"unreachable\""));
 
     let launchctl_log = runtime.data.path().join("background-off-launchctl.log");
