@@ -449,7 +449,7 @@ $script:CliSearchMode = "succeeds"   # succeeds | refuses | fails-otherwise
 # refusal that row exists to require. A parameter accepted and ignored is worse
 # than one not accepted at all: the call site reads as measured.
 #
-# The authority is scripts/first-run/lib.ps1:330-437 -- the shell/release lane's
+# The authority is scripts/first-run/lib.ps1, Record-Row through Check -- the shell/release lane's
 # file, read here and never edited. What is modelled, and must stay modelled:
 #
 #   * `$script:CheckReached` and `Reached`, the witness that execution actually
