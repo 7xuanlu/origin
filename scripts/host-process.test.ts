@@ -1,3 +1,7 @@
+// @vitest-environment node
+//
+// These cases spawn processes and read files; nothing here touches a DOM, and
+// building jsdom for each file costs more than every assertion in it.
 import {
   chmodSync,
   mkdirSync,
@@ -12,6 +16,11 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { branchesOnUnmeasured, probeCallSites } from "./lib/probe-call-sites";
+import { resolveTestBash } from "./lib/test-bash";
+
+// Resolved once for the file rather than per case: on Windows this is Git Bash,
+// never the WSL `bash` that PATH offers first.
+const TEST_BASH = resolveTestBash();
 
 // Every case spawns node, then Git Bash, then a shim or two: a few hundred
 // milliseconds idle, seconds under load. At the 5s default the assertion being
@@ -235,16 +244,14 @@ function runDriver(
   if (options.isolatePath) env.WENLAN_TEST_ISOLATE_PATH = "1";
   for (const [key, value] of Object.entries(options.env ?? {})) env[key] = value;
 
-  // Git Bash explicitly on Windows: a machine with WSL installed resolves a bare
-  // `bash` to the Linux distro, which is a different host entirely.
-  const result =
-    process.platform === "win32"
-      ? spawnSync(process.execPath, ["scripts/run-bash.mjs", driverPath, ...args], {
-          cwd: root,
-          encoding: "utf8",
-          env,
-        })
-      : spawnSync("bash", [driverPath, ...args], { cwd: root, encoding: "utf8", env });
+  // TEST_BASH is Git Bash on Windows, resolved at module scope by the same
+  // candidate search scripts/run-bash.mjs uses, so a machine with WSL installed
+  // never runs these fixtures on the Linux distro PATH offers first.
+  const result = spawnSync(TEST_BASH, [driverPath, ...args], {
+    cwd: root,
+    encoding: "utf8",
+    env,
+  });
 
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
@@ -1194,27 +1201,72 @@ describe("host-process.sh: windows_pid_for_job is tri-state", () => {
     // host's load rather than the poll.
   }, 60_000);
 
-  // THE TERMINAL NEGATIVE: the one answer this helper may give after a hundred
-  // readable tables that did not contain the row, and the one the `rc == 2`
+  // THE TERMINAL NEGATIVE: the one answer this helper may give after a window
+  // of readable tables that did not contain the row, and the one the `rc == 2`
   // early return above must never become — the caller's responses to 1 and to 2
   // differ in what they print and in whether they call the reap a measurement.
-  // A hundred rounds at 0.1s is ten seconds of sleeping plus a hundred `ps`
-  // spawns, paid here once.
+  //
+  // Run at FIVE rounds rather than the shipped hundred. At 0.1s a round the
+  // shipped window is ten seconds of sleeping plus a hundred `ps` spawns, which
+  // measured 70.6s here; what this case is about is the answer at the end of a
+  // window, not how long the window is. The count file makes the shortening
+  // observable rather than assumed: the shim is consulted exactly `_rounds`
+  // times, so a helper that ignored the override, or ran a different number of
+  // rounds, fails here. The shipped 100 is pinned by the two rows below.
   it("reports the MEASURED NEGATIVE after a full window of readable tables", () => {
+    const dir = makeTempRoot();
+    const countPath = resolve(dir, "ps.count");
     const counted = [
-      `count="$(dirname "$0")/ps.count"`,
+      `count="$WENLAN_TEST_PS_COUNT"`,
       "n=0",
       `if [ -f "$count" ]; then n="$(cat "$count")"; fi`,
       "n=$((n + 1))",
       `printf '%s' "$n" >"$count"`,
       psTable([strangerRow]),
     ].join("\n");
-    const result = jobpid(counted);
+    const result = runDriver(["jobpid", JOB, SERVER], {
+      shims: [shim("ps", counted), cygpath],
+      env: {
+        WENLAN_HOST_PROCESS_POLL_ROUNDS: "5",
+        WENLAN_TEST_PS_COUNT: countPath.split("\\").join("/"),
+      },
+    });
     // 1, and emphatically not 2: every table it read was whole, well-formed,
     // carried the System process and cleared the row floor. The row simply was
     // not in any of them.
     expect(result.stdout.trim(), result.stderr).toBe("rc=1 out=");
-  }, 120_000);
+    expect(readFileSync(countPath, "utf8"), "the window was not five rounds").toBe("5");
+  }, 60_000);
+
+  // The override is a TEST convenience, so the shipped default is pinned in the
+  // source: a library that shortened its own window would still satisfy the
+  // case above, which supplies its own count.
+  it("ships a hundred-round window as its default", () => {
+    // `${VAR-100}`, not `${VAR:-100}`: an empty value is something a caller set,
+    // and the row below requires it to be refused rather than defaulted.
+    expect(readFileSync(libPath, "utf8")).toContain(
+      '"${WENLAN_HOST_PROCESS_POLL_ROUNDS-100}"',
+    );
+  });
+
+  // And a window that was asked for and not understood is not a window. Falling
+  // back to the default here would report a measurement about a window nobody
+  // chose — the same substitution as reading a failed probe as a negative, one
+  // level up.
+  it.each([
+    ["reports COULD NOT MEASURE for a poll window that is not a number", "five"],
+    ["reports COULD NOT MEASURE for a poll window of zero rounds", "0"],
+    ["reports COULD NOT MEASURE for a negative poll window", "-1"],
+    ["reports COULD NOT MEASURE for an empty poll window", ""],
+  ])("%s", (_title, rounds) => {
+    const result = runDriver(["jobpid", JOB, SERVER], {
+      shims: [shim("ps", psTable([psRow(JOB, "4242", "10:23:45", SERVER)])), cygpath],
+      env: { WENLAN_HOST_PROCESS_POLL_ROUNDS: rounds },
+    });
+    // The table CONTAINS the row, so rc=0 is what a fallback to the default
+    // would produce: this refuses before it ever looks.
+    expect(result.stdout.trim(), result.stderr).toBe("rc=2 out=");
+  });
 
   // The case above with its WINDOW taken away. Moving the round COUNT off `seq`
   // is not enough: a bare `sleep 0.1` whose status nothing reads, invoked from

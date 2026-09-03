@@ -686,11 +686,25 @@ poll_delay() {
 # stdout: the Windows pid. exit: 0 found, 1 never appeared within the window,
 # 2 could not measure (no `ps`, a failed snapshot, a table that is not one, or
 # an unspellable path).
+#
+# The window is 100 rounds of `poll_delay 0.1`, ten seconds. Its one caller that
+# needs a SHORTER one is the suite that has to observe the terminal negative,
+# which otherwise pays ten real seconds plus a hundred `ps` spawns per case, so
+# WENLAN_HOST_PROCESS_POLL_ROUNDS overrides the count. It must parse as a
+# positive integer: anything else is a caller that meant to set a window and did
+# not, and running the shipped 100 in its place would report a measurement about
+# a window nobody chose, so the probe answers COULD NOT MEASURE instead. The
+# default is `${VAR-100}` and not `${VAR:-100}` deliberately -- an EMPTY value is
+# something a caller set, not something it left alone, and it is refused like any
+# other unreadable window. The override never changes what the three answers
+# MEAN, only how long 1 takes to earn.
 windows_pid_for_job() {
   local job_pid="$1" program="$2" want row winpid command got rc
-  local _attempt
+  local _attempt _rounds
+  _rounds="${WENLAN_HOST_PROCESS_POLL_ROUNDS-100}"
+  [[ "$_rounds" =~ ^[0-9]+$ ]] && (( _rounds > 0 )) || return 2
   want="$(normalize_program_path "$program")" || return 2
-  for (( _attempt = 0; _attempt < 100; _attempt++ )); do
+  for (( _attempt = 0; _attempt < _rounds; _attempt++ )); do
     # One snapshot yields both fields, so the pid and the image it names cannot
     # come from either side of an exec.
     #
