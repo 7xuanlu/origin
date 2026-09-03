@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=a0461fc92a4c4fb5027d1f063f425f25438c5181ff3cb478c2705385e779b4ab -->
+<!-- README_SYNC: source=README.md sha256=5c37ed76d5c530ace9aa15f851cb4c06d9b0107d8e495c717eefabcee201c123 -->
 
 <p align="center">
   <picture>
@@ -28,9 +28,7 @@
   <a href="#learn-more">进&#8288;一&#8288;步&#8288;了&#8288;解</a>
 </p>
 
-<p align="center">
-  <img src="./docs/assets/desktop-wiki-preview.png" alt="Wenlan 桌面 app，展示有来源支撑的 wiki 页面与可检查的引用。" width="100%">
-</p>
+https://github.com/user-attachments/assets/fd1631cd-8fe3-4f7e-9334-c7772f5d1ed7
 
 <p align="center">
   <sub>桌面 app 中持续维护的页面：打开任意引用，就能检查这条结论背后的来源或记忆。</sub>
@@ -124,8 +122,6 @@ Wenlan 把文档、笔记和过去的 AI 对话整理成会随工作持续更新
 完整流程请见 [LLM-wiki 实现指南](https://wenlan.app/zh-CN/learn/distilled-wiki-pages-ai-memory)。
 
 **Wenlan 最独特的做法：** 来源与原子记忆会分别支撑持续维护的页面。记忆历史保留知识如何改变；页面历史说明当前结论由哪些依据支撑。机器维护的页面可以依当前依据重建；对人工文字的改动则成为可审核的修订，不会直接覆盖。
-
-https://github.com/user-attachments/assets/f206fd82-bb25-4bf3-8d6e-82242c12bd8a
 
 <a id="knowledge-graph"></a>
 
