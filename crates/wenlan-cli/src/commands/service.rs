@@ -275,6 +275,116 @@ fn build_launchd_plist(
     buf
 }
 
+/// The data root this CLI run was told to use, if any: `WENLAN_DATA_DIR` (or
+/// its legacy `ORIGIN_DATA_DIR` spelling) in the CLI's own environment, which
+/// is also how the desktop app hands over its selected store.
+#[cfg(target_os = "macos")]
+fn explicit_data_root() -> Option<PathBuf> {
+    wenlan_core::env_compat::var_compat("WENLAN_DATA_DIR").map(PathBuf::from)
+}
+
+/// The plist `background on` registers: a fresh one when none exists, else
+/// the existing file with the CLI-owned keys brought up to date.
+///
+/// Ownership rule for an existing `com.wenlan.server.plist` (re-registering
+/// over one is the upgrade path, and the user or the desktop app may have
+/// edited it since):
+/// - The CLI owns the launch mechanics and rewrites them every time: `Label`,
+///   `ProgramArguments`, `KeepAlive`, `RunAtLoad`, `Disabled`,
+///   `StandardOutPath`, `StandardErrorPath`.
+/// - Every other top-level key and every `EnvironmentVariables` entry belongs
+///   to whoever put it there and is kept as is (a full rewrite on 2026-08-16
+///   dropped the user's `WENLAN_ENABLE_EDGE_GROUNDING_PROMOTE=1`).
+/// - `RUST_LOG` is seeded to `info` only when absent.
+/// - `WENLAN_DATA_DIR` is written only when this run was given one explicitly
+///   (see [`explicit_data_root`]); otherwise an existing value stays and a
+///   missing one stays missing, so a plist that relies on the platform
+///   default keeps doing so instead of gaining a pinned copy of it.
+///
+/// A file that does not parse as a plist dictionary carries nothing worth
+/// keeping and is replaced by a fresh one; the CLI says so on stderr.
+#[cfg(target_os = "macos")]
+fn launchd_plist_contents(
+    existing: Option<&str>,
+    program: &Path,
+    stderr_log: &Path,
+    data_root: &Path,
+    explicit_data_root: Option<&Path>,
+) -> String {
+    let stdout = Path::new("/dev/null");
+    let fresh = || build_launchd_plist(program, stdout, stderr_log, "info", data_root);
+    let Some(existing) = existing else {
+        return fresh();
+    };
+    match merge_launchd_plist(existing, program, stdout, stderr_log, explicit_data_root) {
+        Ok(merged) => merged,
+        Err(error) => {
+            eprintln!(
+                "The existing {SERVICE_LABEL} plist could not be read ({error:#}); writing a fresh one."
+            );
+            fresh()
+        }
+    }
+}
+
+/// Applies the ownership rule in [`launchd_plist_contents`] to an existing
+/// plist and renders the result.
+#[cfg(target_os = "macos")]
+fn merge_launchd_plist(
+    existing: &str,
+    program: &Path,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    explicit_data_root: Option<&Path>,
+) -> Result<String> {
+    use plist::{Dictionary, Value};
+
+    let path_value = |path: &Path| Value::String(path.to_string_lossy().into_owned());
+    let mut root = match Value::from_reader_xml(existing.as_bytes()).context("parse plist")? {
+        Value::Dictionary(root) => root,
+        _ => anyhow::bail!("plist root is not a dictionary"),
+    };
+    root.insert("Label".into(), Value::String(SERVICE_LABEL.into()));
+    root.insert(
+        "ProgramArguments".into(),
+        Value::Array(vec![path_value(program)]),
+    );
+    let mut keep_alive = Dictionary::new();
+    keep_alive.insert("SuccessfulExit".into(), Value::Boolean(false));
+    root.insert("KeepAlive".into(), Value::Dictionary(keep_alive));
+    root.insert("RunAtLoad".into(), Value::Boolean(true));
+    root.insert("Disabled".into(), Value::Boolean(true));
+    root.insert("StandardOutPath".into(), path_value(stdout_path));
+    root.insert("StandardErrorPath".into(), path_value(stderr_path));
+
+    if root
+        .get("EnvironmentVariables")
+        .and_then(Value::as_dictionary)
+        .is_none()
+    {
+        root.insert(
+            "EnvironmentVariables".into(),
+            Value::Dictionary(Dictionary::new()),
+        );
+    }
+    let env = root
+        .get_mut("EnvironmentVariables")
+        .and_then(Value::as_dictionary_mut)
+        .context("EnvironmentVariables is not a dictionary")?;
+    if !env.contains_key("RUST_LOG") {
+        env.insert("RUST_LOG".into(), Value::String("info".into()));
+    }
+    if let Some(data_root) = explicit_data_root {
+        env.insert("WENLAN_DATA_DIR".into(), path_value(data_root));
+    }
+
+    let mut rendered = Vec::new();
+    Value::Dictionary(root)
+        .to_writer_xml(&mut rendered)
+        .context("render plist")?;
+    String::from_utf8(rendered).context("rendered plist is not UTF-8")
+}
+
 pub async fn install() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -363,12 +473,20 @@ pub async fn install() -> Result<()> {
                     format!("create the daemon log directory {}", log_dir.display())
                 })?;
             }
-            Some(build_launchd_plist(
+            let plist_path = service_unit_path()?;
+            let existing = match std::fs::read_to_string(&plist_path) {
+                Ok(existing) => Some(existing),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("read {}", plist_path.display()))
+                }
+            };
+            Some(launchd_plist_contents(
+                existing.as_deref(),
                 &program,
-                Path::new("/dev/null"),
                 &stderr_log,
-                "info",
                 &data_root,
+                explicit_data_root().as_deref(),
             ))
         }
         #[cfg(not(target_os = "macos"))]
@@ -1118,6 +1236,227 @@ mod tests {
         assert!(plist.contains(
             "<key>WENLAN_DATA_DIR</key>\n\t\t<string>/tmp/wenlan-plist-test-root</string>"
         ));
+    }
+
+    /// A plist as a user leaves it: an older binary path and stderr path, a
+    /// tuning key the CLI knows nothing about, a `RUST_LOG` they changed, and
+    /// an extra environment variable — with no `WENLAN_DATA_DIR`.
+    #[cfg(target_os = "macos")]
+    const USER_EDITED_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.wenlan.server</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/old/bin/wenlan-server</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/old/root/logs/launchd-stderr.log</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>RUST_LOG</key>
+		<string>debug</string>
+		<key>WENLAN_ENABLE_EDGE_GROUNDING_PROMOTE</key>
+		<string>1</string>
+	</dict>
+</dict>
+</plist>
+"#;
+
+    #[cfg(target_os = "macos")]
+    fn plist_dict(rendered: &str) -> plist::Dictionary {
+        match plist::Value::from_reader_xml(rendered.as_bytes()).expect("rendered plist parses") {
+            plist::Value::Dictionary(root) => root,
+            other => panic!("plist root is not a dictionary: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn plist_env(root: &plist::Dictionary) -> &plist::Dictionary {
+        root.get("EnvironmentVariables")
+            .and_then(plist::Value::as_dictionary)
+            .expect("EnvironmentVariables dictionary")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn plist_string<'a>(dict: &'a plist::Dictionary, key: &str) -> Option<&'a str> {
+        dict.get(key).and_then(plist::Value::as_string)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn merged_user_plist(explicit_data_root: Option<&Path>) -> plist::Dictionary {
+        plist_dict(&launchd_plist_contents(
+            Some(USER_EDITED_PLIST),
+            Path::new("/new/bin/wenlan-server"),
+            Path::new("/new/root/logs/launchd-stderr.log"),
+            Path::new("/new/root"),
+            explicit_data_root,
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_plist_without_an_existing_file_is_the_fresh_template() {
+        let program = Path::new("/opt/wenlan/wenlan-server");
+        let stderr_log = Path::new("/data/logs/launchd-stderr.log");
+        let data_root = Path::new("/data");
+        assert_eq!(
+            launchd_plist_contents(None, program, stderr_log, data_root, Some(data_root)),
+            build_launchd_plist(
+                program,
+                Path::new("/dev/null"),
+                stderr_log,
+                "info",
+                data_root
+            )
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_plist_merge_keeps_user_keys_and_updates_cli_owned_ones() {
+        let root = merged_user_plist(None);
+        let env = plist_env(&root);
+        assert_eq!(
+            plist_string(env, "WENLAN_ENABLE_EDGE_GROUNDING_PROMOTE"),
+            Some("1"),
+            "user environment variables survive re-registration"
+        );
+        assert_eq!(
+            plist_string(env, "RUST_LOG"),
+            Some("debug"),
+            "a RUST_LOG the user changed is theirs"
+        );
+        assert_eq!(
+            env.get("WENLAN_DATA_DIR"),
+            None,
+            "no default WENLAN_DATA_DIR is added when the CLI was not given one"
+        );
+        assert_eq!(
+            root.get("ThrottleInterval")
+                .and_then(plist::Value::as_signed_integer),
+            Some(30),
+            "unknown top-level keys survive"
+        );
+        assert_eq!(
+            root.get("ProgramArguments")
+                .and_then(plist::Value::as_array)
+                .and_then(|args| args.first())
+                .and_then(plist::Value::as_string),
+            Some("/new/bin/wenlan-server"),
+            "the program path is CLI-owned and moves with the binary"
+        );
+        assert_eq!(
+            plist_string(&root, "StandardErrorPath"),
+            Some("/new/root/logs/launchd-stderr.log")
+        );
+        assert_eq!(plist_string(&root, "StandardOutPath"), Some("/dev/null"));
+        assert_eq!(plist_string(&root, "Label"), Some(SERVICE_LABEL));
+        assert_eq!(
+            root.get("KeepAlive")
+                .and_then(plist::Value::as_dictionary)
+                .and_then(|keep_alive| keep_alive.get("SuccessfulExit"))
+                .and_then(plist::Value::as_boolean),
+            Some(false)
+        );
+        assert_eq!(
+            root.get("RunAtLoad").and_then(plist::Value::as_boolean),
+            Some(true)
+        );
+        assert_eq!(
+            root.get("Disabled").and_then(plist::Value::as_boolean),
+            Some(true)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_plist_merge_writes_only_an_explicit_data_root() {
+        let root = merged_user_plist(Some(Path::new("/explicit/root")));
+        assert_eq!(
+            plist_string(plist_env(&root), "WENLAN_DATA_DIR"),
+            Some("/explicit/root")
+        );
+        assert_eq!(
+            plist_string(plist_env(&root), "WENLAN_ENABLE_EDGE_GROUNDING_PROMOTE"),
+            Some("1")
+        );
+
+        let pinned = USER_EDITED_PLIST.replace(
+            "\t\t<key>RUST_LOG</key>",
+            "\t\t<key>WENLAN_DATA_DIR</key>\n\t\t<string>/private/tmp/scratch</string>\n\t\t<key>RUST_LOG</key>",
+        );
+        let program = Path::new("/new/bin/wenlan-server");
+        let stderr_log = Path::new("/new/root/logs/launchd-stderr.log");
+        let data_root = Path::new("/new/root");
+        let kept = plist_dict(&launchd_plist_contents(
+            Some(&pinned),
+            program,
+            stderr_log,
+            data_root,
+            None,
+        ));
+        assert_eq!(
+            plist_string(plist_env(&kept), "WENLAN_DATA_DIR"),
+            Some("/private/tmp/scratch"),
+            "an existing WENLAN_DATA_DIR is kept when the CLI was not given one"
+        );
+        let replaced = plist_dict(&launchd_plist_contents(
+            Some(&pinned),
+            program,
+            stderr_log,
+            data_root,
+            Some(data_root),
+        ));
+        assert_eq!(
+            plist_string(plist_env(&replaced), "WENLAN_DATA_DIR"),
+            Some("/new/root"),
+            "an explicit data root replaces the existing one"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_plist_merge_seeds_rust_log_and_replaces_an_unreadable_file() {
+        let no_env = USER_EDITED_PLIST.replace(
+            "\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>RUST_LOG</key>\n\t\t<string>debug</string>\n\t\t<key>WENLAN_ENABLE_EDGE_GROUNDING_PROMOTE</key>\n\t\t<string>1</string>\n\t</dict>\n",
+            "",
+        );
+        assert!(!no_env.contains("EnvironmentVariables"), "{no_env}");
+        let program = Path::new("/new/bin/wenlan-server");
+        let stderr_log = Path::new("/new/root/logs/launchd-stderr.log");
+        let data_root = Path::new("/new/root");
+        let seeded = plist_dict(&launchd_plist_contents(
+            Some(&no_env),
+            program,
+            stderr_log,
+            data_root,
+            None,
+        ));
+        assert_eq!(plist_string(plist_env(&seeded), "RUST_LOG"), Some("info"));
+        assert_eq!(plist_env(&seeded).get("WENLAN_DATA_DIR"), None);
+
+        assert_eq!(
+            launchd_plist_contents(
+                Some("fake registered launch agent"),
+                program,
+                stderr_log,
+                data_root,
+                None
+            ),
+            build_launchd_plist(
+                program,
+                Path::new("/dev/null"),
+                stderr_log,
+                "info",
+                data_root
+            ),
+            "a file that is not a plist has nothing to keep"
+        );
     }
 
     #[cfg(target_os = "macos")]

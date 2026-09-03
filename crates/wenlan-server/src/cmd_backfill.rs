@@ -149,7 +149,7 @@ fn service_unit_path() -> Result<std::path::PathBuf> {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 fn check_service_unit_absent(unit: &std::path::Path) -> Result<()> {
     if unit.exists() {
         Err(anyhow!(
@@ -163,8 +163,86 @@ fn check_service_unit_absent(unit: &std::path::Path) -> Result<()> {
     }
 }
 
-/// Returns Ok if no service manager has the origin daemon registered.
-/// Returns Err with instructions if a service unit file is present.
+/// Exit status `launchctl print` uses for a target launchd does not have.
+#[cfg(target_os = "macos")]
+const LAUNCHCTL_NO_SUCH_SERVICE: i32 = 113;
+
+/// The current user's launchd domain id, for `gui/<uid>/<label>` targets.
+/// Mirrors `current_user_id` in wenlan-cli's `commands::service`; the CLI is a
+/// separate crate this daemon does not depend on, so the lookup is repeated
+/// rather than shared.
+#[cfg(target_os = "macos")]
+fn current_user_id() -> Result<String> {
+    let output = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .context("run id -u for the launchd user domain")?;
+    if !output.status.success() {
+        anyhow::bail!("id -u failed (exit {})", output.status.code().unwrap_or(-1));
+    }
+    let uid = std::str::from_utf8(&output.stdout)
+        .context("id -u returned non-UTF-8 output")?
+        .trim()
+        .to_owned();
+    if uid.is_empty() || !uid.bytes().all(|byte| byte.is_ascii_digit()) {
+        anyhow::bail!("id -u returned invalid user id: {uid:?}");
+    }
+    Ok(uid)
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_print_exit_code(target: &str) -> Result<Option<i32>> {
+    let output = std::process::Command::new("launchctl")
+        .args(["print", target])
+        .output()
+        .context("spawn launchctl print")?;
+    Ok(output.status.code())
+}
+
+/// Refuses while launchd still has the daemon job loaded.
+///
+/// The plist file is not the answer on macOS: `wenlan background off` boots the
+/// job out and deliberately keeps
+/// `~/Library/LaunchAgents/com.wenlan.server.plist`, so a file check refused
+/// precisely after the command this error tells the user to run.
+/// `launchctl print gui/<uid>/<label>` exits 113 for a target launchd does not
+/// have — the same signal `wenlan background off` itself reads (wenlan-cli
+/// `commands::service::stop_registered_service`).
+///
+/// `print_exit_code` is injected so tests can drive every launchd answer
+/// without loading or unloading the real service.
+#[cfg(target_os = "macos")]
+fn check_launchd_job_unloaded(
+    uid: &str,
+    print_exit_code: impl FnOnce(&str) -> Result<Option<i32>>,
+) -> Result<()> {
+    let target = format!("gui/{uid}/{SERVICE_LABEL}");
+    match print_exit_code(&target)? {
+        Some(LAUNCHCTL_NO_SUCH_SERVICE) => Ok(()),
+        Some(0) => Err(anyhow!(
+            "launchd still has the Wenlan daemon loaded as '{}', so it can restart in the \
+             middle of this command.\nIts LaunchAgent is at:\n  {}\n\
+             Turn it off first to prevent auto-restart:\n  wenlan background off\n\
+             Then re-run this command. (Restart after with `wenlan background on`.)",
+            target,
+            service_unit_path()?.display()
+        )),
+        other => Err(anyhow!(
+            "Could not read launchd state for '{}': launchctl print exit status {}. \
+             Refusing while it is unknown whether the daemon can restart mid-run.\n\
+             Turn it off first:\n  wenlan background off\n\
+             Then re-run this command. (Restart after with `wenlan background on`.)",
+            target,
+            match other {
+                Some(code) => code.to_string(),
+                None => "killed by a signal".to_string(),
+            }
+        )),
+    }
+}
+
+/// Returns Ok when nothing can restart the daemon under this command.
+/// Returns Err with instructions when something can.
 pub(crate) fn check_service_unloaded() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -186,7 +264,11 @@ pub(crate) fn check_service_unloaded() -> Result<()> {
             Ok(())
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        check_launchd_job_unloaded(&current_user_id()?, launchctl_print_exit_code)
+    }
+    #[cfg(target_os = "linux")]
     {
         let unit = service_unit_path()?;
         check_service_unit_absent(&unit)
@@ -228,13 +310,49 @@ pub(crate) async fn check_daemon_not_running() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn check_service_unloaded_returns_ok_when_no_service_installed() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let unit = tmp.path().join("com.wenlan.server.plist");
+        let unit = tmp.path().join("wenlan-server.service");
 
         super::check_service_unit_absent(&unit).expect("expected Ok for absent test unit");
+    }
+
+    /// `wenlan background off` boots the launchd job out and keeps the plist on
+    /// disk, so an unloaded job must let the command run even though the file
+    /// is still there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unloaded_launchd_job_lets_the_command_run() {
+        let mut asked = Vec::new();
+        super::check_launchd_job_unloaded("501", |target| {
+            asked.push(target.to_string());
+            Ok(Some(113))
+        })
+        .expect("an unloaded launchd job must not block the command");
+        assert_eq!(asked, vec!["gui/501/com.wenlan.server".to_string()]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_loaded_launchd_job_blocks_and_names_background_off() {
+        let error = super::check_launchd_job_unloaded("501", |_| Ok(Some(0)))
+            .expect_err("a loaded launchd job must block the command");
+        let message = format!("{error}");
+        assert!(message.contains("gui/501/com.wenlan.server"), "{message}");
+        assert!(message.contains("wenlan background off"), "{message}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unreadable_launchd_state_blocks() {
+        let error = super::check_launchd_job_unloaded("501", |_| Ok(Some(2)))
+            .expect_err("an unknown launchd state must block the command");
+        assert!(
+            format!("{error}").contains("Could not read launchd state"),
+            "{error}"
+        );
     }
 
     /// Pin both copies (CLI + server) to the on-disk paths `service-manager`
