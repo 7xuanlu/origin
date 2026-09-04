@@ -5290,6 +5290,19 @@ async fn accepting_a_chunked_page_card_keeps_the_redaction_its_chunks_carry() {
         .as_deref()
         .expect("staged page card must return an id");
 
+    // Gate: the card must have chunked, or the accept reads `content` and this
+    // test stops covering the recovered-body path it exists for.
+    let payload = db
+        .pending_memory_revision_payload(card_id)
+        .await
+        .unwrap()
+        .expect("the staged card must resolve");
+    assert!(
+        payload.full_body.is_some(),
+        "fixture must stage a card that actually chunked, or the redaction \
+         under test is never reached"
+    );
+
     accept_pending_revision(&db, card_id, "test-agent")
         .await
         .unwrap();
@@ -5447,6 +5460,193 @@ async fn accepting_an_edited_page_card_writes_the_edit_not_the_staged_body() {
     );
 }
 
+/// A recovered body must be grounded against the date the card was staged,
+/// which is not the date of the last edit to its row.
+///
+/// `upsert_documents` grounds `content` against the document's `last_modified`
+/// and stores that same value in `created_at`, so at insert the two agree.
+/// They stop agreeing afterwards: `apply_memory_update` bumps `last_modified`
+/// on every call, and its sibling-chunk delete sits inside the content branch,
+/// so a metadata-only edit -- confirming the card, or moving it to another
+/// space -- moves the timestamp while leaving the card chunked. Anchoring the
+/// recovered body on `last_modified` would then ground "yesterday" against the
+/// date of that unrelated edit, and the page would get a date that was never
+/// staged.
+///
+/// This is also the only coverage of the grounding branch at all: it is off by
+/// default, so every other test here exercises redaction alone.
+#[tokio::test]
+async fn a_recovered_body_grounds_against_the_staging_date_not_a_later_edit() {
+    let (db, _dir) = test_db().await;
+    let target_id = "mem_650_grounding_target";
+    let card_id = "mem_650_grounding_card";
+
+    // Far enough back that "yesterday" resolves to a different calendar day
+    // than it would today, so the two anchors cannot coincide.
+    let staged_at = chrono::Utc::now() - chrono::Duration::days(90);
+    let expected_day = (staged_at - chrono::Duration::days(1))
+        .date_naive()
+        .to_string();
+    let wrong_day = (chrono::Utc::now() - chrono::Duration::days(1))
+        .date_naive()
+        .to_string();
+
+    // Long enough to chunk, so the body is only reachable through the
+    // recovered-body path this test is about.
+    let body = format!(
+        "We agreed on the retention rule yesterday. {}",
+        "Supporting prose that pushes this card past the chunker's budget. ".repeat(60)
+    );
+
+    temp_env::async_with_vars([("WENLAN_ENABLE_TEMPORAL_GROUNDING", Some("1"))], async {
+        seed_memory(&db, target_id, "The retention rule is under discussion").await;
+
+        let card = crate::sources::RawDocument {
+            source: "memory".to_string(),
+            source_id: card_id.to_string(),
+            title: "Revision: retention".to_string(),
+            content: body.clone(),
+            last_modified: staged_at.timestamp(),
+            memory_type: Some("fact".to_string()),
+            source_agent: Some("test".to_string()),
+            confidence: Some(0.9),
+            supersedes: Some(target_id.to_string()),
+            pending_revision: true,
+            source_text: Some(body.clone()),
+            ..Default::default()
+        };
+        db.upsert_documents(vec![card]).await.unwrap();
+
+        // A metadata-only edit: it bumps `last_modified` to now and leaves
+        // every sibling chunk in place.
+        update_memory(
+            &db,
+            card_id,
+            MemoryUpdate {
+                content: None,
+                space: None,
+                confirm: true,
+                memory_type: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let payload = db
+            .pending_memory_revision_payload(card_id)
+            .await
+            .unwrap()
+            .expect("the staged card must resolve");
+        let full_body = payload
+            .full_body
+            .expect("a chunked card must expose its whole staged body");
+
+        assert!(
+            full_body.contains(&format!("yesterday ({expected_day})")),
+            "the recovered body must ground against the staging date; got: {}",
+            &full_body[..full_body.len().min(120)]
+        );
+        assert!(
+            !full_body.contains(&wrong_day),
+            "the recovered body must not ground against the date of the \
+                 later metadata edit ({wrong_day})"
+        );
+    })
+    .await;
+}
+
+/// The whole staged body must survive an accept at every length, not just the
+/// one the other tests happen to use.
+///
+/// Issue #650 is a chunk-boundary bug, so a single fixture size proves the fix
+/// only at that size. This sweeps lengths across both budgets that decide
+/// whether a card chunks at all -- 1,500 characters for markdown, 512 for
+/// plain text -- and past them, so the crossing itself is covered rather than
+/// approximated. A staged card takes the plain-text splitter, because
+/// `upsert_documents` hands the chunker the card's `source_id` as its path and
+/// that has no markdown extension.
+///
+/// Compared after `trim_end`: `text_splitter` trims chunk edges, so a
+/// single-chunk body ending in a newline round-trips without it. That is
+/// pre-existing and whitespace-only, and no rule requires a trailing newline.
+#[tokio::test]
+async fn a_page_card_survives_its_accept_at_every_length() {
+    let (db, _dir) = test_db().await;
+
+    for (case, filler_repeats) in [
+        ("tiny", 1),
+        ("under", 6),
+        ("at", 8),
+        ("over", 10),
+        ("wide", 60),
+    ] {
+        let mem_id = format!("mem_650_sweep_{case}");
+        let original_content = "Ownership rules make Rust memory safety explicit";
+        let human_content =
+            "Ownership rules make Rust memory safety explicit. A human maintains this page.";
+        let proposed_content = format!(
+            "## Section for {case}\n\n{}Reach the maintainer at sweep@example.com.\n",
+            "Prose that lengthens this body one repeat at a time. ".repeat(filler_repeats)
+        );
+
+        seed_memory(&db, &mem_id, original_content).await;
+        let page_id = seed_page(&db, &mem_id, original_content).await;
+        update_page(
+            &db,
+            &page_id,
+            UpdatePageRequest {
+                content: human_content.to_string(),
+                source_memory_ids: vec![mem_id.clone()],
+                expected_version: None,
+                caller_id: None,
+                operation_id: None,
+            },
+            "fs_edit",
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let before = db.get_page(&page_id).await.unwrap().unwrap();
+        let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
+        let card = stage_page_revision_card(
+            &db,
+            &before,
+            &proposed_content,
+            std::slice::from_ref(&mem_id),
+            staged_source_revision,
+            "page_growth",
+            None,
+        )
+        .await
+        .unwrap();
+        let card_id = card
+            .revision_card_id
+            .as_deref()
+            .expect("staged page card must return an id");
+
+        accept_pending_revision(&db, card_id, "test-agent")
+            .await
+            .unwrap();
+
+        let after = db.get_page(&page_id).await.unwrap().unwrap();
+        let expected = crate::privacy::redact_pii(&proposed_content);
+        assert_eq!(
+            after.content.trim_end(),
+            expected.trim_end(),
+            "case {case} ({} chars staged) came back as {} chars",
+            proposed_content.len(),
+            after.content.len()
+        );
+        assert!(
+            !after.content.contains("sweep@example.com"),
+            "case {case} leaked the raw address into the page"
+        );
+    }
+}
+
 /// The queue must keep previewing a memory card's stored `content`.
 ///
 /// Only a page card previews `source_text`. On a memory card `source_text` is
@@ -5458,23 +5658,45 @@ async fn a_memory_revision_card_still_previews_its_stored_content() {
     let target_id = "mem_650_memory_target";
     seed_memory(&db, target_id, "Postgres stores JSON in a JSONB column").await;
 
-    let stored = "Postgres stores JSON in a JSONB column, which is indexable";
-    let pre_distillation = "So anyway I looked it up and Postgres has this JSONB thing";
+    // Both bodies are long enough to chunk. A single-chunk fixture would take
+    // the not-chunked arm whatever the page flag said, so deleting the page
+    // check from the preview would leave this test green while a real chunked
+    // memory card started previewing prose its accept never stores.
+    let stored = format!(
+        "CANONICAL-CLAIM-MARKER. {}",
+        "Postgres stores JSON in a JSONB column, which is indexable. ".repeat(40)
+    );
+    let pre_distillation = format!(
+        "PRE-DISTILLATION-MARKER. {}",
+        "So anyway I looked it up and Postgres has this JSONB thing. ".repeat(40)
+    );
     let card = crate::sources::RawDocument {
         source: "memory".to_string(),
         source_id: "mem_650_memory_card".to_string(),
         title: "Revision: Postgres".to_string(),
-        content: stored.to_string(),
+        content: stored.clone(),
         last_modified: chrono::Utc::now().timestamp(),
         memory_type: Some("fact".to_string()),
         source_agent: Some("test".to_string()),
         confidence: Some(0.9),
         supersedes: Some(target_id.to_string()),
         pending_revision: true,
-        source_text: Some(pre_distillation.to_string()),
+        source_text: Some(pre_distillation.clone()),
         ..Default::default()
     };
     db.upsert_documents(vec![card]).await.unwrap();
+
+    // Gate: the card really chunked, so the page check is the only thing
+    // keeping its preview off `source_text`.
+    let payload = db
+        .pending_memory_revision_payload("mem_650_memory_card")
+        .await
+        .unwrap()
+        .expect("the memory card must resolve");
+    assert!(
+        payload.content.len() < stored.len(),
+        "fixture must stage a memory card that actually chunked"
+    );
 
     let queued = db
         .list_pending_revisions_scoped(10, &crate::read_scope::ReadScope::Global)
@@ -5484,10 +5706,14 @@ async fn a_memory_revision_card_still_previews_its_stored_content() {
         .iter()
         .find(|item| item.revision_source_id == "mem_650_memory_card")
         .expect("the memory card must appear in the pending queue");
-    assert_eq!(
-        item.revision_content, stored,
-        "a memory card previews the text its accept stores, not the prose it \
-         was distilled from"
+    assert!(
+        item.revision_content.contains("CANONICAL-CLAIM-MARKER"),
+        "a memory card previews the text its accept stores"
+    );
+    assert!(
+        !item.revision_content.contains("PRE-DISTILLATION-MARKER"),
+        "a memory card must never preview the prose it was distilled from: \
+         accepting it would not write that text"
     );
 }
 

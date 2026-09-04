@@ -41945,6 +41945,7 @@ impl MemoryDB {
                 "SELECT supersedes, source_id, content, source_agent, last_modified, structured_fields, \
                         EXISTS (SELECT 1 FROM pages page WHERE page.id = memories.supersedes), \
                         source_text, \
+                        COALESCE(created_at, last_modified), \
                         EXISTS (SELECT 1 FROM memories sibling \
                                 WHERE sibling.source_id = memories.source_id \
                                   AND sibling.source = 'memory' \
@@ -41993,11 +41994,14 @@ impl MemoryDB {
             // A memory card keeps previewing `content` whatever its shape,
             // because there `source_text` is the pre-distillation prose rather
             // than the body its accept stores.
-            let chunked = row.get::<i64>(8).unwrap_or(0) != 0;
+            let chunked = row.get::<i64>(9).unwrap_or(0) != 0;
+            // Grounding anchors on `created_at`, the staging date, because
+            // `last_modified` moves on any later metadata edit to the card.
+            let staged_at = row.get::<i64>(8).unwrap_or(last_modified);
             let revision_content =
                 match (targets_a_page && chunked, row.get::<Option<String>>(7).ok()) {
                     (true, Some(Some(staged))) => {
-                        memory_point_reads::rehydrate_staged_body(&staged, last_modified)
+                        memory_point_reads::rehydrate_staged_body(&staged, staged_at)
                     }
                     _ => chunk,
                 };
@@ -42113,6 +42117,7 @@ impl MemoryDB {
                     revision.source_agent, revision.last_modified, revision.structured_fields,
                     EXISTS (SELECT 1 FROM pages page WHERE page.id = revision.supersedes),
                     revision.source_text,
+                    COALESCE(revision.created_at, revision.last_modified),
                     EXISTS (SELECT 1 FROM memories sibling
                             WHERE sibling.source_id = revision.source_id
                               AND sibling.source = 'memory'
@@ -42164,11 +42169,14 @@ impl MemoryDB {
             // A memory card keeps previewing `content` whatever its shape,
             // because there `source_text` is the pre-distillation prose rather
             // than the body its accept stores.
-            let chunked = row.get::<i64>(8).unwrap_or(0) != 0;
+            let chunked = row.get::<i64>(9).unwrap_or(0) != 0;
+            // Grounding anchors on `created_at`, the staging date, because
+            // `last_modified` moves on any later metadata edit to the card.
+            let staged_at = row.get::<i64>(8).unwrap_or(last_modified);
             let revision_content =
                 match (targets_a_page && chunked, row.get::<Option<String>>(7).ok()) {
                     (true, Some(Some(staged))) => {
-                        memory_point_reads::rehydrate_staged_body(&staged, last_modified)
+                        memory_point_reads::rehydrate_staged_body(&staged, staged_at)
                     }
                     _ => chunk,
                 };

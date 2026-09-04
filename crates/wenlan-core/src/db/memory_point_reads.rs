@@ -42,8 +42,16 @@ pub(crate) struct PendingMemoryRevisionPayload {
 ///
 /// Kept beside the read rather than at the call site: every consumer of a
 /// recovered body needs both transforms, and a caller that forgot the first
-/// one would publish PII. `observed_at` is the row's `last_modified`, the same
-/// anchor the write path used.
+/// one would publish PII.
+///
+/// `observed_at` must be the row's `created_at`, not its `last_modified`.
+/// `upsert_documents` grounds against the document's `last_modified` and stores
+/// that same value in both columns, so at insert the two agree. They stop
+/// agreeing afterwards: `apply_memory_update` bumps `last_modified` on every
+/// call, including a metadata-only one that changes no text and deletes no
+/// sibling chunks -- confirming a card, or moving it to another space, is
+/// enough. Anchoring on `last_modified` would then ground "yesterday" against
+/// the date of that unrelated edit instead of the date the card was staged.
 pub(super) fn rehydrate_staged_body(raw: &str, observed_at: i64) -> String {
     let redacted = crate::privacy::redact_pii(raw);
     if crate::db::temporal_grounding_enabled() {
@@ -110,7 +118,8 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT source_id, supersedes, content, structured_fields, source_text, last_modified, \
+                "SELECT source_id, supersedes, content, structured_fields, source_text, \
+                        COALESCE(created_at, last_modified), \
                         EXISTS (SELECT 1 FROM memories sibling \
                                 WHERE sibling.source_id = memories.source_id \
                                   AND sibling.source = 'memory' \
