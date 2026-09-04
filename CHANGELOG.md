@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.17.7](https://github.com/7xuanlu/wenlan/compare/v0.17.6...v0.17.7) (2026-09-04)
+
+
+### Features
+
+* **ci:** watch the SignPath application and require the signing secrets to be there ([#662](https://github.com/7xuanlu/wenlan/issues/662)) ([7d7d011](https://github.com/7xuanlu/wenlan/commit/7d7d011d338a62802626ece9b4acb8a032c4c87a))
+* **graph:** name a hovered node's neighbors on the atlas ([#659](https://github.com/7xuanlu/wenlan/issues/659)) ([5d31cbe](https://github.com/7xuanlu/wenlan/commit/5d31cbe9ae9a65524b3601f4dee02d55c5ca6153))
+
+
+### Bug Fixes
+
+* **app:** a reading that failed no longer renders as a measured negative ([#684](https://github.com/7xuanlu/wenlan/issues/684)) ([3e7c14c](https://github.com/7xuanlu/wenlan/commit/3e7c14c60644f93cdc42e4de56c1ebda3a209cef))
+* **app:** drop the quick-capture halo where the platform draws no window shadow ([#666](https://github.com/7xuanlu/wenlan/issues/666)) ([e4ab575](https://github.com/7xuanlu/wenlan/commit/e4ab575c76a0c4448e53c484ddddc2d23eb5a1b7))
+* **app:** open citation files through open_file and surface refused opens ([#657](https://github.com/7xuanlu/wenlan/issues/657)) ([5b0c2ae](https://github.com/7xuanlu/wenlan/commit/5b0c2ae99602e3dacc04e8bc2504d0096aad7325)), closes [#656](https://github.com/7xuanlu/wenlan/issues/656)
+* **ci:** stop requiring a version bump in a file that no longer has one ([#681](https://github.com/7xuanlu/wenlan/issues/681)) ([c94d8bf](https://github.com/7xuanlu/wenlan/commit/c94d8bfc9421fb6798c68df43b3660c346fb337e))
+* **ci:** stop the CLI smoke test reading the database path as the data root ([#686](https://github.com/7xuanlu/wenlan/issues/686)) ([942355b](https://github.com/7xuanlu/wenlan/commit/942355b9b1eeeff2fa095a350cb8d33f6e7424c2))
+* **cli:** exit non-zero from status when unreachable and fix the brief and distill hints ([#672](https://github.com/7xuanlu/wenlan/issues/672)) ([30f9cda](https://github.com/7xuanlu/wenlan/commit/30f9cdaefbc8f58fa8aa2dbac650d505167d5e13))
+* **cli:** keep launchd env vars, read launchd state before backfills, warn on a temp data root ([#671](https://github.com/7xuanlu/wenlan/issues/671)) ([34fc838](https://github.com/7xuanlu/wenlan/commit/34fc8384d82ebd43d270104adf4c861d46bd4f6a))
+* **core:** fence page writes on an immutable incarnation token and guard db commits ([#676](https://github.com/7xuanlu/wenlan/issues/676)) ([4a387d2](https://github.com/7xuanlu/wenlan/commit/4a387d2e232f055eaf38e6097f290bc2201e75ca))
+* **core:** keep decisions in the recent and unconfirmed readers ([#673](https://github.com/7xuanlu/wenlan/issues/673)) ([f377bfa](https://github.com/7xuanlu/wenlan/commit/f377bfa958cc3d5e2b28d854e2c95cf78726e272))
+* **core:** quote FTS special characters by default so hyphens and dates stop breaking search ([#675](https://github.com/7xuanlu/wenlan/issues/675)) ([1a4407c](https://github.com/7xuanlu/wenlan/commit/1a4407cf29120f97698c22cf3c55307f58c25d74))
+* **core:** surface citation-gate refresh failures instead of silently discarding ([#654](https://github.com/7xuanlu/wenlan/issues/654)) ([3a2776d](https://github.com/7xuanlu/wenlan/commit/3a2776d697b56801ed3eec96572272813012e03c))
+* **deps:** drop quick-xml 0.30, and hold lopdf back on purpose ([#680](https://github.com/7xuanlu/wenlan/issues/680)) ([781f96b](https://github.com/7xuanlu/wenlan/commit/781f96bb59ac42e780d987a6c641f4cc0d8c7915))
+* **deps:** raise twelve dependencies past their advisories ([#677](https://github.com/7xuanlu/wenlan/issues/677)) ([e411ea5](https://github.com/7xuanlu/wenlan/commit/e411ea5a691bcb2023a7c3b342fdc6debbae7e24))
+* **first-run:** make the Windows channels prove they own a tree before deleting it ([#664](https://github.com/7xuanlu/wenlan/issues/664)) ([d6743ff](https://github.com/7xuanlu/wenlan/commit/d6743ff41c2a26541ba32a5a79a3269145c01740))
+* **graph:** lay out a focused neighborhood's names so none is buried ([#660](https://github.com/7xuanlu/wenlan/issues/660)) ([a5646a1](https://github.com/7xuanlu/wenlan/commit/a5646a1e67dc97c4327b623f7ec37bee3d80cd76))
+* **scripts:** stop reporting "nothing is running" when nothing could be measured ([#663](https://github.com/7xuanlu/wenlan/issues/663)) ([66f0580](https://github.com/7xuanlu/wenlan/commit/66f05805fe427276fffa94d48cc51c7ccba65c0f))
+
 ## [0.17.6](https://github.com/7xuanlu/wenlan/compare/v0.17.5...v0.17.6) (2026-08-31)
 
 
