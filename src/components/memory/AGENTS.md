@@ -36,9 +36,13 @@ sources, settings, remote access, imports, profile, and review surfaces.
 - Do not reintroduce a second home layout. `HomePage.tsx` always renders
   `WikiHome`; a library with no pages gets the empty state inside the page
   slot, never a separate greeting screen.
-- Do not promise pages will compile when `intelligence-ready` has never
-  triggered. Page synthesis is LLM-gated, so that copy is a lie without a
-  local model or an API key.
+- Do not gate that empty state on the `intelligence-ready` milestone. It is a
+  permanent latch, so it keeps claiming a provider that has since been removed
+  and denies one that was configured a minute ago. Read the live provider
+  through `useProviderConfigured`.
+- Do not promise pages will compile when no provider is configured. Page
+  synthesis is LLM-gated, so that copy is a lie without a local model or an
+  API key.
 
 ## COMMANDS
 
