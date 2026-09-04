@@ -1343,12 +1343,22 @@ const en = {
     deltaToday: "+{{value}} today",
     deltaUpdated: "{{value}} updated today",
     empty: {
+      noPages: "No pages yet.",
       needsProvider:
-        "No pages yet. Wenlan compiles pages from your memories once a local model or an API key is turned on, or you can write one yourself.",
+        "Wenlan compiles pages from your memories once a local model or an API key is turned on, or you can write one yourself.",
       compiling:
-        "No pages yet. Wenlan compiles pages as patterns emerge in your memories, usually within a day of regular use.",
+        "Wenlan compiles pages as patterns emerge in your memories, usually within a day of regular use.",
       turnOnModel: "Turn on a model",
       writePage: "Write a page",
+    },
+    retrievals: {
+      title: "Where AI looked",
+      subtitle: "recent assistants pulling from your library",
+      justNow: "just now",
+      minutesAgo: "{{count}}m ago",
+      hoursAgo: "{{count}}h ago",
+      yesterday: "yesterday",
+      daysAgo: "{{count}}d ago",
     },
     reasons: {
       sourceConflict: "Source conflict",
@@ -2894,12 +2904,22 @@ const zhHans = {
     deltaToday: "今日 +{{value}}",
     deltaUpdated: "今日更新 {{value}} 条",
     empty: {
+      noPages: "还没有页面。",
       needsProvider:
-        "还没有页面。启用本地模型或填入 API 密钥后，文澜会从你的记忆整理出页面；你也可以自己写一个。",
+        "启用本地模型或填入 API 密钥后，文澜会从你的记忆整理出页面；你也可以自己写一个。",
       compiling:
-        "还没有页面。当你的记忆中浮现出模式时，文澜会整理成页面，通常会在规律使用一天内出现。",
+        "当你的记忆中浮现出模式时，文澜会整理成页面，通常会在规律使用一天内出现。",
       turnOnModel: "启用模型",
       writePage: "自己写一个页面",
+    },
+    retrievals: {
+      title: "AI 查阅了哪些内容",
+      subtitle: "最近从你的资料库中读取内容的助手",
+      justNow: "刚刚",
+      minutesAgo: "{{count}} 分钟前",
+      hoursAgo: "{{count}} 小时前",
+      yesterday: "昨天",
+      daysAgo: "{{count}} 天前",
     },
     reasons: {
       sourceConflict: "来源冲突",
@@ -4440,12 +4460,22 @@ const zhHant = {
     deltaToday: "今日 +{{value}}",
     deltaUpdated: "今日更新 {{value}} 條",
     empty: {
+      noPages: "還沒有頁面。",
       needsProvider:
-        "還沒有頁面。啟用本機模型或填入 API 金鑰後，文瀾會從你的記憶整理出頁面；你也可以自己寫一個。",
+        "啟用本機模型或填入 API 金鑰後，文瀾會從你的記憶整理出頁面；你也可以自己寫一個。",
       compiling:
-        "還沒有頁面。當你的記憶中浮現出模式時，文瀾會整理成頁面，通常會在規律使用一天內出現。",
+        "當你的記憶中浮現出模式時，文瀾會整理成頁面，通常會在規律使用一天內出現。",
       turnOnModel: "啟用模型",
       writePage: "自己寫一個頁面",
+    },
+    retrievals: {
+      title: "AI 查閱了哪些內容",
+      subtitle: "最近從你的資料庫中讀取內容的助手",
+      justNow: "剛剛",
+      minutesAgo: "{{count}} 分鐘前",
+      hoursAgo: "{{count}} 小時前",
+      yesterday: "昨天",
+      daysAgo: "{{count}} 天前",
     },
     reasons: {
       sourceConflict: "來源衝突",

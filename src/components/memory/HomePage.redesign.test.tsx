@@ -45,6 +45,9 @@ vi.mock("../../lib/tauri", async () => {
     getMemoryRevisions: vi.fn(),
     listOnboardingMilestones: vi.fn(),
     acknowledgeOnboardingMilestone: vi.fn(),
+    getApiKey: vi.fn(),
+    getExternalLlm: vi.fn(),
+    getOnDeviceModel: vi.fn(),
   };
 });
 
@@ -68,14 +71,17 @@ function renderHome(
         onNavigateGraph={() => {}}
         onOpenDistillReview={props.onOpenDistillReview}
         onSelectPage={props.onSelectPage}
-        onCreatePage={props.onCreatePage}
-        onOpenIntelligenceSettings={props.onOpenIntelligenceSettings}
+        onCreatePage={props.onCreatePage ?? (() => {})}
+        onOpenIntelligenceSettings={props.onOpenIntelligenceSettings ?? (() => {})}
       />
     </QueryClientProvider>,
   );
 }
 
-/** The daemon only records `intelligence-ready` once an LLM provider served traffic. */
+/**
+ * The daemon latches `intelligence-ready` on the first successful inference
+ * and never clears it, so it says nothing about what is configured now.
+ */
 function intelligenceReadyMilestone(): tauri.MilestoneRecord {
   return {
     id: "intelligence-ready",
@@ -83,6 +89,11 @@ function intelligenceReadyMilestone(): tauri.MilestoneRecord {
     acknowledged_at: null,
     payload: null,
   };
+}
+
+/** A saved Anthropic key — the daemon returns it masked. */
+function withAnthropicKey() {
+  vi.mocked(tauri.getApiKey).mockResolvedValue("sk-ant-...abcd");
 }
 
 const nowIso = new Date().toISOString();
@@ -124,6 +135,14 @@ beforeEach(async () => {
   vi.mocked(tauri.listEntities).mockResolvedValue([]);
   vi.mocked(tauri.listOnboardingMilestones).mockResolvedValue([]);
   vi.mocked(tauri.acknowledgeOnboardingMilestone).mockResolvedValue(undefined);
+  // Default: no provider of any kind, and all three queries answer.
+  vi.mocked(tauri.getApiKey).mockResolvedValue(null);
+  vi.mocked(tauri.getExternalLlm).mockResolvedValue([null, null]);
+  vi.mocked(tauri.getOnDeviceModel).mockResolvedValue({
+    loaded: null,
+    selected: null,
+    models: [],
+  });
   vi.mocked(tauri.getMemoryStats).mockResolvedValue({
     total: 0,
     new_today: 0,
@@ -272,7 +291,6 @@ describe("HomePage redesign", () => {
     expect(screen.queryByText("Related pages")).toBeNull();
     expect(screen.queryByText("Related sources")).toBeNull();
     expect(screen.queryByText("source-backed")).toBeNull();
-    expect(screen.queryByTestId("what-happens-next")).toBeNull();
   });
 
   it("counts only knowledge pages in the pages metric, never entity shadow pages", async () => {
@@ -1269,18 +1287,7 @@ describe("HomePage redesign", () => {
         memory_snippets: [],
       },
     ]);
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(
-      <QueryClientProvider client={qc}>
-        <HomePage
-          onNavigateMemory={() => {}}
-          onNavigateStream={() => {}}
-          onNavigateLog={() => {}}
-          onNavigateGraph={() => {}}
-          onSelectPage={onSelectPage}
-        />
-      </QueryClientProvider>,
-    );
+    renderHome({ onSelectPage });
     // Wait for the retrievals section to render
     await screen.findByTestId("retrievals");
     // The archived badge should be visible
@@ -1321,9 +1328,12 @@ describe("HomePage redesign", () => {
     const onCreatePage = vi.fn();
     const onOpenIntelligenceSettings = vi.fn();
     const user = userEvent.setup();
-    // No `intelligence-ready` milestone: no local model and no API key, so
-    // page synthesis cannot run at all.
-    vi.mocked(tauri.listOnboardingMilestones).mockResolvedValue([]);
+    // No provider configured, but the milestone is latched from an inference
+    // that ran before the key was removed. The live queries win: page
+    // synthesis cannot run today, so the promise must not appear.
+    vi.mocked(tauri.listOnboardingMilestones).mockResolvedValue([
+      intelligenceReadyMilestone(),
+    ]);
 
     renderHome({ onCreatePage, onOpenIntelligenceSettings });
 
@@ -1334,9 +1344,12 @@ describe("HomePage redesign", () => {
     expect(screen.queryByTestId("wiki-page-list")).toBeNull();
 
     // The copy names the precondition instead of promising a deadline.
-    expect(empty).toHaveTextContent(
-      /Wenlan compiles pages from your memories once a local model or an API key is turned on/,
+    await waitFor(() =>
+      expect(empty).toHaveTextContent(
+        /Wenlan compiles pages from your memories once a local model or an API key is turned on/,
+      ),
     );
+    expect(empty).toHaveTextContent("No pages yet.");
     expect(empty).not.toHaveTextContent(/usually within a day/);
 
     // Both actions are live, not decoration.
@@ -1347,19 +1360,24 @@ describe("HomePage redesign", () => {
     expect(onCreatePage).toHaveBeenCalledTimes(1);
     expect(onCreatePage).toHaveBeenCalledWith(null);
 
-    // The ghost outlines still preview what a compiled page will look like.
+    // The ghost outlines still preview what a compiled page will look like,
+    // and the section is announced by its own heading.
     expect(
       within(empty).getByText("Pages will appear here as Wenlan finds patterns."),
     ).toBeInTheDocument();
+    expect(
+      within(empty).getByRole("heading", { name: "No pages yet." }),
+    ).toBeInTheDocument();
   });
 
-  it("promises compiled pages only once a provider has served traffic", async () => {
+  it("promises compiled pages when a provider is configured, milestone or not", async () => {
     const onCreatePage = vi.fn();
     const onOpenIntelligenceSettings = vi.fn();
     const user = userEvent.setup();
-    vi.mocked(tauri.listOnboardingMilestones).mockResolvedValue([
-      intelligenceReadyMilestone(),
-    ]);
+    // A key is saved but has never served an inference, so the milestone has
+    // not latched. The provider is nonetheless on: pages really are coming.
+    vi.mocked(tauri.listOnboardingMilestones).mockResolvedValue([]);
+    withAnthropicKey();
 
     renderHome({ onCreatePage, onOpenIntelligenceSettings });
 
@@ -1376,6 +1394,81 @@ describe("HomePage redesign", () => {
     await user.click(within(empty).getByRole("button", { name: "Write a page" }));
     expect(onCreatePage).toHaveBeenCalledWith(null);
     expect(onOpenIntelligenceSettings).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["an on-device model the daemon has loaded", () => {
+      vi.mocked(tauri.getOnDeviceModel).mockResolvedValue({
+        loaded: "qwen3-1.7b",
+        selected: "qwen3-1.7b",
+        models: [
+          {
+            id: "qwen3-1.7b",
+            display_name: "Qwen3 1.7B",
+            param_count: "1.7B",
+            ram_required_gb: 4,
+            file_size_gb: 1.2,
+            cached: true,
+          },
+        ],
+      });
+    }],
+    ["a saved external endpoint", () => {
+      vi.mocked(tauri.getExternalLlm).mockResolvedValue([
+        "http://127.0.0.1:11434/v1",
+        "llama3.1",
+      ]);
+    }],
+  ] as const)("counts %s as a configured provider", async (_label, configure) => {
+    configure();
+
+    renderHome();
+
+    const empty = await screen.findByTestId("wiki-page-empty");
+    await waitFor(() =>
+      expect(empty).toHaveTextContent(/as patterns emerge in your memories/),
+    );
+    expect(within(empty).queryByRole("button", { name: "Turn on a model" })).toBeNull();
+  });
+
+  it("commits to neither variant while the provider queries are unresolved", async () => {
+    // The key query never settles: the answer to "is a provider on" is
+    // unknown, so neither the promise nor the turn-on button may appear.
+    vi.mocked(tauri.getApiKey).mockImplementation(() => new Promise(() => {}));
+
+    renderHome();
+
+    const empty = await screen.findByTestId("wiki-page-empty");
+    expect(empty).toHaveTextContent("No pages yet.");
+    expect(empty).not.toHaveTextContent(/an API key is turned on/);
+    expect(empty).not.toHaveTextContent(/as patterns emerge in your memories/);
+    expect(within(empty).queryByRole("button", { name: "Turn on a model" })).toBeNull();
+    // The action that is true in every state still renders immediately.
+    expect(within(empty).getByRole("button", { name: "Write a page" })).toBeInTheDocument();
+    expect(
+      within(empty).getByText("Pages will appear here as Wenlan finds patterns."),
+    ).toBeInTheDocument();
+  });
+
+  it("treats a library of nothing but entity shadow pages as empty", async () => {
+    // The daemon's browse list carries a shadow page per entity by contract.
+    // The rail already excludes them from Pages; the empty-state switch must
+    // agree, or the home shows "PAGES 0" beside a list of shadow pages.
+    vi.mocked(tauri.listPages).mockResolvedValue([
+      page({
+        id: "shadow-lucian",
+        title: "Lucian",
+        creation_kind: "entity",
+        entity_id: "ent-1",
+      }),
+    ]);
+
+    renderHome();
+
+    expect(await screen.findByTestId("wiki-page-empty")).toBeInTheDocument();
+    expect(screen.queryByTestId("wiki-page-list")).toBeNull();
+    expect(screen.getByTestId("wiki-context-pages")).toHaveTextContent("0");
+    expect(screen.queryByText("Lucian")).toBeNull();
   });
 
   it("keeps Where AI looked on the home surface when there are no pages yet", async () => {
