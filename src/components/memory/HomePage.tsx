@@ -23,7 +23,6 @@ import "./homeEmptyState.css";
 
 interface HomePageProps {
   onNavigateMemory: (sourceId: string) => void;
-  onNavigateStream: () => void;
   onNavigateLog: () => void;
   onNavigateGraph: () => void;
   onSelectPage?: (pageId: string) => void;
@@ -46,7 +45,6 @@ const MAX_MODAL_SHOWS = 3;
 
 export default function HomePage({
   onNavigateMemory,
-  onNavigateStream: _onNavigateStream,
   onNavigateLog: _onNavigateLog,
   onNavigateGraph: _onNavigateGraph,
   onSelectPage,

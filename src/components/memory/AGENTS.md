@@ -50,7 +50,8 @@ sources, settings, remote access, imports, profile, and review surfaces.
   Agents reading from the library are the Activity view's subject
   (`ActivityFeed.tsx`, route kind `activity`); home stays the library's own
   surface. `HomePage.redesign.test.tsx` asserts the section is absent even when
-  the daemon has retrieval events.
+  the daemon has retrieval events. Recaps remain reachable from Memories; do
+  not make their entry point depend on a retrieval surface.
 - Do not promise pages will compile when no provider is configured. Page
   synthesis is LLM-gated, so that copy is a lie without a local model or an
   API key.

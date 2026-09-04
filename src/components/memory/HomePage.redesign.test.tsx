@@ -66,7 +66,6 @@ function renderHome(
     <QueryClientProvider client={qc}>
       <HomePage
         onNavigateMemory={() => {}}
-        onNavigateStream={() => {}}
         onNavigateLog={() => {}}
         onNavigateGraph={() => {}}
         onOpenDistillReview={props.onOpenDistillReview}
