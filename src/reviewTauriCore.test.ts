@@ -5,6 +5,8 @@ import {
   invoke,
   resetReviewRuntime,
 } from "../review/tauri-core";
+import { isKnowledgePage } from "./components/memory/pages/listAllPages";
+import type { Page } from "./lib/tauri";
 
 describe("Review fixture IPC", () => {
   beforeEach(() => {
@@ -421,5 +423,27 @@ describe("Review fixture IPC", () => {
     await expect(invoke("plugin:updater|check")).rejects.toThrow(
       "Unknown Tauri command: plugin:updater|check",
     );
+  });
+
+  it("keeps provider status out of the contract and the fixture library out of the empty state", async () => {
+    // Settings → Intelligence is not part of the fixture-only Review surface,
+    // so the provider triple fails closed like any other unlisted command.
+    for (const command of ["get_api_key", "get_external_llm", "get_on_device_model"]) {
+      await expect(invoke(command)).rejects.toThrow(
+        `Unknown Tauri command: ${command}`,
+      );
+    }
+
+    // Which is why the Review Home must never reach the state that asks. Home
+    // renders `HomeEmptyState` — the one component that reads the provider —
+    // only when the library has no knowledge page, so a fixture that lost its
+    // pages would put those three rejections back on the Home screen and break
+    // `e2e/review-flavor.review.spec.ts`. Fail here first, with the reason.
+    const pages = await invoke("list_pages", {
+      status: "active",
+      limit: 500,
+      offset: 0,
+    }) as Page[];
+    expect(pages.filter(isKnowledgePage).length).toBeGreaterThan(0);
   });
 });

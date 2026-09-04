@@ -17,8 +17,6 @@ src/components/ChunkViewer.tsx	Search chunks…	2
 src/components/intelligence/IntelligenceSetup.tsx	sk-ant-api03-...	2
 src/components/memory/ActivityFeed.tsx	&ldquo;	1
 src/components/memory/ActivityFeed.tsx	&rdquo;	1
-src/components/memory/ConnectionsList.tsx	patterns and themes the refinery surfaced this week	1
-src/components/memory/ConnectionsList.tsx	What Wenlan learned	1
 src/components/memory/ConstellationMap.tsx	Connection	1
 src/components/memory/ConstellationMap.tsx	Explore	1
 src/components/memory/ConstellationMap.tsx	Memory	1
@@ -46,8 +44,6 @@ src/components/memory/DistillReviewPanel.tsx	Refresh	1
 src/components/memory/DistillReviewPanel.tsx	Refreshing...	1
 src/components/memory/DistillReviewPanel.tsx	Showing the first 10 stale pages returned by the daemon.	1
 src/components/memory/DistillReviewPanel.tsx	Unlinked topics	1
-src/components/memory/Greeting.tsx	Good	1
-src/components/memory/Greeting.tsx	your library holds	1
 src/components/memory/IdentityDetail.tsx	&rarr;	1
 src/components/memory/IdentityDetail.tsx	+ add observation	1
 src/components/memory/IdentityDetail.tsx	About	1
@@ -233,15 +229,11 @@ src/components/memory/ProfilePage.tsx	What Wenlan knows	1
 src/components/memory/ProfileSummaryCard.tsx	Collapse	1
 src/components/memory/ProfileSummaryCard.tsx	Expand	1
 src/components/memory/ProfileSummaryCard.tsx	View all &rarr;	1
-src/components/memory/RefiningList.tsx	quality settling in as you keep working	1
-src/components/memory/RefiningList.tsx	Refining	1
 src/components/memory/RetrievalsList.tsx	archived	1
 src/components/memory/RetrievalsList.tsx	on "	1
-src/components/memory/RetrievalsList.tsx	recent assistants pulling from your library	1
 src/components/memory/RetrievalsList.tsx	searched, found nothing relevant	1
 src/components/memory/RetrievalsList.tsx	This page has been archived	2
 src/components/memory/RetrievalsList.tsx	View all recaps &rarr;	1
-src/components/memory/RetrievalsList.tsx	Where AI looked	1
 src/components/memory/settings/SettingsSidebar.tsx	Wenlan	1
 src/components/memory/SourceList.tsx	+ Add folder or vault	1
 src/components/memory/SourceList.tsx	Add source	2

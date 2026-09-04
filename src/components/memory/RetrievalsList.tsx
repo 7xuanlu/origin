@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useState } from "react";
+import type { TFunction } from "i18next";
+import { useTranslation } from "react-i18next";
 import type { RetrievalEvent } from "../../lib/tauri";
 
 interface Props {
@@ -39,15 +41,17 @@ function prettyAgent(name: string): string {
   return KNOWN_AGENTS[key] ?? name;
 }
 
-function relative(ms: number): string {
+function relative(t: TFunction, ms: number): string {
   const delta = Date.now() - ms;
   const mins = Math.floor(delta / 60_000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
+  if (mins < 1) return t("home.retrievals.justNow");
+  if (mins < 60) return t("home.retrievals.minutesAgo", { count: mins });
   const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
+  if (hrs < 24) return t("home.retrievals.hoursAgo", { count: hrs });
   const days = Math.floor(hrs / 24);
-  return days === 1 ? "yesterday" : `${days}d ago`;
+  return days === 1
+    ? t("home.retrievals.yesterday")
+    : t("home.retrievals.daysAgo", { count: days });
 }
 
 const SECTION_TITLE_STYLE: React.CSSProperties = {
@@ -68,14 +72,15 @@ const SECTION_SUB_STYLE: React.CSSProperties = {
 };
 
 export function RetrievalsList({ events, onSelectPageById, onViewRecaps }: Props) {
+  const { t } = useTranslation();
   const trusted = events.filter((e) => isTrustedAgent(e.agent_name));
   if (!trusted.length) return null;
 
   return (
     <section data-testid="retrievals">
-      <h2 style={SECTION_TITLE_STYLE}>Where AI looked</h2>
+      <h2 style={SECTION_TITLE_STYLE}>{t("home.retrievals.title")}</h2>
       <p style={SECTION_SUB_STYLE} className="mb-3">
-        recent assistants pulling from your library
+        {t("home.retrievals.subtitle")}
       </p>
       <ul className="space-y-2">
         {trusted.map((e, i) => (
@@ -183,6 +188,7 @@ function RetrievalItemBody({
   memories: string[];
   archived?: boolean;
 }) {
+  const { t } = useTranslation();
   const hasContent = pages.length > 0 || memories.length > 0;
   return (
     <>
@@ -195,7 +201,7 @@ function RetrievalItemBody({
             whiteSpace: "nowrap",
           }}
         >
-          {relative(event.timestamp_ms)}
+          {relative(t, event.timestamp_ms)}
         </span>
         <span
           style={{

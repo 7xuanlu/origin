@@ -29,7 +29,7 @@ export const ANTHROPIC_MODELS = [
 }>;
 
 export function useApiKeyStatus() {
-  const { data: maskedKey } = useQuery({
+  const { data: maskedKey, isSuccess } = useQuery({
     queryKey: ["apiKey"],
     queryFn: getApiKey,
   });
@@ -37,6 +37,10 @@ export function useApiKeyStatus() {
   return {
     maskedKey,
     isConfigured: !!maskedKey,
+    // The daemon has actually answered. `isConfigured` alone cannot tell
+    // "no key" apart from "not asked yet", and callers that gate copy on the
+    // answer must not treat the pending state as a no.
+    isResolved: isSuccess,
   };
 }
 

@@ -6,26 +6,23 @@ import { useTranslation } from "react-i18next";
 import {
   getMemoryStats,
   listEntities,
-  listRecentChanges,
   listRecentRetrievals,
   type MemoryStats,
   type Page,
+  type RetrievalEvent,
 } from "../../lib/tauri";
 import { isKnowledgePage, listAllActivePages } from "./pages/listAllPages";
-import { Greeting } from "./Greeting";
 import { useReviewQueue, reviewItemId, type ReviewItem } from "./useReviewQueue";
 import ReviewDialog, {
   reviewKindLabel,
   useReviewItemSummary,
 } from "./ReviewDialog";
-import { RefiningList } from "./RefiningList";
-import { ConnectionsList } from "./ConnectionsList";
 import { RetrievalsList } from "./RetrievalsList";
-import { WhatHappensNextCard, type HomePageState } from "../onboarding/WhatHappensNextCard";
 import { GhostPagesRow } from "../onboarding/GhostPagesRow";
 import { useMilestones } from "../onboarding/useMilestones";
 import { FirstPageModal } from "../onboarding/FirstPageModal";
-import { MilestoneHighlight } from "../onboarding/MilestoneHighlight";
+import { useProviderConfigured } from "../intelligence/useProviderConfigured";
+import "./homeEmptyState.css";
 
 interface HomePageProps {
   onNavigateMemory: (sourceId: string) => void;
@@ -34,25 +31,21 @@ interface HomePageProps {
   onNavigateGraph: () => void;
   onSelectPage?: (pageId: string) => void;
   onOpenDistillReview?: () => void;
+  /**
+   * Starts the same new-page draft flow the Wiki overview's New page action
+   * uses. Required: the empty state offers "Write a page" in every variant, so
+   * the copy must never name an action with no handler behind it.
+   */
+  onCreatePage: (space: string | null) => void;
+  /**
+   * Opens Settings → Intelligence, where a local model is installed or an API
+   * key is set. Required for the same reason as {@link onCreatePage}.
+   */
+  onOpenIntelligenceSettings: () => void;
 }
 
 const FIRST_CONCEPT_SHOWN_KEY = "onboarding:firstConceptShownCount";
 const MAX_MODAL_SHOWS = 3;
-
-function deriveHomePageState(params: {
-  intelligenceReady: boolean;
-  memoryCount: number;
-  conceptCount: number;
-}): HomePageState {
-  // Pages take precedence over memories: if any page exists the home page is
-  // "alive", even if memories were subsequently deleted. The local counter
-  // still uses the legacy concept name because the daemon activity contract
-  // has not been renamed yet.
-  if (params.conceptCount > 0) return "alive";
-  if (params.memoryCount > 0) return "gathering";
-  if (params.intelligenceReady) return "listening";
-  return "seed";
-}
 
 export default function HomePage({
   onNavigateMemory,
@@ -61,17 +54,12 @@ export default function HomePage({
   onNavigateGraph: _onNavigateGraph,
   onSelectPage,
   onOpenDistillReview,
+  onCreatePage,
+  onOpenIntelligenceSettings,
 }: HomePageProps) {
-  const { t } = useTranslation();
   const { data: retrievals = [] } = useQuery({
     queryKey: ["recentRetrievals"],
     queryFn: () => listRecentRetrievals(12),
-    refetchInterval: 30_000,
-  });
-
-  const { data: changes = [] } = useQuery({
-    queryKey: ["recentChanges"],
-    queryFn: () => listRecentChanges(3),
     refetchInterval: 30_000,
   });
 
@@ -87,26 +75,24 @@ export default function HomePage({
     refetchInterval: 10_000,
   });
 
-  const memoryCount = stats?.total ?? 0;
-  const conceptCount = recentConcepts.length;
-  const hasPages = recentConcepts.length > 0;
-  const recentlyRefinedPages = useMemo(
-    () =>
-      [...recentConcepts]
-        .sort((a, b) => Date.parse(b.last_modified) - Date.parse(a.last_modified))
-        .slice(0, 6),
+  // The daemon's browse list carries an entity "shadow" page for every entity
+  // by contract. Those belong in Wiki browse but are not pages anyone wrote or
+  // Wenlan distilled, so filtering once here keeps the empty-state switch, the
+  // home page list, and the rail's Pages metric all counting the same thing.
+  const knowledgePages = useMemo(
+    () => recentConcepts.filter(isKnowledgePage),
     [recentConcepts],
   );
 
-  const { milestones, acknowledge } = useMilestones();
-  const intelligenceReady = milestones.some(
-    (m) => m.id === "intelligence-ready" && m.first_triggered_at != null,
+  const recentlyRefinedPages = useMemo(
+    () =>
+      [...knowledgePages]
+        .sort((a, b) => Date.parse(b.last_modified) - Date.parse(a.last_modified))
+        .slice(0, 6),
+    [knowledgePages],
   );
-  const firstTriggeredAt = milestones.find((m) => m.id === "intelligence-ready")
-    ?.first_triggered_at;
-  const daysInListening = firstTriggeredAt
-    ? Math.floor((Date.now() / 1000 - firstTriggeredAt) / 86_400)
-    : 0;
+
+  const { milestones, acknowledge } = useMilestones();
 
   const firstConceptMs = milestones.find(
     (m) => m.id === "first-concept" && m.acknowledged_at == null,
@@ -117,12 +103,6 @@ export default function HomePage({
   const firstConcept = firstConceptData?.page_id
     ? recentConcepts.find((c) => c.id === firstConceptData.page_id)
     : null;
-
-  const homePageState = deriveHomePageState({
-    intelligenceReady,
-    memoryCount,
-    conceptCount,
-  });
 
   // Track whether we've incremented shown_count for the current first-concept
   // modal instance, so StrictMode double-invokes don't double-count.
@@ -152,109 +132,28 @@ export default function HomePage({
     !!firstConceptMs &&
     firstConceptShownCount <= MAX_MODAL_SHOWS;
 
-  const isEmpty =
-    retrievals.length === 0 &&
-    changes.length === 0;
-
-  const distillReviewEntry = onOpenDistillReview ? (
-    <div style={{ display: "flex", justifyContent: "flex-end", margin: "-4px 0 10px" }}>
-      <button
-        type="button"
-        onClick={onOpenDistillReview}
-        style={{
-          border: "1px solid var(--mem-border)",
-          background: "var(--mem-surface)",
-          color: "var(--mem-text)",
-          borderRadius: 8,
-          padding: "7px 11px",
-          fontSize: 13,
-          cursor: "pointer",
-        }}
-      >
-        {t("home.reviewPageChanges")}
-      </button>
-    </div>
-  ) : null;
-
   // The "recent-concepts" query has never resolved right after onboarding
   // (HomePage isn't mounted during the wizard), so its default `[]` would
-  // otherwise make hasPages look like "no pages" and flash the never-
-  // onboarded seed state before the real page list arrives.
+  // otherwise be read as "no pages" and flash the empty state before the real
+  // page list arrives.
   if (recentConceptsLoading) {
     return null;
   }
 
-  if (hasPages) {
-    return (
-      <>
-        <WikiHome
-          allPages={recentConcepts}
-          pages={recentlyRefinedPages}
-          stats={stats}
-          onSelectPage={onSelectPage}
-          onOpenDistillReview={onOpenDistillReview}
-          onOpenMemory={onNavigateMemory}
-        />
-
-        {shouldShowFirstConceptModal && firstConcept && (
-          <FirstPageModal
-            page={firstConcept}
-            onOpen={(id) => {
-              localStorage.removeItem(FIRST_CONCEPT_SHOWN_KEY);
-              acknowledge("first-concept");
-              onSelectPage?.(id);
-            }}
-            onDismiss={() => {
-              localStorage.removeItem(FIRST_CONCEPT_SHOWN_KEY);
-              acknowledge("first-concept");
-            }}
-          />
-        )}
-      </>
-    );
-  }
-
   return (
-    <div className="flex flex-col gap-8 pb-16">
-      <Greeting memoryCount={memoryCount} pageCount={conceptCount} />
-
-      {isEmpty ? (
-        <>
-          <WhatHappensNextCard
-            state={homePageState}
-            memoryCount={memoryCount}
-            daysInListening={daysInListening}
-          />
-          {distillReviewEntry}
-          <MilestoneHighlight
-            active={
-              !shouldShowFirstConceptModal &&
-              milestones.some(
-                (m) => m.id === "first-concept" && m.acknowledged_at == null,
-              )
-            }
-            onSeen={() => {}}
-            intensity="full"
-          >
-            <section>
-              <GhostPagesRow />
-            </section>
-          </MilestoneHighlight>
-        </>
-      ) : (
-        <>
-          {distillReviewEntry}
-          <RefiningList changes={changes} pages={recentConcepts} onSelectPage={onSelectPage} />
-          <RetrievalsList
-            events={retrievals}
-            onSelectPageById={(pageId) => onSelectPage?.(pageId)}
-          />
-          <ConnectionsList
-            onSelectPage={onSelectPage}
-            onSelectEntity={undefined}
-          />
-        </>
-      )}
+    <>
+      <WikiHome
+        allPages={recentConcepts}
+        knowledgePages={knowledgePages}
+        pages={recentlyRefinedPages}
+        stats={stats}
+        retrievals={retrievals}
+        onSelectPage={onSelectPage}
+        onOpenDistillReview={onOpenDistillReview}
+        onOpenMemory={onNavigateMemory}
+        onCreatePage={onCreatePage}
+        onOpenIntelligenceSettings={onOpenIntelligenceSettings}
+      />
 
       {shouldShowFirstConceptModal && firstConcept && (
         <FirstPageModal
@@ -270,7 +169,7 @@ export default function HomePage({
           }}
         />
       )}
-    </div>
+    </>
   );
 }
 
@@ -342,18 +241,28 @@ function useElementMinWidth<T extends HTMLElement>(minWidth: number) {
 
 function WikiHome({
   allPages,
+  knowledgePages,
   pages,
   stats,
+  retrievals,
   onSelectPage,
   onOpenDistillReview,
   onOpenMemory,
+  onCreatePage,
+  onOpenIntelligenceSettings,
 }: {
+  /** Every active page the daemon browses, entity shadow pages included. */
   allPages: Page[];
+  /** `allPages` minus entity shadow pages — what a person calls "my pages". */
+  knowledgePages: Page[];
   pages: Page[];
   stats?: MemoryStats;
+  retrievals: RetrievalEvent[];
   onSelectPage?: (pageId: string) => void;
   onOpenDistillReview?: () => void;
   onOpenMemory?: (sourceId: string) => void;
+  onCreatePage: (space: string | null) => void;
+  onOpenIntelligenceSettings: () => void;
 }) {
   const [containerRef, isWideLayout] = useElementMinWidth<HTMLDivElement>(820);
   const {
@@ -394,7 +303,7 @@ function WikiHome({
         <TodayHeader pages={allPages} />
 
         <HomeContextRail
-          pages={allPages}
+          knowledgePages={knowledgePages}
           stats={stats}
         />
       </section>
@@ -411,11 +320,18 @@ function WikiHome({
           minWidth: 0,
         }}
       >
-        <PageList
-          pages={pages}
-          onSelectPage={onSelectPage}
-          isWideLayout={isWideLayout}
-        />
+        {knowledgePages.length === 0 ? (
+          <HomeEmptyState
+            onCreatePage={onCreatePage}
+            onOpenIntelligenceSettings={onOpenIntelligenceSettings}
+          />
+        ) : (
+          <PageList
+            pages={pages}
+            onSelectPage={onSelectPage}
+            isWideLayout={isWideLayout}
+          />
+        )}
         <NeedsReviewRail
           items={decisionItems}
           isLoading={reviewLoading}
@@ -427,6 +343,15 @@ function WikiHome({
           leadsColumn={!isWideLayout && decisionItems.length > 0}
         />
       </div>
+
+      {/* Full width under the page area rather than inside the review column:
+          a retrieval row carries the agent, the query it ran, and the pages it
+          hit, which needs the whole measure at >=820px and reads as the same
+          single column below it. */}
+      <RetrievalsList
+        events={retrievals}
+        onSelectPageById={(pageId) => onSelectPage?.(pageId)}
+      />
 
       <ReviewDialog
         items={decisionItems}
@@ -504,6 +429,122 @@ function TodayHeader({ pages }: { pages: Page[] }) {
           </span>
         }
       />
+    </section>
+  );
+}
+
+const EMPTY_ACTION_STYLE: React.CSSProperties = {
+  fontFamily: "var(--mem-font-body)",
+  fontSize: 13,
+  borderRadius: 8,
+  padding: "7px 12px",
+  cursor: "pointer",
+};
+
+/**
+ * What the page list says when the library has no pages yet.
+ *
+ * Page synthesis is LLM-gated: distill and the refinery no-op without a
+ * provider, so a library with no local model and no API key will never grow a
+ * page on its own. The variants keep that honest — without a provider the copy
+ * names the precondition and offers the setting that removes it, and only with
+ * one is the deadline promise allowed.
+ *
+ * Until the provider queries answer, neither claim is made: the lead, the
+ * ghost preview and "Write a page" are true in every state, so they render
+ * immediately and the provider-dependent sentence and button appear once the
+ * answer is actually known.
+ *
+ * The provider read lives here, not in `HomePage`, because this is the only
+ * screen on the home surface whose copy depends on the answer. Asked one level
+ * up it fired for every library, including the ones that already have pages and
+ * never render this component — three IPC calls per home mount whose result was
+ * discarded, and, in the fixture-only Review flavor, three commands outside the
+ * Review command contract (`review/commandCapabilities.ts`), which fails closed
+ * on anything it does not list.
+ */
+function HomeEmptyState({
+  onCreatePage,
+  onOpenIntelligenceSettings,
+}: {
+  onCreatePage: (space: string | null) => void;
+  onOpenIntelligenceSettings: () => void;
+}) {
+  const { t } = useTranslation();
+  const { configured: providerConfigured, isResolved: providerResolved } =
+    useProviderConfigured();
+  const needsProvider = providerResolved && !providerConfigured;
+  return (
+    <section data-testid="wiki-page-empty" aria-labelledby="wiki-page-empty-title">
+      <h2
+        id="wiki-page-empty-title"
+        style={{
+          fontFamily: "var(--mem-font-heading)",
+          fontSize: 16,
+          fontWeight: 500,
+          color: "var(--mem-text)",
+          lineHeight: 1.3,
+          margin: "0 0 6px",
+        }}
+      >
+        {t("home.empty.noPages")}
+      </h2>
+      {providerResolved && (
+        <p
+          style={{
+            fontFamily: "var(--mem-font-body)",
+            fontSize: 14,
+            color: "var(--mem-text-secondary)",
+            lineHeight: 1.6,
+            margin: "0 0 14px",
+            maxWidth: "62ch",
+          }}
+        >
+          {providerConfigured
+            ? t("home.empty.compiling")
+            : t("home.empty.needsProvider")}
+        </p>
+      )}
+
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          gap: 10,
+          margin: providerResolved ? "0 0 24px" : "14px 0 24px",
+        }}
+      >
+        {needsProvider && (
+          <button
+            type="button"
+            className="home-empty-action"
+            onClick={onOpenIntelligenceSettings}
+            style={{
+              ...EMPTY_ACTION_STYLE,
+              border: "1px solid var(--mem-accent-indigo)",
+              background: "var(--mem-indigo-bg)",
+              color: "var(--mem-accent-indigo)",
+            }}
+          >
+            {t("home.empty.turnOnModel")}
+          </button>
+        )}
+        <button
+          type="button"
+          className="home-empty-action"
+          onClick={() => onCreatePage(null)}
+          style={{
+            ...EMPTY_ACTION_STYLE,
+            border: "1px solid var(--mem-border)",
+            background: "var(--mem-surface)",
+            color: "var(--mem-text)",
+          }}
+        >
+          {t("home.empty.writePage")}
+        </button>
+      </div>
+
+      <GhostPagesRow />
     </section>
   );
 }
@@ -629,10 +670,17 @@ function PageList({
 }
 
 function HomeContextRail({
-  pages,
+  knowledgePages,
   stats,
 }: {
-  pages: Page[];
+  /**
+   * Already filtered by the caller. The browse list includes entity shadow
+   * pages by daemon contract; entities have their own metric below, so the
+   * Pages number and its updated-today chip count knowledge pages only — and
+   * they are filtered in exactly one place so this total can never disagree
+   * with the empty-state switch that reads the same list.
+   */
+  knowledgePages: Page[];
   /** Aggregate memory counts; undefined while the stats query is loading. */
   stats?: MemoryStats;
 }) {
@@ -644,10 +692,6 @@ function HomeContextRail({
     queryFn: () => listEntities(),
     staleTime: 60_000,
   });
-  // The browse list includes entity shadow pages by daemon contract; entities
-  // already have their own metric below, so the Pages number and its
-  // updated-today chip count knowledge pages only.
-  const knowledgePages = useMemo(() => pages.filter(isKnowledgePage), [pages]);
   const pagesUpdatedToday = updatedTodayCount(knowledgePages);
 
   return (

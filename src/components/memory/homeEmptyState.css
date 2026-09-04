@@ -1,0 +1,19 @@
+/* Home empty-state actions.
+ *
+ * The two variants' colors stay inline beside the rest of HomePage's styling;
+ * hover and :focus-visible have no inline equivalent, so they live here and
+ * follow the same ring the repo's other actions use (pageActions.css,
+ * index.css `.mem-icon-action`). */
+.home-empty-action {
+  transition: background-color 150ms, border-color 150ms, color 150ms;
+  white-space: nowrap;
+}
+
+.home-empty-action:hover {
+  background: var(--mem-hover);
+}
+
+.home-empty-action:focus-visible {
+  outline: 2px solid var(--mem-accent-page);
+  outline-offset: 2px;
+}

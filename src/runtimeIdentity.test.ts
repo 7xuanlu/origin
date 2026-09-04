@@ -187,7 +187,6 @@ describe("runtime product identity", () => {
     const productOwnedFiles = [
       "src/components/memory/SettingsPage.tsx",
       "src/components/memory/AboutWenlanDialog.tsx",
-      "src/components/memory/ConnectionsList.tsx",
       "src/components/memory/sources/AddSourceDialog.tsx",
       "src/components/memory/sources/SourcesSection.tsx",
       "src/components/memory/PageDetail.tsx",

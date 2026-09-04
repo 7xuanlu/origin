@@ -44,11 +44,9 @@ describe("taxonomy and product copy", () => {
 
   it("keeps user-facing page copy out of legacy concept wording", () => {
     const productOwnedFiles = [
-      "src/components/onboarding/WhatHappensNextCard.tsx",
       "src/components/onboarding/FirstPageModal.tsx",
       "src/components/onboarding/GhostPagesRow.tsx",
       "src/components/intelligence/IntelligenceSetup.tsx",
-      "src/components/memory/Greeting.tsx",
       "src/components/memory/ActivityFeed.tsx",
       "src/components/memory/PageDetail.tsx",
       "src/components/memory/SpaceDetail.tsx",
@@ -87,13 +85,6 @@ describe("taxonomy and product copy", () => {
   it("keeps remaining graph surfaces on page/theme copy while preserving legacy keys", () => {
     const legacyWireKey = "con" + "cept";
     const legacyLabel = "Con" + "cept";
-    const legacyPlural = legacyWireKey + "s";
-    const linkedLegacyName = "linked" + legacyLabel + "s";
-    const connections = read("src/components/memory/ConnectionsList.tsx");
-    expect(connections).not.toContain(
-      ` across \${${linkedLegacyName}.length} ${legacyPlural}`,
-    );
-    expect(connections).toContain(` across \${${linkedLegacyName}.length} pages`);
 
     const atlas = read("src/components/memory/AtlasView.tsx");
     expect(atlas).not.toContain(
