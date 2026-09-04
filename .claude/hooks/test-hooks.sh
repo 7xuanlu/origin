@@ -21,6 +21,9 @@ t() { # desc script stdin want-exit
 }
 
 t "no-verify: block --no-verify"           block-no-verify.sh '{"tool_input":{"command":"git commit --no-verify -m x"}}' 2
+t "no-verify: block --no-gpg-sign"         block-no-verify.sh '{"tool_input":{"command":"git commit --no-gpg-sign -m x"}}' 2
+t "no-verify: block -c gpgsign=false"      block-no-verify.sh '{"tool_input":{"command":"git -c commit.gpgsign=false commit -m x"}}' 2
+t "no-verify: block spaced gpgsign=false"  block-no-verify.sh '{"tool_input":{"command":"git -c commit.gpgsign = false commit -m x"}}' 2
 t "no-verify: allow plain git"             block-no-verify.sh '{"tool_input":{"command":"git status"}}' 0
 t "no-verify: allow innocent mention"      block-no-verify.sh '{"tool_input":{"command":"grep -- --no-verify README.md"}}' 0
 t "no-verify: malformed JSON fails closed" block-no-verify.sh 'not json' 2
@@ -28,6 +31,18 @@ t "release-please: block CHANGELOG.md"     block-release-please-files.sh '{"tool
 t "release-please: allow normal file"      block-release-please-files.sh '{"tool_input":{"file_path":"/x/src/main.rs"}}' 0
 t "release-please: allow no file_path"     block-release-please-files.sh '{"tool_input":{}}' 0
 t "release-please: malformed JSON fails closed" block-release-please-files.sh '{{{' 2
+
+RP_TMP="$(mktemp -d "${TMPDIR:-/tmp}/wenlan-rp.XXXXXX")"
+mkdir -p "$RP_TMP/marked" "$RP_TMP/unmarked"
+printf '[package]\nversion = "0.1.0" # x-release-please-version\n' > "$RP_TMP/marked/Cargo.toml"
+printf '[package]\nversion = "0.1.0"\n' > "$RP_TMP/unmarked/Cargo.toml"
+t "release-please: block Cargo.toml with marker" block-release-please-files.sh "{\"tool_input\":{\"file_path\":\"$RP_TMP/marked/Cargo.toml\"}}" 2
+t "release-please: allow Cargo.toml without marker" block-release-please-files.sh "{\"tool_input\":{\"file_path\":\"$RP_TMP/unmarked/Cargo.toml\"}}" 0
+rp_got="$(printf '{"tool_input":{"file_path":"Cargo.toml"}}' | CLAUDE_PROJECT_DIR="$RP_TMP/marked" bash block-release-please-files.sh >/dev/null 2>&1; echo $?)"
+if [ "$rp_got" -eq 2 ]; then echo "PASS  release-please: relative Cargo.toml resolves via CLAUDE_PROJECT_DIR"; else echo "FAIL  release-please: relative Cargo.toml resolves via CLAUDE_PROJECT_DIR (want exit 2, got $rp_got)"; fails=$((fails + 1)); fi
+rp_got="$(printf '{"tool_input":{"file_path":"Cargo.toml"}}' | CLAUDE_PROJECT_DIR="$RP_TMP/unmarked" bash block-release-please-files.sh >/dev/null 2>&1; echo $?)"
+if [ "$rp_got" -eq 0 ]; then echo "PASS  release-please: relative unmarked Cargo.toml allows"; else echo "FAIL  release-please: relative unmarked Cargo.toml allows (want exit 0, got $rp_got)"; fails=$((fails + 1)); fi
+rm -rf "$RP_TMP"
 
 stop_t() { # desc fixture want-exit
   local tmp got filename
@@ -41,9 +56,41 @@ stop_t() { # desc fixture want-exit
       filename=canary.rs
       printf 'fn main() { todo!(); }\n' > "$tmp/$filename"
       ;;
+    rust-assert-true)
+      filename=canary.rs
+      printf 'fn main() { assert!(true); }\n' > "$tmp/$filename"
+      ;;
+    rust-assert-eq)
+      filename=canary.rs
+      printf 'fn main() { assert_eq!(true, true); }\n' > "$tmp/$filename"
+      ;;
+    rust-unimplemented)
+      filename=canary.rs
+      printf 'fn main() { unimplemented!(); }\n' > "$tmp/$filename"
+      ;;
+    rust-fixme)
+      filename=canary.rs
+      printf '// FIXME: finish this\nfn main() {}\n' > "$tmp/$filename"
+      ;;
+    ts-assert)
+      filename=canary.ts
+      printf 'assert(true);\n' > "$tmp/$filename"
+      ;;
+    ts-expect)
+      filename=canary.ts
+      printf 'expect(true).toBe(true);\n' > "$tmp/$filename"
+      ;;
     ts-skip)
       filename=canary.ts
       printf 'it.skip("pending", () => {});\n' > "$tmp/$filename"
+      ;;
+    ts-test-skip)
+      filename=canary.ts
+      printf 'test.skip("pending", () => {});\n' > "$tmp/$filename"
+      ;;
+    ts-xit)
+      filename=canary.ts
+      printf 'xit("pending", () => {});\n' > "$tmp/$filename"
       ;;
     clean)
       ;;
@@ -63,7 +110,15 @@ stop_t() { # desc fixture want-exit
 }
 
 stop_t "pre-stop: block staged todo!" rust-todo 2
+stop_t "pre-stop: block staged assert!(true)" rust-assert-true 2
+stop_t "pre-stop: block staged assert_eq!(true,true)" rust-assert-eq 2
+stop_t "pre-stop: block staged unimplemented!" rust-unimplemented 2
+stop_t "pre-stop: block staged FIXME" rust-fixme 2
+stop_t "pre-stop: block staged assert(true)" ts-assert 2
+stop_t "pre-stop: block staged expect(true).toBe(true)" ts-expect 2
 stop_t "pre-stop: block staged TS skip" ts-skip 2
+stop_t "pre-stop: block staged test.skip" ts-test-skip 2
+stop_t "pre-stop: block staged xit" ts-xit 2
 stop_t "pre-stop: allow clean tree" clean 0
 
 # ---- wrapper-level cases: exercise the REAL settings.json command strings, not
@@ -126,9 +181,22 @@ rm -rf "$D"
 J="$(jq -n --arg cwd "$ROOT" --arg fp "$ROOT/CHANGELOG.md" '{cwd:$cwd, tool_input:{file_path:$fp}}')"
 wt "wrapper write: CLAUDE_PROJECT_DIR resolves, inner blocks CHANGELOG.md" "$W_WRITE" "$J" "$ROOT" 2
 
+# Inside a repo that's just missing the script: still fail closed.
+D="$(mktemp -d "${TMPDIR:-/tmp}/wenlan-wrap.XXXXXX")"
+git init -q "$D"
+J="$(jq -n --arg cwd "$D" --arg fp "$D/CHANGELOG.md" '{cwd:$cwd, tool_input:{file_path:$fp}}')"
+wt "wrapper write: cwd inside a repo missing the script -> fail closed" "$W_WRITE" "$J" "/nonexistent/path" 2 "inside a repo"
+rm -rf "$D"
+
 D="$(mktemp -d "${TMPDIR:-/tmp}/wenlan-wrap.XXXXXX")"
 J="$(jq -n --arg cwd "$D" '{cwd:$cwd}')"
 wt "wrapper stop: cwd outside any git repo -> allow" "$W_STOP" "$J" "/nonexistent" 0
+rm -rf "$D"
+
+D="$(mktemp -d "${TMPDIR:-/tmp}/wenlan-wrap.XXXXXX")"
+git init -q "$D"
+J="$(jq -n --arg cwd "$D" '{cwd:$cwd}')"
+wt "wrapper stop: cwd inside a repo missing the script -> gate did not run" "$W_STOP" "$J" "/nonexistent/path" 1 "did not run"
 rm -rf "$D"
 
 echo "----"

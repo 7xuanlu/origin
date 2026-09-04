@@ -36,7 +36,7 @@ if [ "${#FILES[@]}" -gt 0 ]; then
     'assert_eq!\s*\(\s*true\s*,\s*true\s*\)'
     'todo!\s*\('
     'unimplemented!\s*\('
-    '^\s*//.*FIXME'
+    '^[+ ]*\s*//.*FIXME'
     'assert[[:space:]]*\([[:space:]]*true[[:space:]]*\)'
     'expect[[:space:]]*\([[:space:]]*true[[:space:]]*\)[[:space:]]*\.toBe[[:space:]]*\([[:space:]]*true[[:space:]]*\)'
     '(^|[^[:alnum:]_])(it|test)\.skip[[:space:]]*\('

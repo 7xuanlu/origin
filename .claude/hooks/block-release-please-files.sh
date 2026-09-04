@@ -29,10 +29,23 @@ fi
 
 # Block Cargo.toml ONLY if it has release-please version marker
 if [[ "$file_path" == */Cargo.toml || "$file_path" == Cargo.toml ]]; then
-  if [[ -f "$file_path" ]] && grep -q 'x-release-please-version' "$file_path" 2>/dev/null; then
-    echo "BLOCKED: $file_path has release-please-managed version line. Bump via release-please PR, not direct edit." >&2
-    exit 2
+  # Resolve relative paths against the repo root so a bare `Cargo.toml` or
+  # `app/Cargo.toml` can't bypass the marker check when the hook's cwd is
+  # not the repo root.
+  REPO_DIR="${CLAUDE_PROJECT_DIR:-}"
+  if [[ -z "$REPO_DIR" ]]; then
+    REPO_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   fi
+  candidates=("$file_path")
+  if [[ "$file_path" != /* ]]; then
+    candidates+=("$REPO_DIR/$file_path")
+  fi
+  for cand in "${candidates[@]}"; do
+    if [[ -f "$cand" ]] && grep -q 'x-release-please-version' "$cand" 2>/dev/null; then
+      echo "BLOCKED: $file_path has release-please-managed version line. Bump via release-please PR, not direct edit." >&2
+      exit 2
+    fi
+  done
 fi
 
 exit 0
