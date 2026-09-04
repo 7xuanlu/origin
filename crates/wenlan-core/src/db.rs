@@ -41943,11 +41943,17 @@ impl MemoryDB {
         let mut rows = conn
             .query(
                 "SELECT supersedes, source_id, content, source_agent, last_modified, structured_fields, \
-                        EXISTS (SELECT 1 FROM pages page WHERE page.id = memories.supersedes) \
+                        EXISTS (SELECT 1 FROM pages page WHERE page.id = memories.supersedes), \
+                        source_text, \
+                        EXISTS (SELECT 1 FROM memories sibling \
+                                WHERE sibling.source_id = memories.source_id \
+                                  AND sibling.source = 'memory' \
+                                  AND sibling.chunk_index > 0) \
                  FROM memories \
                  WHERE pending_revision = 1 \
                    AND supersedes IS NOT NULL \
                    AND source = 'memory' \
+                   AND chunk_index = 0 \
                  ORDER BY last_modified DESC \
                  LIMIT ?1",
                 libsql::params![limit as i64],
@@ -41970,6 +41976,31 @@ impl MemoryDB {
                         .and_then(|g| g.as_str())
                         .map(str::to_string)
                 });
+            let targets_a_page = row.get::<i64>(6).unwrap_or(0) != 0;
+            let chunk = row
+                .get::<String>(2)
+                .map_err(|e| WenlanError::VectorDb(format!("col 2: {e}")))?;
+            let last_modified = row
+                .get::<i64>(4)
+                .map_err(|e| WenlanError::VectorDb(format!("col 4: {e}")))?;
+            // A page card previews the whole staged body; `content` on one row
+            // is a single chunk of it (issue #650). Only a card that actually
+            // chunked needs `source_text`: once a human edits a staged card,
+            // `apply_memory_update` leaves one row holding the edited body and
+            // a `source_text` from before the edit, and previewing that would
+            // show the human their own edit reverted.
+            //
+            // A memory card keeps previewing `content` whatever its shape,
+            // because there `source_text` is the pre-distillation prose rather
+            // than the body its accept stores.
+            let chunked = row.get::<i64>(8).unwrap_or(0) != 0;
+            let revision_content =
+                match (targets_a_page && chunked, row.get::<Option<String>>(7).ok()) {
+                    (true, Some(Some(staged))) => {
+                        memory_point_reads::rehydrate_staged_body(&staged, last_modified)
+                    }
+                    _ => chunk,
+                };
             out.push(wenlan_types::responses::PendingRevisionItem {
                 target_source_id: row
                     .get::<String>(0)
@@ -41977,13 +42008,9 @@ impl MemoryDB {
                 revision_source_id: row
                     .get::<String>(1)
                     .map_err(|e| WenlanError::VectorDb(format!("col 1: {e}")))?,
-                revision_content: row
-                    .get::<String>(2)
-                    .map_err(|e| WenlanError::VectorDb(format!("col 2: {e}")))?,
+                revision_content,
                 source_agent: row.get::<Option<String>>(3).unwrap_or(None),
-                last_modified: row
-                    .get::<i64>(4)
-                    .map_err(|e| WenlanError::VectorDb(format!("col 4: {e}")))?,
+                last_modified,
                 target_kind: revision_target_kind(row.get::<i64>(6).unwrap_or(0)),
                 grounded_in,
             });
@@ -42077,21 +42104,19 @@ impl MemoryDB {
             ),
         };
         let limit_param = values.len();
+        // `source_text` rides along so a page card can preview the body an
+        // accept would actually write. Which column wins is decided in Rust
+        // below, off the page flag this query already selects, so the page
+        // lookup still runs once per row.
         let sql = format!(
-            // A page card's preview comes from `source_text`, which carries the
-            // whole staged body on every chunk row, while `content` holds one
-            // chunk. Without this the human reviews the card's first ~1,500
-            // characters and cannot see what accepting it would write (issue
-            // #650). A memory card keeps reading `content` on purpose: there
-            // `source_text` is the pre-distillation prose, not the body the
-            // accept path writes, so previewing it would show text the accept
-            // never stores.
-            "SELECT revision.supersedes, revision.source_id,
-                    CASE WHEN EXISTS (SELECT 1 FROM pages page WHERE page.id = revision.supersedes)
-                         THEN COALESCE(revision.source_text, revision.content)
-                         ELSE revision.content END,
+            "SELECT revision.supersedes, revision.source_id, revision.content,
                     revision.source_agent, revision.last_modified, revision.structured_fields,
-                    EXISTS (SELECT 1 FROM pages page WHERE page.id = revision.supersedes)
+                    EXISTS (SELECT 1 FROM pages page WHERE page.id = revision.supersedes),
+                    revision.source_text,
+                    EXISTS (SELECT 1 FROM memories sibling
+                            WHERE sibling.source_id = revision.source_id
+                              AND sibling.source = 'memory'
+                              AND sibling.chunk_index > 0)
              FROM memories revision
              WHERE revision.pending_revision = 1
                AND revision.supersedes IS NOT NULL
@@ -42122,6 +42147,31 @@ impl MemoryDB {
                         .and_then(|ground| ground.as_str())
                         .map(str::to_string)
                 });
+            let targets_a_page = row.get::<i64>(6).unwrap_or(0) != 0;
+            let chunk = row
+                .get::<String>(2)
+                .map_err(|e| WenlanError::VectorDb(format!("col 2: {e}")))?;
+            let last_modified = row
+                .get::<i64>(4)
+                .map_err(|e| WenlanError::VectorDb(format!("col 4: {e}")))?;
+            // A page card previews the whole staged body; `content` on one row
+            // is a single chunk of it (issue #650). Only a card that actually
+            // chunked needs `source_text`: once a human edits a staged card,
+            // `apply_memory_update` leaves one row holding the edited body and
+            // a `source_text` from before the edit, and previewing that would
+            // show the human their own edit reverted.
+            //
+            // A memory card keeps previewing `content` whatever its shape,
+            // because there `source_text` is the pre-distillation prose rather
+            // than the body its accept stores.
+            let chunked = row.get::<i64>(8).unwrap_or(0) != 0;
+            let revision_content =
+                match (targets_a_page && chunked, row.get::<Option<String>>(7).ok()) {
+                    (true, Some(Some(staged))) => {
+                        memory_point_reads::rehydrate_staged_body(&staged, last_modified)
+                    }
+                    _ => chunk,
+                };
             out.push(wenlan_types::responses::PendingRevisionItem {
                 target_source_id: row
                     .get::<String>(0)
@@ -42129,13 +42179,9 @@ impl MemoryDB {
                 revision_source_id: row
                     .get::<String>(1)
                     .map_err(|e| WenlanError::VectorDb(format!("col 1: {e}")))?,
-                revision_content: row
-                    .get::<String>(2)
-                    .map_err(|e| WenlanError::VectorDb(format!("col 2: {e}")))?,
+                revision_content,
                 source_agent: row.get::<Option<String>>(3).unwrap_or(None),
-                last_modified: row
-                    .get::<i64>(4)
-                    .map_err(|e| WenlanError::VectorDb(format!("col 4: {e}")))?,
+                last_modified,
                 target_kind: revision_target_kind(row.get::<i64>(6).unwrap_or(0)),
                 grounded_in,
             });

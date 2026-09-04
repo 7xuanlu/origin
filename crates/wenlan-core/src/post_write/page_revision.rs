@@ -76,7 +76,12 @@ async fn resolve_page_revision_card(
         revision_id: payload.revision_id,
         page_version,
         source_revision,
-        content: payload.content,
+        // The staged body, not the one chunk of it this row happens to
+        // carry. `full_body` is `None` only for a row written before
+        // `source_text` existed, and such a card also predates source-revision
+        // fencing, so `accept_page_revision_card` refuses it below before its
+        // content is ever written.
+        content: payload.full_body.unwrap_or(payload.content),
         source_memory_ids,
     }))
 }

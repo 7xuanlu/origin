@@ -165,12 +165,17 @@ fn print_table(groups: &[GroupedRevision]) {
     println!("accept/dismiss: wenlan curate accept|dismiss <revision_source_id>");
 }
 
-/// Group per-chunk `PendingRevisionItem` rows into one logical revision each.
+/// Turn `PendingRevisionItem` rows into one `GroupedRevision` each.
 ///
-/// `list_pending_revisions` returns one row per chunk; a long revision spans
-/// several rows sharing the same `revision_source_id`. Join their content in the
-/// order received (the daemon sorts by `last_modified DESC`) so each card is ONE
-/// logical revision, not a mid-sentence fragment.
+/// The daemon now returns exactly one row per revision: it reads chunk zero and,
+/// for a page card, previews the whole staged body from `source_text` (issue
+/// #650). The join below therefore folds nothing against a current daemon.
+///
+/// It stays because the CLI and the daemon are separately installed binaries and
+/// need not be the same build. An older daemon still returns one row per chunk,
+/// and joining them in the order received (sorted by `last_modified DESC`) is
+/// what keeps such a card one logical revision rather than a mid-sentence
+/// fragment.
 fn group_revisions(items: Vec<PendingRevisionItem>) -> Vec<GroupedRevision> {
     use std::collections::HashMap;
     let mut order: Vec<String> = Vec::new();
