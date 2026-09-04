@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.18.0](https://github.com/7xuanlu/wenlan/compare/v0.17.8...v0.18.0) (2026-09-04)
+
+
+### Features
+
+* **app:** one home page for every library, with an honest empty state ([#693](https://github.com/7xuanlu/wenlan/issues/693)) ([6602e29](https://github.com/7xuanlu/wenlan/commit/6602e29cd823f584a512f468c8afdf17a8463b6e))
+
+
+### Bug Fixes
+
+* **app:** drop the "Where AI looked" section from the home page ([#698](https://github.com/7xuanlu/wenlan/issues/698)) ([c644119](https://github.com/7xuanlu/wenlan/commit/c64411963271c1b0e9bf2b7dc4fa04f085487ada))
+* **app:** fit the home empty state's ghost cards at the default window size ([#696](https://github.com/7xuanlu/wenlan/issues/696)) ([f26134a](https://github.com/7xuanlu/wenlan/commit/f26134a12319b8a94f616c6f68e3f12387e1c73b))
+* **app:** keep starting when a global shortcut is already taken ([#695](https://github.com/7xuanlu/wenlan/issues/695)) ([17b961e](https://github.com/7xuanlu/wenlan/commit/17b961eb10e1344df9163d8a64d6d197a109643a))
+* **app:** keep the window still after launch and show a starting status until the daemon answers ([#692](https://github.com/7xuanlu/wenlan/issues/692)) ([c99d536](https://github.com/7xuanlu/wenlan/commit/c99d536f6f4453c18df7580742b253cf1a6fd2c6))
+
 ## [0.17.8](https://github.com/7xuanlu/wenlan/compare/v0.17.7...v0.17.8) (2026-09-04)
 
 
