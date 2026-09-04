@@ -15,6 +15,7 @@ pub mod config;
 mod daemon_start;
 pub mod error;
 pub mod events;
+pub mod global_shortcuts;
 #[cfg(target_os = "macos")]
 mod handover;
 mod identity_paths;
@@ -906,19 +907,10 @@ pub fn run() {
                 }
             }
 
-            // Register global shortcuts
+            // Register global shortcuts. The accelerators live in
+            // `global_shortcuts::SHORTCUTS`.
             use tauri::Manager;
             use tauri_plugin_global_shortcut::GlobalShortcutExt;
-
-            let toggle_shortcut = "CmdOrCtrl+K"
-                .parse::<tauri_plugin_global_shortcut::Shortcut>()
-                .unwrap();
-            let spotlight_shortcut = "CmdOrCtrl+Shift+K"
-                .parse::<tauri_plugin_global_shortcut::Shortcut>()
-                .unwrap();
-            let quick_capture_shortcut = "CmdOrCtrl+Shift+N"
-                .parse::<tauri_plugin_global_shortcut::Shortcut>()
-                .unwrap();
 
             let state: tauri::State<Arc<RwLock<AppState>>> = app.state();
             let state_clone = state.inner().clone();
@@ -936,83 +928,113 @@ pub fn run() {
                 });
             }
 
-            // Register all global shortcuts
-            {
-                let handle_for_shortcuts = handle.clone();
-                let toggle = toggle_shortcut;
-                let spotlight = spotlight_shortcut;
-                let quick_capture = quick_capture_shortcut;
-                app.global_shortcut().on_shortcuts(
-                    [toggle, spotlight, quick_capture],
-                    move |_app, shortcut, event| {
-                        use tauri::Emitter;
-                        use tauri_plugin_global_shortcut::ShortcutState;
-                        if event.state != ShortcutState::Pressed {
-                            return;
-                        }
-                        if *shortcut == toggle {
-                            let _ = handle_for_shortcuts.emit("toggle-spotlight", ());
-                        } else if *shortcut == spotlight {
-                            if let Some(window) = handle_for_shortcuts.get_webview_window("main") {
-                                if window.is_visible().unwrap_or(false) {
-                                    let _ = window.hide();
-                                    set_main_window_dock_visibility(&handle_for_shortcuts, false);
-                                } else {
-                                    set_main_window_dock_visibility(&handle_for_shortcuts, true);
-                                    let _ = window.show();
-                                    let _ = window.set_focus();
-                                    let _ = handle_for_shortcuts.emit("show-memory", ());
+            // Register the global shortcuts — one at a time, and never fatally.
+            //
+            // A hotkey belongs to whichever process grabbed it first, desktop
+            // wide, so "already registered" is an ordinary answer: another app
+            // holds Ctrl+K, or a second Wenlan does. The single-instance plugin
+            // does not prevent the second case; it keys on the bundle
+            // identifier, so a build with a different identifier is not "the
+            // same instance" to it and arrives here with the running app's
+            // hotkeys still held.
+            //
+            // This used to be one `on_shortcuts([..])?` call. That helper stops
+            // at the first refusal — so one taken hotkey also cost the other
+            // two — and the `?` carried the error out of `setup()`, which Tauri
+            // turns into `Failed to setup app: HotKey already registered: ...`
+            // and a panic, seconds after the window was already visible. See
+            // `global_shortcuts` for the whole story.
+            let shortcut_status = {
+                use crate::global_shortcuts::ShortcutId;
+
+                let mut outcomes = Vec::with_capacity(global_shortcuts::SHORTCUTS.len());
+                for spec in global_shortcuts::SHORTCUTS {
+                    let handle_for_shortcuts = handle.clone();
+                    let outcome = global_shortcuts::parse(&spec).and_then(|shortcut| {
+                        app.global_shortcut()
+                            .on_shortcut(shortcut, move |_app, _shortcut, event| {
+                                use tauri::Emitter;
+                                use tauri_plugin_global_shortcut::ShortcutState;
+                                if event.state != ShortcutState::Pressed {
+                                    return;
                                 }
-                            }
-                        } else if *shortcut == quick_capture {
-                            if let Some(window) =
-                                handle_for_shortcuts.get_webview_window("quick-capture")
-                            {
-                                #[cfg(target_os = "macos")]
-                                #[allow(deprecated)]
-                                {
-                                    use cocoa::base::id;
-                                    use raw_window_handle::HasWindowHandle;
-                                    if let Ok(raw_handle) = window.window_handle() {
-                                        if let raw_window_handle::RawWindowHandle::AppKit(appkit) = raw_handle.as_raw() {
-                                            let ns_view = appkit.ns_view.as_ptr() as id;
-                                            unsafe {
-                                                let ns_win: id = objc::msg_send![ns_view, window];
-                                                let visible: bool = objc::msg_send![ns_win, isVisible];
-                                                if visible {
-                                                    // orderOut removes the window without
-                                                    // triggering macOS window promotion
-                                                    let _: () = objc::msg_send![ns_win, orderOut: ns_win];
-                                                } else {
-                                                    // makeKeyAndOrderFront shows + focuses
-                                                    // without activating the app (main stays put)
-                                                    let _: () = objc::msg_send![ns_win, setLevel: 3_i64]; // NSFloatingWindowLevel
-                                                    let _: () = objc::msg_send![ns_win, makeKeyAndOrderFront: ns_win];
-                                                    tauri::async_runtime::spawn({
-                                                        let h = handle_for_shortcuts.clone();
-                                                        async move {
-                                                            let _ = crate::search::position_quick_capture(h).await;
+                                if spec.id == ShortcutId::ToggleSearch {
+                                    let _ = handle_for_shortcuts.emit("toggle-spotlight", ());
+                                } else if spec.id == ShortcutId::ShowMemory {
+                                    if let Some(window) = handle_for_shortcuts.get_webview_window("main") {
+                                        if window.is_visible().unwrap_or(false) {
+                                            let _ = window.hide();
+                                            set_main_window_dock_visibility(&handle_for_shortcuts, false);
+                                        } else {
+                                            set_main_window_dock_visibility(&handle_for_shortcuts, true);
+                                            let _ = window.show();
+                                            let _ = window.set_focus();
+                                            let _ = handle_for_shortcuts.emit("show-memory", ());
+                                        }
+                                    }
+                                } else if spec.id == ShortcutId::QuickCapture {
+                                    if let Some(window) =
+                                        handle_for_shortcuts.get_webview_window("quick-capture")
+                                    {
+                                        #[cfg(target_os = "macos")]
+                                        #[allow(deprecated)]
+                                        {
+                                            use cocoa::base::id;
+                                            use raw_window_handle::HasWindowHandle;
+                                            if let Ok(raw_handle) = window.window_handle() {
+                                                if let raw_window_handle::RawWindowHandle::AppKit(appkit) = raw_handle.as_raw() {
+                                                    let ns_view = appkit.ns_view.as_ptr() as id;
+                                                    unsafe {
+                                                        let ns_win: id = objc::msg_send![ns_view, window];
+                                                        let visible: bool = objc::msg_send![ns_win, isVisible];
+                                                        if visible {
+                                                            // orderOut removes the window without
+                                                            // triggering macOS window promotion
+                                                            let _: () = objc::msg_send![ns_win, orderOut: ns_win];
+                                                        } else {
+                                                            // makeKeyAndOrderFront shows + focuses
+                                                            // without activating the app (main stays put)
+                                                            let _: () = objc::msg_send![ns_win, setLevel: 3_i64]; // NSFloatingWindowLevel
+                                                            let _: () = objc::msg_send![ns_win, makeKeyAndOrderFront: ns_win];
+                                                            tauri::async_runtime::spawn({
+                                                                let h = handle_for_shortcuts.clone();
+                                                                async move {
+                                                                    let _ = crate::search::position_quick_capture(h).await;
+                                                                }
+                                                            });
                                                         }
-                                                    });
+                                                    }
                                                 }
+                                            }
+                                        }
+                                        #[cfg(not(target_os = "macos"))]
+                                        {
+                                            if window.is_visible().unwrap_or(false) {
+                                                let _ = window.hide();
+                                            } else {
+                                                let _ = window.show();
+                                                let _ = window.set_focus();
                                             }
                                         }
                                     }
                                 }
-                                #[cfg(not(target_os = "macos"))]
-                                {
-                                    if window.is_visible().unwrap_or(false) {
-                                        let _ = window.hide();
-                                    } else {
-                                        let _ = window.show();
-                                        let _ = window.set_focus();
-                                    }
-                                }
-                            }
-                        }
-                    },
-                )?;
-            }
+                            })
+                            .map_err(|e| e.to_string())
+                    });
+
+                    // Explicit, never swallowed: the shortcut, the keys the
+                    // user would press, and the OS error, in the app log.
+                    if let Err(ref error) = outcome {
+                        log::warn!("{}", global_shortcuts::registration_warning(&spec, error));
+                    }
+                    outcomes.push((spec, outcome));
+                }
+
+                global_shortcuts::partition_registrations(outcomes)
+            };
+            // Recorded so a surface can answer "why does Ctrl+K do nothing?".
+            // Read it with the `global_shortcut_status` command.
+            app.manage(shortcut_status);
 
             // Tray icon: left-click toggles window, right-click menu with Show / Status / Quit
             {
@@ -1518,6 +1540,8 @@ pub fn run() {
             acknowledge_guarded_quit_request,
             cancel_guarded_quit_request,
             daemon_start::start_daemon_sidecar,
+            // Which global hotkeys this session actually holds
+            global_shortcuts::global_shortcut_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
