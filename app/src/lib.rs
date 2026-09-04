@@ -751,7 +751,7 @@ pub fn run() {
                     // Size first because AppKit can recalculate titlebar control
                     // frames while the window geometry changes.
                     let _ = win.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
-                        1100.0, 720.0,
+                        1280.0, 720.0,
                     )));
                     let _ = win.center();
 

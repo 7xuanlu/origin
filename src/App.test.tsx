@@ -41,10 +41,9 @@ vi.mock("./lib/tauri", () => ({
   setTrafficLightsVisible: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock("./lib/resizeWindow", () => ({
-  resizeWindowCentered: vi.fn(),
-}));
-
+// No setSize/setPosition/scaleFactor/currentMonitor here on purpose: App no
+// longer touches the window geometry, so mocking those would only hide a
+// regression that re-added the launch-time resize.
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
     setAlwaysOnTop: vi.fn(),
@@ -52,13 +51,20 @@ vi.mock("@tauri-apps/api/window", () => ({
     hide: hideWindowMock,
     show: showWindowMock,
     setFocus: focusWindowMock,
-    setSize: vi.fn().mockResolvedValue(undefined),
-    setPosition: vi.fn().mockResolvedValue(undefined),
-    scaleFactor: vi.fn().mockResolvedValue(1),
   }),
-  LogicalSize: vi.fn(),
-  LogicalPosition: vi.fn(),
-  currentMonitor: vi.fn().mockResolvedValue(null),
+}));
+
+// The real ladder is ~162s of wall clock by design (it has to outlast the
+// Rust health loop). Running it here would be a three-minute unit test, so
+// this file substitutes a two-attempt policy and asserts only the branching
+// it owns. The production schedule and its budget are pinned as arithmetic in
+// src/lib/bootRetryPolicy.test.ts.
+vi.mock("./lib/bootRetryPolicy", () => ({
+  ATTEMPT_TIMEOUT_MS: 5000,
+  RUST_HEALTH_LOOP_BUDGET_MS: 152_200,
+  BOOT_QUERY_RETRY: 1,
+  bootQueryRetryDelay: () => 10,
+  bootQueryBudgetMs: () => 10_010,
 }));
 
 // Heavy real children — swap for markers so this test only pins App's own
@@ -102,6 +108,9 @@ vi.mock("./components/UpdaterDialog", () => ({
 }));
 
 import { shouldShowWizard } from "./lib/tauri";
+import { resources } from "./i18n/resources";
+
+const STARTING_RUNTIME = resources.en.translation.common.startingRuntime;
 
 function renderApp() {
   const queryClient = new QueryClient({
@@ -172,26 +181,48 @@ describe("App - first-run wizard gate", () => {
     }
   });
 
-  // The daemon's first-run install is async (app/src/lib.rs) and can race this
-  // query past its own retry budget. App.tsx's per-query retry (5 attempts,
-  // exponential backoff capped at 3s, ~12s total) overrides main.tsx's global
-  // retry:false, so this exercises the REAL production retry policy end to
-  // end rather than a shortened test double — hence the generous timeout.
-  it(
-    "fails closed to SetupWizard when shouldShowWizard rejects (daemon unreachable)",
-    async () => {
-      vi.mocked(shouldShowWizard).mockRejectedValue(new Error("connection refused"));
-      renderApp();
+  // A cold start can leave the window with nothing to show for seconds. The
+  // gate must say what it is waiting for rather than holding an empty window,
+  // and it must not pre-empt that wait with the first-run wizard.
+  it("shows the starting-runtime status while the wizard query is pending", async () => {
+    let resolveWizard!: (showWizard: boolean) => void;
+    vi.mocked(shouldShowWizard).mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        resolveWizard = resolve;
+      }),
+    );
+    renderApp();
 
-      expect(
-        await screen.findByTestId("setup-wizard", {}, { timeout: 20000 }),
-      ).toBeInTheDocument();
-      expect(screen.queryByTestId("home-main")).not.toBeInTheDocument();
-      // Proves retries actually happened, not just a single failed attempt.
-      expect(vi.mocked(shouldShowWizard).mock.calls.length).toBeGreaterThan(1);
-    },
-    25000,
-  );
+    const status = await screen.findByRole("status");
+    expect(status).toHaveTextContent(STARTING_RUNTIME);
+    expect(screen.queryByTestId("setup-wizard")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("home-main")).not.toBeInTheDocument();
+    expect(screen.getByTestId("runtime-overlays")).toHaveAttribute(
+      "data-variant",
+      "updater-only",
+    );
+
+    // …and it is a waiting state, not a terminal one.
+    await act(async () => {
+      resolveWizard(false);
+    });
+    expect(await screen.findByTestId("home-main")).toBeInTheDocument();
+    expect(screen.queryByText(STARTING_RUNTIME)).not.toBeInTheDocument();
+  });
+
+  // The daemon's first-run install is async (app/src/lib.rs) and can race this
+  // query. App.tsx's per-query retry overrides main.tsx's global retry:false,
+  // and this pins that the query retries at all and then fails CLOSED. How
+  // MANY times and for how long is the policy module's contract, tested there.
+  it("fails closed to SetupWizard when shouldShowWizard rejects (daemon unreachable)", async () => {
+    vi.mocked(shouldShowWizard).mockRejectedValue(new Error("connection refused"));
+    renderApp();
+
+    expect(await screen.findByTestId("setup-wizard")).toBeInTheDocument();
+    expect(screen.queryByTestId("home-main")).not.toBeInTheDocument();
+    // Proves retries actually happened, not just a single failed attempt.
+    expect(vi.mocked(shouldShowWizard).mock.calls.length).toBeGreaterThan(1);
+  });
 
   it("waits for the active editor guard before an explicit quit reaches Tauri", async () => {
     let resolveFlush!: (saved: boolean) => void;
