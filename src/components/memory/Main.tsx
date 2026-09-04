@@ -954,6 +954,10 @@ export default function Main({
               onNavigateGraph={() => navigateTo({ kind: "graph" })}
               onSelectPage={(id) => navigateTo({ kind: "page", pageId: id })}
               onOpenDistillReview={() => navigateTo({ kind: "distill-review" })}
+              onCreatePage={(space) => navigateTo({ kind: "page-draft", space })}
+              onOpenIntelligenceSettings={() =>
+                navigateTo({ kind: "settings", section: "intelligence" })
+              }
             />
           ) : view.kind === "activity" ? (
             <ActivityFeed

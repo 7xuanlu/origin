@@ -1342,6 +1342,14 @@ const en = {
     entities: "Entities",
     deltaToday: "+{{value}} today",
     deltaUpdated: "{{value}} updated today",
+    empty: {
+      needsProvider:
+        "No pages yet. Wenlan compiles pages from your memories once a local model or an API key is turned on, or you can write one yourself.",
+      compiling:
+        "No pages yet. Wenlan compiles pages as patterns emerge in your memories, usually within a day of regular use.",
+      turnOnModel: "Turn on a model",
+      writePage: "Write a page",
+    },
     reasons: {
       sourceConflict: "Source conflict",
       sourceUpdated: "New sources waiting",
@@ -1480,20 +1488,6 @@ const en = {
     onDeviceDownloadHint: "Uncached models download from the On-device model row below.",
   },
   onboarding: {
-    next: {
-      seed:
-        "Wenlan is loading its on-device intelligence. Once it's ready, memories from your agents will start arriving here and compile into pages.",
-      listeningQuiet:
-        "Still quiet here. You can connect more AI tools from Settings.",
-      listening:
-        "Keep using your AI tools. Memories will appear here as agents save what they learn. Pages usually start compiling within a day.",
-      gatheringFew_one:
-        "{{count}} memory saved. Pages are compiled automatically — usually within a day of regular use.",
-      gatheringFew_other:
-        "{{count}} memories saved. Pages are compiled automatically — usually within a day of regular use.",
-      gatheringMany:
-        "{{count}} memories saved. Pages are compiled when patterns emerge — you should see the first ones soon.",
-    },
     ghostPages:
       "Pages will appear here as Wenlan finds patterns.",
     firstPage: {
@@ -2899,6 +2893,14 @@ const zhHans = {
     entities: "实体",
     deltaToday: "今日 +{{value}}",
     deltaUpdated: "今日更新 {{value}} 条",
+    empty: {
+      needsProvider:
+        "还没有页面。启用本地模型或填入 API 密钥后，文澜会从你的记忆整理出页面；你也可以自己写一个。",
+      compiling:
+        "还没有页面。当你的记忆中浮现出模式时，文澜会整理成页面，通常会在规律使用一天内出现。",
+      turnOnModel: "启用模型",
+      writePage: "自己写一个页面",
+    },
     reasons: {
       sourceConflict: "来源冲突",
       sourceUpdated: "有新来源待处理",
@@ -3037,20 +3039,6 @@ const zhHans = {
     onDeviceDownloadHint: "未缓存的模型可在下方的本地模型行下载。",
   },
   onboarding: {
-    next: {
-      seed:
-        "文澜正在加载本地智能。准备好后，你的代理会开始把记忆送到这里，并整理成页面。",
-      listeningQuiet:
-        "这里还很安静。你可以从设置连接更多 AI 工具。",
-      listening:
-        "继续照常使用你的 AI 工具。代理保存所学内容后，记忆会出现在这里。页面通常会在一天内开始整理。",
-      gatheringFew_one:
-        "已保存 {{count}} 条记忆。页面会自动整理，通常会在规律使用一天内完成。",
-      gatheringFew_other:
-        "已保存 {{count}} 条记忆。页面会自动整理，通常会在规律使用一天内完成。",
-      gatheringMany:
-        "已保存 {{count}} 条记忆。当模式浮现时会整理成页面，你应该很快会看到第一批页面。",
-    },
     ghostPages:
       "当文澜发现模式时，页面会出现在这里。",
     firstPage: {
@@ -4451,6 +4439,14 @@ const zhHant = {
     entities: "實體",
     deltaToday: "今日 +{{value}}",
     deltaUpdated: "今日更新 {{value}} 條",
+    empty: {
+      needsProvider:
+        "還沒有頁面。啟用本機模型或填入 API 金鑰後，文瀾會從你的記憶整理出頁面；你也可以自己寫一個。",
+      compiling:
+        "還沒有頁面。當你的記憶中浮現出模式時，文瀾會整理成頁面，通常會在規律使用一天內出現。",
+      turnOnModel: "啟用模型",
+      writePage: "自己寫一個頁面",
+    },
     reasons: {
       sourceConflict: "來源衝突",
       sourceUpdated: "有新來源待處理",
@@ -4589,20 +4585,6 @@ const zhHant = {
     onDeviceDownloadHint: "未快取的模型可在下方的本機模型列下載。",
   },
   onboarding: {
-    next: {
-      seed:
-        "文瀾正在載入本機智慧。準備好後，你的代理會開始把記憶送到這裡，並整理成頁面。",
-      listeningQuiet:
-        "這裡還很安靜。你可以從設定連接更多 AI 工具。",
-      listening:
-        "繼續照常使用你的 AI 工具。代理儲存所學內容後，記憶會出現在這裡。頁面通常會在一天內開始整理。",
-      gatheringFew_one:
-        "已儲存 {{count}} 則記憶。頁面會自動整理，通常會在規律使用一天內完成。",
-      gatheringFew_other:
-        "已儲存 {{count}} 則記憶。頁面會自動整理，通常會在規律使用一天內完成。",
-      gatheringMany:
-        "已儲存 {{count}} 則記憶。當模式浮現時會整理成頁面，你應該很快會看到第一批頁面。",
-    },
     ghostPages:
       "當文瀾發現模式時，頁面會出現在這裡。",
     firstPage: {

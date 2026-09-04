@@ -15,7 +15,7 @@ sources, settings, remote access, imports, profile, and review surfaces.
 | Sources UI | `SourcesView.tsx`, `sources/` | add/list/sync source workflows |
 | Memory rendering | `MemoryCard.tsx`, `ContentRenderer.tsx`, `MemoryDetail.tsx` | classifier/rendering invariants |
 | Remote access UI | `RemoteAccessPanel.tsx` | talks to Rust remote-access commands |
-| Review lanes | `DistillReviewPanel.tsx`, `RefiningList.tsx` | pending/refinement flows |
+| Review lanes | `DistillReviewPanel.tsx`, `HomePage.tsx` needs-review rail | pending/refinement flows |
 
 ## CONVENTIONS
 
@@ -33,8 +33,12 @@ sources, settings, remote access, imports, profile, and review surfaces.
 - Do not add navigation state that depends on localized placeholder text.
 - Do not weaken `PageDetail.*.test.tsx` or `page/PageInfo.test.tsx` to make UI
   changes pass.
-- Do not treat `RefiningList.tsx` TODOs as cleanup-only; they mark unresolved
-  behavior.
+- Do not reintroduce a second home layout. `HomePage.tsx` always renders
+  `WikiHome`; a library with no pages gets the empty state inside the page
+  slot, never a separate greeting screen.
+- Do not promise pages will compile when `intelligence-ready` has never
+  triggered. Page synthesis is LLM-gated, so that copy is a lie without a
+  local model or an API key.
 
 ## COMMANDS
 

@@ -43,6 +43,8 @@ vi.mock("../../lib/tauri", async () => {
     getPage: vi.fn(),
     getPageSources: vi.fn(),
     getMemoryRevisions: vi.fn(),
+    listOnboardingMilestones: vi.fn(),
+    acknowledgeOnboardingMilestone: vi.fn(),
   };
 });
 
@@ -52,6 +54,8 @@ function renderHome(
   props: {
     onOpenDistillReview?: () => void;
     onSelectPage?: (pageId: string) => void;
+    onCreatePage?: (space: string | null) => void;
+    onOpenIntelligenceSettings?: () => void;
   } = {},
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -64,9 +68,21 @@ function renderHome(
         onNavigateGraph={() => {}}
         onOpenDistillReview={props.onOpenDistillReview}
         onSelectPage={props.onSelectPage}
+        onCreatePage={props.onCreatePage}
+        onOpenIntelligenceSettings={props.onOpenIntelligenceSettings}
       />
     </QueryClientProvider>,
   );
+}
+
+/** The daemon only records `intelligence-ready` once an LLM provider served traffic. */
+function intelligenceReadyMilestone(): tauri.MilestoneRecord {
+  return {
+    id: "intelligence-ready",
+    first_triggered_at: Math.floor(Date.now() / 1000) - 3_600,
+    acknowledged_at: null,
+    payload: null,
+  };
 }
 
 const nowIso = new Date().toISOString();
@@ -106,6 +122,8 @@ beforeEach(async () => {
     entries: [],
   } as any);
   vi.mocked(tauri.listEntities).mockResolvedValue([]);
+  vi.mocked(tauri.listOnboardingMilestones).mockResolvedValue([]);
+  vi.mocked(tauri.acknowledgeOnboardingMilestone).mockResolvedValue(undefined);
   vi.mocked(tauri.getMemoryStats).mockResolvedValue({
     total: 0,
     new_today: 0,
@@ -555,7 +573,7 @@ describe("HomePage redesign", () => {
     expect(onOpenDistillReview).toHaveBeenCalledTimes(1);
   });
 
-  it("always renders the greeting", async () => {
+  it("never renders a greeting screen, with or without pages", async () => {
     vi.mocked(tauri.getProfile).mockResolvedValue({
       id: "p1",
       name: "Lucian",
@@ -566,10 +584,23 @@ describe("HomePage redesign", () => {
       created_at: 0,
       updated_at: 0,
     } as any);
+
+    // Empty library: one home, no salutation.
+    const emptyHome = renderHome();
+    await screen.findByTestId("wiki-home");
+    expect(screen.queryByTestId("greeting")).toBeNull();
+    expect(screen.queryByText(/Good (morning|afternoon|evening)/)).toBeNull();
+    expect(screen.queryByText(/your library holds/)).toBeNull();
+    emptyHome.unmount();
+
+    // Populated library: the same one home.
+    vi.mocked(tauri.listPages).mockResolvedValue([
+      page({ id: "page-architecture", title: "Wenlan app architecture" }),
+    ]);
     renderHome();
-    // Wait for the profile query to resolve before asserting the name renders.
-    await screen.findByText(/Good (morning|afternoon|evening), Lucian/);
-    expect(screen.getByTestId("greeting")).toBeInTheDocument();
+    await screen.findByTestId("wiki-page-list");
+    expect(screen.queryByTestId("greeting")).toBeNull();
+    expect(screen.queryByText(/Good (morning|afternoon|evening)/)).toBeNull();
   });
 
   it("does NOT render ProfileNarrativeCompact on home", async () => {
@@ -581,12 +612,6 @@ describe("HomePage redesign", () => {
     // Settle React Query before asserting absence.
     await new Promise((r) => setTimeout(r, 100));
     expect(screen.queryByText(/^Updated/i)).toBeNull();
-  });
-
-  it.skip("renders Recent activity scroll with badges", async () => {
-    // Superseded by RefiningList. Badge styling lives inside RefiningList and
-    // is covered by that component's own tests; the home-level integration only
-    // needs to verify RefiningList mounts when there are changes.
   });
 
   it("renders the retrievals list with known agent names", async () => {
@@ -1266,7 +1291,7 @@ describe("HomePage redesign", () => {
     expect(onSelectPage).not.toHaveBeenCalled();
   });
 
-  it("does not flash the empty seed state while the pages query is still loading", async () => {
+  it("does not flash the empty state while the pages query is still loading", async () => {
     let resolvePages!: (pages: tauri.Page[]) => void;
     vi.mocked(tauri.listPages).mockImplementation(
       () =>
@@ -1278,8 +1303,9 @@ describe("HomePage redesign", () => {
     renderHome();
 
     // The query has not resolved yet — its data defaults to `[]`, which must
-    // not be read as "no pages" and paint the never-onboarded seed state.
-    expect(screen.queryByTestId("what-happens-next")).toBeNull();
+    // not be read as "no pages" and paint the empty state over a library that
+    // in fact has pages.
+    expect(screen.queryByTestId("wiki-page-empty")).toBeNull();
     expect(screen.queryByTestId("wiki-home")).toBeNull();
 
     resolvePages([
@@ -1287,22 +1313,108 @@ describe("HomePage redesign", () => {
     ]);
 
     expect(await screen.findByTestId("wiki-home")).toBeInTheDocument();
-    expect(screen.queryByTestId("what-happens-next")).toBeNull();
+    expect(screen.queryByTestId("wiki-page-empty")).toBeNull();
+    expect(screen.getByTestId("wiki-page-list")).toBeInTheDocument();
   });
 
-  it("empty state shows greeting plus WhatHappensNextCard, no data zones", async () => {
-    vi.mocked(tauri.listConcepts).mockResolvedValue([]);
-    vi.mocked(tauri.listRecentConcepts).mockResolvedValue([]);
-    vi.mocked(tauri.listRecentMemories).mockResolvedValue([]);
-    vi.mocked(tauri.listRecentRetrievals).mockResolvedValue([]);
-    vi.mocked(tauri.listRecentChanges).mockResolvedValue([]);
+  it("renders one wiki home with the not-ready empty state and both actions wired", async () => {
+    const onCreatePage = vi.fn();
+    const onOpenIntelligenceSettings = vi.fn();
+    const user = userEvent.setup();
+    // No `intelligence-ready` milestone: no local model and no API key, so
+    // page synthesis cannot run at all.
+    vi.mocked(tauri.listOnboardingMilestones).mockResolvedValue([]);
+
+    renderHome({ onCreatePage, onOpenIntelligenceSettings });
+
+    // The one home surface renders — heading, rail, and the empty page slot.
+    await screen.findByRole("heading", { name: "Today in Wenlan" });
+    expect(screen.getByTestId("wiki-context-rail")).toBeInTheDocument();
+    const empty = await screen.findByTestId("wiki-page-empty");
+    expect(screen.queryByTestId("wiki-page-list")).toBeNull();
+
+    // The copy names the precondition instead of promising a deadline.
+    expect(empty).toHaveTextContent(
+      /Wenlan compiles pages from your memories once a local model or an API key is turned on/,
+    );
+    expect(empty).not.toHaveTextContent(/usually within a day/);
+
+    // Both actions are live, not decoration.
+    await user.click(within(empty).getByRole("button", { name: "Turn on a model" }));
+    expect(onOpenIntelligenceSettings).toHaveBeenCalledTimes(1);
+
+    await user.click(within(empty).getByRole("button", { name: "Write a page" }));
+    expect(onCreatePage).toHaveBeenCalledTimes(1);
+    expect(onCreatePage).toHaveBeenCalledWith(null);
+
+    // The ghost outlines still preview what a compiled page will look like.
+    expect(
+      within(empty).getByText("Pages will appear here as Wenlan finds patterns."),
+    ).toBeInTheDocument();
+  });
+
+  it("promises compiled pages only once a provider has served traffic", async () => {
+    const onCreatePage = vi.fn();
+    const onOpenIntelligenceSettings = vi.fn();
+    const user = userEvent.setup();
+    vi.mocked(tauri.listOnboardingMilestones).mockResolvedValue([
+      intelligenceReadyMilestone(),
+    ]);
+
+    renderHome({ onCreatePage, onOpenIntelligenceSettings });
+
+    const empty = await screen.findByTestId("wiki-page-empty");
+    await waitFor(() =>
+      expect(empty).toHaveTextContent(
+        /Wenlan compiles pages as patterns emerge in your memories, usually within a day of regular use/,
+      ),
+    );
+    expect(empty).not.toHaveTextContent(/an API key is turned on/);
+
+    // Nothing to turn on, so only the write action is offered.
+    expect(within(empty).queryByRole("button", { name: "Turn on a model" })).toBeNull();
+    await user.click(within(empty).getByRole("button", { name: "Write a page" }));
+    expect(onCreatePage).toHaveBeenCalledWith(null);
+    expect(onOpenIntelligenceSettings).not.toHaveBeenCalled();
+  });
+
+  it("keeps Where AI looked on the home surface when there are no pages yet", async () => {
+    vi.mocked(tauri.listRecentRetrievals).mockResolvedValue([
+      {
+        timestamp_ms: Date.now(),
+        agent_name: "claude-code",
+        query: "positioning",
+        page_titles: ["Wenlan positioning"],
+        page_ids: ["page-positioning"],
+        memory_snippets: [],
+      },
+    ]);
+
     renderHome();
-    expect(await screen.findByTestId("what-happens-next")).toBeInTheDocument();
-    expect(screen.getByTestId("greeting")).toBeInTheDocument();
-    expect(screen.queryByTestId("worth-a-glance")).toBeNull();
-    expect(screen.queryByTestId("refining")).toBeNull();
-    expect(screen.queryByTestId("connections")).toBeNull();
-    expect(screen.queryByTestId("retrievals")).toBeNull();
+
+    const home = await screen.findByTestId("wiki-home");
+    expect(await screen.findByTestId("wiki-page-empty")).toBeInTheDocument();
+    const retrievals = within(home).getByTestId("retrievals");
+    expect(within(retrievals).getByText(/Where AI looked/i)).toBeInTheDocument();
+    expect(within(retrievals).getByText(/Claude Code/)).toBeInTheDocument();
+  });
+
+  it("shows the page list and no empty state once pages exist", async () => {
+    const onCreatePage = vi.fn();
+    const onOpenIntelligenceSettings = vi.fn();
+    vi.mocked(tauri.listPages).mockResolvedValue([
+      page({ id: "page-architecture", title: "Wenlan app architecture" }),
+    ]);
+
+    renderHome({ onCreatePage, onOpenIntelligenceSettings });
+
+    await screen.findByTestId("wiki-page-list");
+    expect(screen.queryByTestId("wiki-page-empty")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Turn on a model" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Write a page" })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: /open Wenlan app architecture/i }),
+    ).toBeInTheDocument();
   });
 
   it("shows a load-error state with retry in the needs-review rail when the queue fetch fails and the queue is empty, never All caught up", async () => {

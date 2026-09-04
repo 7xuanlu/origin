@@ -6,22 +6,18 @@ import { useTranslation } from "react-i18next";
 import {
   getMemoryStats,
   listEntities,
-  listRecentChanges,
   listRecentRetrievals,
   type MemoryStats,
   type Page,
+  type RetrievalEvent,
 } from "../../lib/tauri";
 import { isKnowledgePage, listAllActivePages } from "./pages/listAllPages";
-import { Greeting } from "./Greeting";
 import { useReviewQueue, reviewItemId, type ReviewItem } from "./useReviewQueue";
 import ReviewDialog, {
   reviewKindLabel,
   useReviewItemSummary,
 } from "./ReviewDialog";
-import { RefiningList } from "./RefiningList";
-import { ConnectionsList } from "./ConnectionsList";
 import { RetrievalsList } from "./RetrievalsList";
-import { WhatHappensNextCard, type HomePageState } from "../onboarding/WhatHappensNextCard";
 import { GhostPagesRow } from "../onboarding/GhostPagesRow";
 import { useMilestones } from "../onboarding/useMilestones";
 import { FirstPageModal } from "../onboarding/FirstPageModal";
@@ -34,25 +30,14 @@ interface HomePageProps {
   onNavigateGraph: () => void;
   onSelectPage?: (pageId: string) => void;
   onOpenDistillReview?: () => void;
+  /** Starts the same new-page draft flow the Wiki overview's New page action uses. */
+  onCreatePage?: (space: string | null) => void;
+  /** Opens Settings → Intelligence, where a local model is installed or an API key is set. */
+  onOpenIntelligenceSettings?: () => void;
 }
 
 const FIRST_CONCEPT_SHOWN_KEY = "onboarding:firstConceptShownCount";
 const MAX_MODAL_SHOWS = 3;
-
-function deriveHomePageState(params: {
-  intelligenceReady: boolean;
-  memoryCount: number;
-  conceptCount: number;
-}): HomePageState {
-  // Pages take precedence over memories: if any page exists the home page is
-  // "alive", even if memories were subsequently deleted. The local counter
-  // still uses the legacy concept name because the daemon activity contract
-  // has not been renamed yet.
-  if (params.conceptCount > 0) return "alive";
-  if (params.memoryCount > 0) return "gathering";
-  if (params.intelligenceReady) return "listening";
-  return "seed";
-}
 
 export default function HomePage({
   onNavigateMemory,
@@ -61,17 +46,12 @@ export default function HomePage({
   onNavigateGraph: _onNavigateGraph,
   onSelectPage,
   onOpenDistillReview,
+  onCreatePage,
+  onOpenIntelligenceSettings,
 }: HomePageProps) {
-  const { t } = useTranslation();
   const { data: retrievals = [] } = useQuery({
     queryKey: ["recentRetrievals"],
     queryFn: () => listRecentRetrievals(12),
-    refetchInterval: 30_000,
-  });
-
-  const { data: changes = [] } = useQuery({
-    queryKey: ["recentChanges"],
-    queryFn: () => listRecentChanges(3),
     refetchInterval: 30_000,
   });
 
@@ -87,9 +67,6 @@ export default function HomePage({
     refetchInterval: 10_000,
   });
 
-  const memoryCount = stats?.total ?? 0;
-  const conceptCount = recentConcepts.length;
-  const hasPages = recentConcepts.length > 0;
   const recentlyRefinedPages = useMemo(
     () =>
       [...recentConcepts]
@@ -99,14 +76,11 @@ export default function HomePage({
   );
 
   const { milestones, acknowledge } = useMilestones();
+  // Only true once an LLM provider has actually served traffic, so it is the
+  // honest switch between "pages cannot compile yet" and "pages are coming".
   const intelligenceReady = milestones.some(
     (m) => m.id === "intelligence-ready" && m.first_triggered_at != null,
   );
-  const firstTriggeredAt = milestones.find((m) => m.id === "intelligence-ready")
-    ?.first_triggered_at;
-  const daysInListening = firstTriggeredAt
-    ? Math.floor((Date.now() / 1000 - firstTriggeredAt) / 86_400)
-    : 0;
 
   const firstConceptMs = milestones.find(
     (m) => m.id === "first-concept" && m.acknowledged_at == null,
@@ -117,12 +91,6 @@ export default function HomePage({
   const firstConcept = firstConceptData?.page_id
     ? recentConcepts.find((c) => c.id === firstConceptData.page_id)
     : null;
-
-  const homePageState = deriveHomePageState({
-    intelligenceReady,
-    memoryCount,
-    conceptCount,
-  });
 
   // Track whether we've incremented shown_count for the current first-concept
   // modal instance, so StrictMode double-invokes don't double-count.
@@ -152,109 +120,36 @@ export default function HomePage({
     !!firstConceptMs &&
     firstConceptShownCount <= MAX_MODAL_SHOWS;
 
-  const isEmpty =
-    retrievals.length === 0 &&
-    changes.length === 0;
-
-  const distillReviewEntry = onOpenDistillReview ? (
-    <div style={{ display: "flex", justifyContent: "flex-end", margin: "-4px 0 10px" }}>
-      <button
-        type="button"
-        onClick={onOpenDistillReview}
-        style={{
-          border: "1px solid var(--mem-border)",
-          background: "var(--mem-surface)",
-          color: "var(--mem-text)",
-          borderRadius: 8,
-          padding: "7px 11px",
-          fontSize: 13,
-          cursor: "pointer",
-        }}
-      >
-        {t("home.reviewPageChanges")}
-      </button>
-    </div>
-  ) : null;
+  // The ghost preview keeps the first-page glow the old greeting layout had:
+  // a pending first-concept milestone that is not already being celebrated by
+  // the modal.
+  const firstConceptHighlight =
+    !shouldShowFirstConceptModal &&
+    milestones.some((m) => m.id === "first-concept" && m.acknowledged_at == null);
 
   // The "recent-concepts" query has never resolved right after onboarding
   // (HomePage isn't mounted during the wizard), so its default `[]` would
-  // otherwise make hasPages look like "no pages" and flash the never-
-  // onboarded seed state before the real page list arrives.
+  // otherwise be read as "no pages" and flash the empty state before the real
+  // page list arrives.
   if (recentConceptsLoading) {
     return null;
   }
 
-  if (hasPages) {
-    return (
-      <>
-        <WikiHome
-          allPages={recentConcepts}
-          pages={recentlyRefinedPages}
-          stats={stats}
-          onSelectPage={onSelectPage}
-          onOpenDistillReview={onOpenDistillReview}
-          onOpenMemory={onNavigateMemory}
-        />
-
-        {shouldShowFirstConceptModal && firstConcept && (
-          <FirstPageModal
-            page={firstConcept}
-            onOpen={(id) => {
-              localStorage.removeItem(FIRST_CONCEPT_SHOWN_KEY);
-              acknowledge("first-concept");
-              onSelectPage?.(id);
-            }}
-            onDismiss={() => {
-              localStorage.removeItem(FIRST_CONCEPT_SHOWN_KEY);
-              acknowledge("first-concept");
-            }}
-          />
-        )}
-      </>
-    );
-  }
-
   return (
-    <div className="flex flex-col gap-8 pb-16">
-      <Greeting memoryCount={memoryCount} pageCount={conceptCount} />
-
-      {isEmpty ? (
-        <>
-          <WhatHappensNextCard
-            state={homePageState}
-            memoryCount={memoryCount}
-            daysInListening={daysInListening}
-          />
-          {distillReviewEntry}
-          <MilestoneHighlight
-            active={
-              !shouldShowFirstConceptModal &&
-              milestones.some(
-                (m) => m.id === "first-concept" && m.acknowledged_at == null,
-              )
-            }
-            onSeen={() => {}}
-            intensity="full"
-          >
-            <section>
-              <GhostPagesRow />
-            </section>
-          </MilestoneHighlight>
-        </>
-      ) : (
-        <>
-          {distillReviewEntry}
-          <RefiningList changes={changes} pages={recentConcepts} onSelectPage={onSelectPage} />
-          <RetrievalsList
-            events={retrievals}
-            onSelectPageById={(pageId) => onSelectPage?.(pageId)}
-          />
-          <ConnectionsList
-            onSelectPage={onSelectPage}
-            onSelectEntity={undefined}
-          />
-        </>
-      )}
+    <>
+      <WikiHome
+        allPages={recentConcepts}
+        pages={recentlyRefinedPages}
+        stats={stats}
+        retrievals={retrievals}
+        intelligenceReady={intelligenceReady}
+        firstConceptHighlight={firstConceptHighlight}
+        onSelectPage={onSelectPage}
+        onOpenDistillReview={onOpenDistillReview}
+        onOpenMemory={onNavigateMemory}
+        onCreatePage={onCreatePage}
+        onOpenIntelligenceSettings={onOpenIntelligenceSettings}
+      />
 
       {shouldShowFirstConceptModal && firstConcept && (
         <FirstPageModal
@@ -270,7 +165,7 @@ export default function HomePage({
           }}
         />
       )}
-    </div>
+    </>
   );
 }
 
@@ -344,16 +239,28 @@ function WikiHome({
   allPages,
   pages,
   stats,
+  retrievals,
+  intelligenceReady,
+  firstConceptHighlight,
   onSelectPage,
   onOpenDistillReview,
   onOpenMemory,
+  onCreatePage,
+  onOpenIntelligenceSettings,
 }: {
   allPages: Page[];
   pages: Page[];
   stats?: MemoryStats;
+  retrievals: RetrievalEvent[];
+  /** An LLM provider has served traffic, so page synthesis can actually run. */
+  intelligenceReady: boolean;
+  /** Glow the ghost preview while the first-page milestone is unseen. */
+  firstConceptHighlight: boolean;
   onSelectPage?: (pageId: string) => void;
   onOpenDistillReview?: () => void;
   onOpenMemory?: (sourceId: string) => void;
+  onCreatePage?: (space: string | null) => void;
+  onOpenIntelligenceSettings?: () => void;
 }) {
   const [containerRef, isWideLayout] = useElementMinWidth<HTMLDivElement>(820);
   const {
@@ -411,11 +318,20 @@ function WikiHome({
           minWidth: 0,
         }}
       >
-        <PageList
-          pages={pages}
-          onSelectPage={onSelectPage}
-          isWideLayout={isWideLayout}
-        />
+        {allPages.length === 0 ? (
+          <HomeEmptyState
+            intelligenceReady={intelligenceReady}
+            milestoneActive={firstConceptHighlight}
+            onCreatePage={onCreatePage}
+            onOpenIntelligenceSettings={onOpenIntelligenceSettings}
+          />
+        ) : (
+          <PageList
+            pages={pages}
+            onSelectPage={onSelectPage}
+            isWideLayout={isWideLayout}
+          />
+        )}
         <NeedsReviewRail
           items={decisionItems}
           isLoading={reviewLoading}
@@ -427,6 +343,15 @@ function WikiHome({
           leadsColumn={!isWideLayout && decisionItems.length > 0}
         />
       </div>
+
+      {/* Full width under the page area rather than inside the review column:
+          a retrieval row carries the agent, the query it ran, and the pages it
+          hit, which needs the whole measure at >=820px and reads as the same
+          single column below it. */}
+      <RetrievalsList
+        events={retrievals}
+        onSelectPageById={(pageId) => onSelectPage?.(pageId)}
+      />
 
       <ReviewDialog
         items={decisionItems}
@@ -504,6 +429,96 @@ function TodayHeader({ pages }: { pages: Page[] }) {
           </span>
         }
       />
+    </section>
+  );
+}
+
+const EMPTY_ACTION_STYLE: React.CSSProperties = {
+  fontFamily: "var(--mem-font-body)",
+  fontSize: 13,
+  borderRadius: 8,
+  padding: "7px 12px",
+  cursor: "pointer",
+};
+
+/**
+ * What the page list says when the library has no pages yet.
+ *
+ * Page synthesis is LLM-gated: distill and the refinery no-op without a
+ * provider, so a library with no local model and no API key will never grow a
+ * page on its own. The two variants keep that honest — the not-ready copy
+ * names the precondition and offers the setting that removes it, and only the
+ * ready copy is allowed to promise pages are coming.
+ */
+function HomeEmptyState({
+  intelligenceReady,
+  milestoneActive,
+  onCreatePage,
+  onOpenIntelligenceSettings,
+}: {
+  intelligenceReady: boolean;
+  milestoneActive: boolean;
+  onCreatePage?: (space: string | null) => void;
+  onOpenIntelligenceSettings?: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <section data-testid="wiki-page-empty">
+      <p
+        style={{
+          fontFamily: "var(--mem-font-body)",
+          fontSize: 14,
+          color: "var(--mem-text-secondary)",
+          lineHeight: 1.6,
+          margin: "0 0 14px",
+          maxWidth: "62ch",
+        }}
+      >
+        {intelligenceReady
+          ? t("home.empty.compiling")
+          : t("home.empty.needsProvider")}
+      </p>
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 24 }}>
+        {!intelligenceReady && onOpenIntelligenceSettings && (
+          <button
+            type="button"
+            onClick={onOpenIntelligenceSettings}
+            style={{
+              ...EMPTY_ACTION_STYLE,
+              border: "1px solid var(--mem-accent-indigo)",
+              background: "var(--mem-indigo-bg)",
+              color: "var(--mem-accent-indigo)",
+            }}
+          >
+            {t("home.empty.turnOnModel")}
+          </button>
+        )}
+        {onCreatePage && (
+          <button
+            type="button"
+            onClick={() => onCreatePage(null)}
+            style={{
+              ...EMPTY_ACTION_STYLE,
+              border: "1px solid var(--mem-border)",
+              background: "var(--mem-surface)",
+              color: "var(--mem-text)",
+            }}
+          >
+            {t("home.empty.writePage")}
+          </button>
+        )}
+      </div>
+
+      <MilestoneHighlight
+        active={milestoneActive}
+        onSeen={() => {}}
+        intensity="full"
+      >
+        <div>
+          <GhostPagesRow />
+        </div>
+      </MilestoneHighlight>
     </section>
   );
 }
