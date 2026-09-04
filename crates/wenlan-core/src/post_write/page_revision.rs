@@ -76,7 +76,16 @@ async fn resolve_page_revision_card(
         revision_id: payload.revision_id,
         page_version,
         source_revision,
-        content: payload.content,
+        // The staged body, not the one chunk of it this row happens to
+        // carry. `full_body` is `Some` exactly when the card spans several
+        // chunk rows, which is the only case where `content` is a fragment.
+        //
+        // The `content` fallback is the ordinary path, not a legacy one: it
+        // carries every page short enough to stage as a single row, and every
+        // card a human has edited, since editing collapses a card to one row
+        // holding the whole edited body. Do not turn this into an `expect` --
+        // it would panic on both.
+        content: payload.full_body.unwrap_or(payload.content),
         source_memory_ids,
     }))
 }

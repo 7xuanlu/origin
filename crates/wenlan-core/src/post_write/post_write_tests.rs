@@ -5082,6 +5082,641 @@ async fn accept_pending_revision_page_write_card_with_matching_source_revision_w
     );
 }
 
+/// Issue #650: a page long enough to chunk must survive its own accept.
+///
+/// `memories` stores one row per chunk, and every chunk of a staged card
+/// shares the card's `source_id` and `last_modified`. A read that takes one
+/// row therefore returns an arbitrary fragment, which the accept path then
+/// writes as the page's complete new body -- observed live turning a 21,038
+/// character page into 1,814. The staged card is not at fault:
+/// `stage_page_revision_card` puts the whole body in `source_text` on every
+/// chunk row, so the whole body is always there to be read.
+///
+/// The chunking assertion below is the test's own gate: a fixture that never
+/// split would pass against the broken read and prove nothing. The splitters
+/// cap a chunk at 1,500 characters for markdown, 512 for plain text, or 510
+/// BGE tokens with a tokenizer loaded, so this fixture is sized past all of
+/// them.
+#[tokio::test]
+async fn accepting_a_multi_chunk_page_card_keeps_the_whole_body() {
+    let (db, _dir) = test_db().await;
+    let mem_id = "mem_650_multi_chunk";
+    let original_content = "Ownership rules make Rust memory safety explicit";
+    // Kept close to the cited source: the human write runs through the same
+    // hallucination guard, and an unrelated sentence fails it before the test
+    // reaches the behaviour under test.
+    let human_content =
+        "Ownership rules make Rust memory safety explicit. A human maintains this page.";
+
+    // Long enough to split, and structured so the split lands on section
+    // boundaries the way a real wiki page does.
+    let proposed_content = (1..=8)
+        .map(|section| {
+            format!(
+                "## Section {section}\n\n{}\n",
+                format!(
+                    "Paragraph {section} of the proposed revision carries enough prose to \
+                     push this page past the chunker's size budget so the write lands as \
+                     several rows rather than one. "
+                )
+                .repeat(4)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        proposed_content.len() > 1500,
+        "fixture must exceed the character splitter's budget, got {} chars",
+        proposed_content.len()
+    );
+
+    seed_memory(&db, mem_id, original_content).await;
+    let page_id = seed_page(&db, mem_id, original_content).await;
+    update_page(
+        &db,
+        &page_id,
+        UpdatePageRequest {
+            content: human_content.to_string(),
+            source_memory_ids: vec![mem_id.to_string()],
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        },
+        "fs_edit",
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let before = db.get_page(&page_id).await.unwrap().unwrap();
+    let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
+    let card = stage_page_revision_card(
+        &db,
+        &before,
+        &proposed_content,
+        &[mem_id.to_string()],
+        staged_source_revision,
+        "page_growth",
+        None,
+    )
+    .await
+    .unwrap();
+    let card_id = card
+        .revision_card_id
+        .as_deref()
+        .expect("staged page card must return an id");
+
+    // Gate: the card must really have chunked, or the assertions below would
+    // pass against the broken read and prove nothing. The chunk this row
+    // carries being shorter than what was staged is exactly that proof.
+    let payload = db
+        .pending_memory_revision_payload(card_id)
+        .await
+        .unwrap()
+        .expect("the staged card must resolve");
+    assert!(
+        payload.content.len() < proposed_content.len(),
+        "fixture must stage a card that actually chunked: one row already holds \
+         all {} characters",
+        proposed_content.len()
+    );
+    assert_eq!(
+        payload.full_body.as_deref(),
+        Some(proposed_content.as_str()),
+        "the row must expose the whole staged body beside its chunk"
+    );
+
+    // The queue a human reads before clicking accept must show the same body
+    // the accept will write. Previewing one chunk hides what is about to
+    // happen at the exact moment the human is deciding.
+    let queued = db
+        .list_pending_revisions_scoped(10, &crate::read_scope::ReadScope::Global)
+        .await
+        .unwrap();
+    let queued_card = queued
+        .iter()
+        .find(|item| item.revision_source_id == card_id)
+        .expect("the staged card must appear in the pending queue");
+    assert_eq!(
+        queued_card.revision_content,
+        proposed_content,
+        "the review queue must preview the whole staged body, not one chunk \
+         (got {} chars, staged {} chars)",
+        queued_card.revision_content.len(),
+        proposed_content.len()
+    );
+
+    accept_pending_revision(&db, card_id, "test-agent")
+        .await
+        .unwrap();
+
+    let after = db.get_page(&page_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.content,
+        proposed_content,
+        "accepting a chunked card must write the whole staged body, not one chunk \
+         (got {} chars, staged {} chars)",
+        after.content.len(),
+        proposed_content.len()
+    );
+}
+
+/// Recovering the whole staged body must not smuggle raw personal data past
+/// the redaction the chunk rows already carry.
+///
+/// `upsert_documents` runs `redact_pii` on `content` before chunking but copies
+/// `source_text` in verbatim, so a read that recovers the body from
+/// `source_text` and hands it straight to the accept path would write an email
+/// address or a card number into the page and into its exported markdown --
+/// worse than the truncation of issue #650, and silent in the same way.
+#[tokio::test]
+async fn accepting_a_chunked_page_card_keeps_the_redaction_its_chunks_carry() {
+    let (db, _dir) = test_db().await;
+    let mem_id = "mem_650_redaction";
+    let original_content = "Ownership rules make Rust memory safety explicit";
+    let human_content =
+        "Ownership rules make Rust memory safety explicit. A human maintains this page.";
+
+    let leak = "alice@example.com";
+    let proposed_content = (1..=8)
+        .map(|section| {
+            format!(
+                "## Section {section}\n\n{}Reach the maintainer at {leak} for details.\n",
+                "Paragraph of the proposed revision, long enough that this page \
+                 splits into several rows rather than one. "
+                    .repeat(4)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    seed_memory(&db, mem_id, original_content).await;
+    let page_id = seed_page(&db, mem_id, original_content).await;
+    update_page(
+        &db,
+        &page_id,
+        UpdatePageRequest {
+            content: human_content.to_string(),
+            source_memory_ids: vec![mem_id.to_string()],
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        },
+        "fs_edit",
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let before = db.get_page(&page_id).await.unwrap().unwrap();
+    let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
+    let card = stage_page_revision_card(
+        &db,
+        &before,
+        &proposed_content,
+        &[mem_id.to_string()],
+        staged_source_revision,
+        "page_growth",
+        None,
+    )
+    .await
+    .unwrap();
+    let card_id = card
+        .revision_card_id
+        .as_deref()
+        .expect("staged page card must return an id");
+
+    // Gate: the card must have chunked, or the accept reads `content` and this
+    // test stops covering the recovered-body path it exists for.
+    let payload = db
+        .pending_memory_revision_payload(card_id)
+        .await
+        .unwrap()
+        .expect("the staged card must resolve");
+    assert!(
+        payload.full_body.is_some(),
+        "fixture must stage a card that actually chunked, or the redaction \
+         under test is never reached"
+    );
+
+    accept_pending_revision(&db, card_id, "test-agent")
+        .await
+        .unwrap();
+
+    let after = db.get_page(&page_id).await.unwrap().unwrap();
+    assert!(
+        !after.content.contains(leak),
+        "the raw address must never reach the page body"
+    );
+    assert!(
+        after.content.contains("[REDACTED:EMAIL]"),
+        "the page must carry the same redaction marker the chunk rows do"
+    );
+    assert_eq!(
+        after.content,
+        crate::privacy::redact_pii(&proposed_content),
+        "the page must equal the staged body with exactly the write-time \
+         redaction applied, nothing more and nothing less"
+    );
+}
+
+/// A human edit to a staged card is what its accept must write.
+///
+/// `apply_memory_update` rewrites chunk zero and deletes the rest without
+/// touching `source_text`, so an edited card is one row whose `source_text`
+/// still holds the body from before the edit. Recovering the body from that
+/// column unconditionally would revert the edit at the moment of accepting it
+/// -- the same silent wrong-body write as issue #650, pointed the other way.
+#[tokio::test]
+async fn accepting_an_edited_page_card_writes_the_edit_not_the_staged_body() {
+    let (db, _dir) = test_db().await;
+    let mem_id = "mem_650_edited";
+    let original_content = "Ownership rules make Rust memory safety explicit";
+    let human_content =
+        "Ownership rules make Rust memory safety explicit. A human maintains this page.";
+
+    // Staged long enough to chunk, so the row starts out in exactly the shape
+    // issue #650 is about.
+    let proposed_content = (1..=8)
+        .map(|section| {
+            format!(
+                "## Section {section}\n\n{}\n",
+                "Paragraph of the proposed revision, long enough that this page \
+                 splits into several rows rather than one. "
+                    .repeat(4)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    seed_memory(&db, mem_id, original_content).await;
+    let page_id = seed_page(&db, mem_id, original_content).await;
+    update_page(
+        &db,
+        &page_id,
+        UpdatePageRequest {
+            content: human_content.to_string(),
+            source_memory_ids: vec![mem_id.to_string()],
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        },
+        "fs_edit",
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let before = db.get_page(&page_id).await.unwrap().unwrap();
+    let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
+    let card = stage_page_revision_card(
+        &db,
+        &before,
+        &proposed_content,
+        &[mem_id.to_string()],
+        staged_source_revision,
+        "page_growth",
+        None,
+    )
+    .await
+    .unwrap();
+    let card_id = card
+        .revision_card_id
+        .as_deref()
+        .expect("staged page card must return an id");
+
+    // Gate: the card chunked, so before the edit the whole body is only
+    // reachable through `source_text`.
+    let staged = db
+        .pending_memory_revision_payload(card_id)
+        .await
+        .unwrap()
+        .expect("the staged card must resolve");
+    assert_eq!(
+        staged.full_body.as_deref(),
+        Some(proposed_content.as_str()),
+        "a chunked card must expose its whole staged body"
+    );
+
+    let edited_content = format!("{proposed_content}\n## Reviewed\n\nA human rewrote the end.\n");
+    update_memory(
+        &db,
+        card_id,
+        MemoryUpdate {
+            content: Some(&edited_content),
+            space: None,
+            confirm: false,
+            memory_type: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // The edit collapsed the card to one row, so `content` is authoritative
+    // again and the stale `source_text` must be left alone.
+    let edited = db
+        .pending_memory_revision_payload(card_id)
+        .await
+        .unwrap()
+        .expect("the edited card must resolve");
+    assert_eq!(
+        edited.content, edited_content,
+        "the edited card's own row must hold the whole edited body"
+    );
+    assert_eq!(
+        edited.full_body, None,
+        "an unchunked card must not offer a body recovered from the stale \
+         `source_text` it kept from before the edit"
+    );
+
+    let queued = db
+        .list_pending_revisions_scoped(10, &crate::read_scope::ReadScope::Global)
+        .await
+        .unwrap();
+    let queued_card = queued
+        .iter()
+        .find(|item| item.revision_source_id == card_id)
+        .expect("the edited card must appear in the pending queue");
+    assert_eq!(
+        queued_card.revision_content, edited_content,
+        "the review queue must preview the edit, not the body staged before it"
+    );
+
+    accept_pending_revision(&db, card_id, "test-agent")
+        .await
+        .unwrap();
+
+    let after = db.get_page(&page_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.content, edited_content,
+        "accepting an edited card must write the edit, not the staged body it \
+         replaced"
+    );
+}
+
+/// A recovered body must be grounded against the date the card was staged,
+/// which is not the date of the last edit to its row.
+///
+/// `upsert_documents` grounds `content` against the document's `last_modified`
+/// and stores that same value in `created_at`, so at insert the two agree.
+/// They stop agreeing afterwards: `apply_memory_update` bumps `last_modified`
+/// on every call, and its sibling-chunk delete sits inside the content branch,
+/// so a metadata-only edit -- confirming the card, or moving it to another
+/// space -- moves the timestamp while leaving the card chunked. Anchoring the
+/// recovered body on `last_modified` would then ground "yesterday" against the
+/// date of that unrelated edit, and the page would get a date that was never
+/// staged.
+///
+/// This is also the only coverage of the grounding branch at all: it is off by
+/// default, so every other test here exercises redaction alone.
+#[tokio::test]
+async fn a_recovered_body_grounds_against_the_staging_date_not_a_later_edit() {
+    let (db, _dir) = test_db().await;
+    let target_id = "mem_650_grounding_target";
+    let card_id = "mem_650_grounding_card";
+
+    // Far enough back that "yesterday" resolves to a different calendar day
+    // than it would today, so the two anchors cannot coincide.
+    let staged_at = chrono::Utc::now() - chrono::Duration::days(90);
+    let expected_day = (staged_at - chrono::Duration::days(1))
+        .date_naive()
+        .to_string();
+    let wrong_day = (chrono::Utc::now() - chrono::Duration::days(1))
+        .date_naive()
+        .to_string();
+
+    // Long enough to chunk, so the body is only reachable through the
+    // recovered-body path this test is about.
+    let body = format!(
+        "We agreed on the retention rule yesterday. {}",
+        "Supporting prose that pushes this card past the chunker's budget. ".repeat(60)
+    );
+
+    temp_env::async_with_vars([("WENLAN_ENABLE_TEMPORAL_GROUNDING", Some("1"))], async {
+        seed_memory(&db, target_id, "The retention rule is under discussion").await;
+
+        let card = crate::sources::RawDocument {
+            source: "memory".to_string(),
+            source_id: card_id.to_string(),
+            title: "Revision: retention".to_string(),
+            content: body.clone(),
+            last_modified: staged_at.timestamp(),
+            memory_type: Some("fact".to_string()),
+            source_agent: Some("test".to_string()),
+            confidence: Some(0.9),
+            supersedes: Some(target_id.to_string()),
+            pending_revision: true,
+            source_text: Some(body.clone()),
+            ..Default::default()
+        };
+        db.upsert_documents(vec![card]).await.unwrap();
+
+        // A metadata-only edit: it bumps `last_modified` to now and leaves
+        // every sibling chunk in place.
+        update_memory(
+            &db,
+            card_id,
+            MemoryUpdate {
+                content: None,
+                space: None,
+                confirm: true,
+                memory_type: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let payload = db
+            .pending_memory_revision_payload(card_id)
+            .await
+            .unwrap()
+            .expect("the staged card must resolve");
+        let full_body = payload
+            .full_body
+            .expect("a chunked card must expose its whole staged body");
+
+        assert!(
+            full_body.contains(&format!("yesterday ({expected_day})")),
+            "the recovered body must ground against the staging date; got: {}",
+            &full_body[..full_body.len().min(120)]
+        );
+        assert!(
+            !full_body.contains(&wrong_day),
+            "the recovered body must not ground against the date of the \
+                 later metadata edit ({wrong_day})"
+        );
+    })
+    .await;
+}
+
+/// The whole staged body must survive an accept at every length, not just the
+/// one the other tests happen to use.
+///
+/// Issue #650 is a chunk-boundary bug, so a single fixture size proves the fix
+/// only at that size. This sweeps lengths across both budgets that decide
+/// whether a card chunks at all -- 1,500 characters for markdown, 512 for
+/// plain text -- and past them, so the crossing itself is covered rather than
+/// approximated. A staged card takes the plain-text splitter, because
+/// `upsert_documents` hands the chunker the card's `source_id` as its path and
+/// that has no markdown extension.
+///
+/// Compared after `trim_end`: `text_splitter` trims chunk edges, so a
+/// single-chunk body ending in a newline round-trips without it. That is
+/// pre-existing and whitespace-only, and no rule requires a trailing newline.
+#[tokio::test]
+async fn a_page_card_survives_its_accept_at_every_length() {
+    let (db, _dir) = test_db().await;
+
+    for (case, filler_repeats) in [
+        ("tiny", 1),
+        ("under", 6),
+        ("at", 8),
+        ("over", 10),
+        ("wide", 60),
+    ] {
+        let mem_id = format!("mem_650_sweep_{case}");
+        let original_content = "Ownership rules make Rust memory safety explicit";
+        let human_content =
+            "Ownership rules make Rust memory safety explicit. A human maintains this page.";
+        let proposed_content = format!(
+            "## Section for {case}\n\n{}Reach the maintainer at sweep@example.com.\n",
+            "Prose that lengthens this body one repeat at a time. ".repeat(filler_repeats)
+        );
+
+        seed_memory(&db, &mem_id, original_content).await;
+        let page_id = seed_page(&db, &mem_id, original_content).await;
+        update_page(
+            &db,
+            &page_id,
+            UpdatePageRequest {
+                content: human_content.to_string(),
+                source_memory_ids: vec![mem_id.clone()],
+                expected_version: None,
+                caller_id: None,
+                operation_id: None,
+            },
+            "fs_edit",
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let before = db.get_page(&page_id).await.unwrap().unwrap();
+        let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
+        let card = stage_page_revision_card(
+            &db,
+            &before,
+            &proposed_content,
+            std::slice::from_ref(&mem_id),
+            staged_source_revision,
+            "page_growth",
+            None,
+        )
+        .await
+        .unwrap();
+        let card_id = card
+            .revision_card_id
+            .as_deref()
+            .expect("staged page card must return an id");
+
+        accept_pending_revision(&db, card_id, "test-agent")
+            .await
+            .unwrap();
+
+        let after = db.get_page(&page_id).await.unwrap().unwrap();
+        let expected = crate::privacy::redact_pii(&proposed_content);
+        assert_eq!(
+            after.content.trim_end(),
+            expected.trim_end(),
+            "case {case} ({} chars staged) came back as {} chars",
+            proposed_content.len(),
+            after.content.len()
+        );
+        assert!(
+            !after.content.contains("sweep@example.com"),
+            "case {case} leaked the raw address into the page"
+        );
+    }
+}
+
+/// The queue must keep previewing a memory card's stored `content`.
+///
+/// Only a page card previews `source_text`. On a memory card `source_text` is
+/// the prose the row was distilled from, which its accept never writes, so
+/// previewing it would show the human text that accepting cannot produce.
+#[tokio::test]
+async fn a_memory_revision_card_still_previews_its_stored_content() {
+    let (db, _dir) = test_db().await;
+    let target_id = "mem_650_memory_target";
+    seed_memory(&db, target_id, "Postgres stores JSON in a JSONB column").await;
+
+    // Both bodies are long enough to chunk. A single-chunk fixture would take
+    // the not-chunked arm whatever the page flag said, so deleting the page
+    // check from the preview would leave this test green while a real chunked
+    // memory card started previewing prose its accept never stores.
+    let stored = format!(
+        "CANONICAL-CLAIM-MARKER. {}",
+        "Postgres stores JSON in a JSONB column, which is indexable. ".repeat(40)
+    );
+    let pre_distillation = format!(
+        "PRE-DISTILLATION-MARKER. {}",
+        "So anyway I looked it up and Postgres has this JSONB thing. ".repeat(40)
+    );
+    let card = crate::sources::RawDocument {
+        source: "memory".to_string(),
+        source_id: "mem_650_memory_card".to_string(),
+        title: "Revision: Postgres".to_string(),
+        content: stored.clone(),
+        last_modified: chrono::Utc::now().timestamp(),
+        memory_type: Some("fact".to_string()),
+        source_agent: Some("test".to_string()),
+        confidence: Some(0.9),
+        supersedes: Some(target_id.to_string()),
+        pending_revision: true,
+        source_text: Some(pre_distillation.clone()),
+        ..Default::default()
+    };
+    db.upsert_documents(vec![card]).await.unwrap();
+
+    // Gate: the card really chunked, so the page check is the only thing
+    // keeping its preview off `source_text`.
+    let payload = db
+        .pending_memory_revision_payload("mem_650_memory_card")
+        .await
+        .unwrap()
+        .expect("the memory card must resolve");
+    assert!(
+        payload.content.len() < stored.len(),
+        "fixture must stage a memory card that actually chunked"
+    );
+
+    let queued = db
+        .list_pending_revisions_scoped(10, &crate::read_scope::ReadScope::Global)
+        .await
+        .unwrap();
+    let item = queued
+        .iter()
+        .find(|item| item.revision_source_id == "mem_650_memory_card")
+        .expect("the memory card must appear in the pending queue");
+    assert!(
+        item.revision_content.contains("CANONICAL-CLAIM-MARKER"),
+        "a memory card previews the text its accept stores"
+    );
+    assert!(
+        !item.revision_content.contains("PRE-DISTILLATION-MARKER"),
+        "a memory card must never preview the prose it was distilled from: \
+         accepting it would not write that text"
+    );
+}
+
 /// Proves the source_revision fence is actually wired end-to-end through
 /// the daemon-internal path a machine refresh uses to reach a human-owned
 /// page's gate: `update_page_at_source_revision` (the same wrapper
