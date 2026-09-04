@@ -191,21 +191,24 @@ describe("App - first-run wizard gate", () => {
         resolveWizard = resolve;
       }),
     );
-    const { container } = renderApp();
+    renderApp();
 
     const status = await screen.findByRole("status");
     expect(status).toHaveTextContent(STARTING_RUNTIME);
     expect(screen.queryByTestId("setup-wizard")).not.toBeInTheDocument();
     expect(screen.queryByTestId("home-main")).not.toBeInTheDocument();
 
-    // The panel owns the whole window (`w-screen h-screen`, centred), so it has
-    // to be a top-level branch of App and not a child of the app shell. Nested
-    // inside `.memory-shell` it would centre itself in the content slot beside
-    // an expanded sidebar and land visibly right of centre in an otherwise
-    // empty window.
-    expect(status.parentElement).toBe(container);
-    expect(status.closest(".memory-shell")).toBeNull();
-    expect(container.querySelector(".memory-shell")).toBeNull();
+    // The panel sizes itself to the whole window and centres its own content,
+    // so it reads correctly only while it keeps those classes. The guard above
+    // — Home is not mounted — is what keeps it out of the app shell; this
+    // asserts the sizing half. Where it actually lands on screen is geometry
+    // jsdom cannot measure: e2e/home-default-window.spec.ts owns that.
+    expect(status).toHaveClass(
+      "w-screen",
+      "h-screen",
+      "items-center",
+      "justify-center",
+    );
     expect(screen.getByTestId("runtime-overlays")).toHaveAttribute(
       "data-variant",
       "updater-only",
