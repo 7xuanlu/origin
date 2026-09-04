@@ -46,6 +46,11 @@ sources, settings, remote access, imports, profile, and review surfaces.
   the hook in `HomePage` rejects three commands on every Review home and breaks
   `e2e/review-flavor.review.spec.ts`. Same rule for any other settings read: ask
   from the component whose copy branches on the answer.
+- Do not put a retrieval list ("Where AI looked") back on the home surface.
+  Agents reading from the library are the Activity view's subject
+  (`ActivityFeed.tsx`, route kind `activity`); home stays the library's own
+  surface. `HomePage.redesign.test.tsx` asserts the section is absent even when
+  the daemon has retrieval events.
 - Do not promise pages will compile when no provider is configured. Page
   synthesis is LLM-gated, so that copy is a lie without a local model or an
   API key.

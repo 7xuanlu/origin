@@ -6,10 +6,8 @@ import { useTranslation } from "react-i18next";
 import {
   getMemoryStats,
   listEntities,
-  listRecentRetrievals,
   type MemoryStats,
   type Page,
-  type RetrievalEvent,
 } from "../../lib/tauri";
 import { isKnowledgePage, listAllActivePages } from "./pages/listAllPages";
 import { useReviewQueue, reviewItemId, type ReviewItem } from "./useReviewQueue";
@@ -17,7 +15,6 @@ import ReviewDialog, {
   reviewKindLabel,
   useReviewItemSummary,
 } from "./ReviewDialog";
-import { RetrievalsList } from "./RetrievalsList";
 import { GhostPagesRow } from "../onboarding/GhostPagesRow";
 import { useMilestones } from "../onboarding/useMilestones";
 import { FirstPageModal } from "../onboarding/FirstPageModal";
@@ -57,12 +54,6 @@ export default function HomePage({
   onCreatePage,
   onOpenIntelligenceSettings,
 }: HomePageProps) {
-  const { data: retrievals = [] } = useQuery({
-    queryKey: ["recentRetrievals"],
-    queryFn: () => listRecentRetrievals(12),
-    refetchInterval: 30_000,
-  });
-
   const { data: recentConcepts = [], isLoading: recentConceptsLoading } = useQuery({
     queryKey: ["recent-concepts"],
     queryFn: listAllActivePages,
@@ -147,7 +138,6 @@ export default function HomePage({
         knowledgePages={knowledgePages}
         pages={recentlyRefinedPages}
         stats={stats}
-        retrievals={retrievals}
         onSelectPage={onSelectPage}
         onOpenDistillReview={onOpenDistillReview}
         onOpenMemory={onNavigateMemory}
@@ -244,7 +234,6 @@ function WikiHome({
   knowledgePages,
   pages,
   stats,
-  retrievals,
   onSelectPage,
   onOpenDistillReview,
   onOpenMemory,
@@ -257,7 +246,6 @@ function WikiHome({
   knowledgePages: Page[];
   pages: Page[];
   stats?: MemoryStats;
-  retrievals: RetrievalEvent[];
   onSelectPage?: (pageId: string) => void;
   onOpenDistillReview?: () => void;
   onOpenMemory?: (sourceId: string) => void;
@@ -344,14 +332,9 @@ function WikiHome({
         />
       </div>
 
-      {/* Full width under the page area rather than inside the review column:
-          a retrieval row carries the agent, the query it ran, and the pages it
-          hit, which needs the whole measure at >=820px and reads as the same
-          single column below it. */}
-      <RetrievalsList
-        events={retrievals}
-        onSelectPageById={(pageId) => onSelectPage?.(pageId)}
-      />
+      {/* No retrieval list here. Agents reading from the library are the
+          Activity view's subject, and home is the library's own surface: pages,
+          what needs review, what changed. */}
 
       <ReviewDialog
         items={decisionItems}
