@@ -18,10 +18,11 @@
 //! the app appeared, showed "Starting the local runtime…", and vanished with no
 //! error UI.
 //!
-//! A shortcut is a convenience; the app is not. So each shortcut is registered
-//! on its own, every failure is a WARN naming the shortcut and the OS error,
-//! and the outcome is recorded in [`GlobalShortcutStatus`] so a surface can
-//! tell the user which keys are dead this session.
+//! A shortcut is a convenience; the app is not. So [`register_all`] attempts
+//! every shortcut on its own, logs a WARN for each refusal, and returns a
+//! [`GlobalShortcutStatus`] a surface can read to say which keys are dead this
+//! session. It takes the registrar as a closure, so the "keep going" rule is
+//! provable without a Tauri app: see the tests at the bottom of this file.
 //!
 //! ## Reading the status from the UI
 //!
@@ -33,13 +34,13 @@
 //! present but not working), and copy in all three locales in
 //! `src/i18n/resources.ts`. Until then the WARN in the app log is the record.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri_plugin_global_shortcut::Shortcut;
 
 /// Which of the app's shortcuts a spec is. An id rather than a comparison
 /// against the parsed `Shortcut`, so a shortcut that failed to register (and
 /// therefore has no parsed value to compare against) is still nameable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ShortcutId {
     /// Summon the main window and focus the search field.
@@ -69,7 +70,7 @@ impl std::fmt::Display for ShortcutId {
 }
 
 /// One shortcut the app wants: what it is for, and the accelerator to ask for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct ShortcutSpec {
     pub id: ShortcutId,
     /// The accelerator exactly as Tauri parses it.
@@ -78,10 +79,11 @@ pub struct ShortcutSpec {
 
 /// Every global shortcut the app registers, in registration order.
 ///
-/// The accelerators are load-bearing history: `toggle-spotlight` and
-/// `show-memory` are still the event names the frontend listens for even though
-/// spotlight mode is retired (see `src/App.tsx`), so changing these changes what
-/// users' fingers already know.
+/// The accelerators are load-bearing: changing one changes what users' fingers
+/// already know. They are not the same names as the Tauri events the handlers
+/// emit in `lib.rs` — `toggle-spotlight` and `show-memory` are event names,
+/// kept from the retired spotlight mode because `src/App.tsx` still listens for
+/// them.
 pub const SHORTCUTS: [ShortcutSpec; 3] = [
     ShortcutSpec {
         id: ShortcutId::ToggleSearch,
@@ -98,7 +100,7 @@ pub const SHORTCUTS: [ShortcutSpec; 3] = [
 ];
 
 /// A shortcut the app holds this session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ActiveShortcut {
     pub id: ShortcutId,
     pub accelerator: String,
@@ -108,7 +110,7 @@ pub struct ActiveShortcut {
 /// the OS/plugin message verbatim (`HotKey already registered: ...`) — a
 /// summarised version would lose the only detail that distinguishes "someone
 /// else holds it" from "this accelerator is not parseable".
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UnavailableShortcut {
     pub id: ShortcutId,
     pub accelerator: String,
@@ -117,25 +119,16 @@ pub struct UnavailableShortcut {
 
 /// What the app got when it asked the OS for its hotkeys. Recorded at startup
 /// and never updated: registration is attempted once, in `setup()`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct GlobalShortcutStatus {
     pub active: Vec<ActiveShortcut>,
     pub unavailable: Vec<UnavailableShortcut>,
 }
 
-impl GlobalShortcutStatus {
-    /// True when every shortcut the app asked for is live. False the moment one
-    /// is not — including when nothing was asked for, which is not a state this
-    /// app reaches but is not "all registered" either.
-    pub fn all_registered(&self) -> bool {
-        !self.active.is_empty() && self.unavailable.is_empty()
-    }
-}
-
 /// Parse a spec's accelerator. Separated from registration so a malformed
 /// accelerator is the same kind of recoverable failure as a taken one, rather
 /// than the `unwrap()` panic it used to be.
-pub fn parse(spec: &ShortcutSpec) -> Result<Shortcut, String> {
+pub fn parse(spec: ShortcutSpec) -> Result<Shortcut, String> {
     spec.accelerator
         .parse::<Shortcut>()
         .map_err(|e| e.to_string())
@@ -143,36 +136,50 @@ pub fn parse(spec: &ShortcutSpec) -> Result<Shortcut, String> {
 
 /// The WARN line for a shortcut the app could not register. Explicit by
 /// construction: it names the shortcut's id, the accelerator the user would
-/// press, the fact that the key is dead for this session, and the OS error.
-pub fn registration_warning(spec: &ShortcutSpec, error: &str) -> String {
+/// press, the fact that the key is dead for this session, and the error.
+///
+/// It offers no cause of its own. The same path carries both "another process
+/// holds this hotkey" and "this accelerator does not parse", and a guess
+/// appended to the second one would be a fabrication — the verbatim error
+/// already says which happened.
+pub fn registration_warning(spec: ShortcutSpec, error: &str) -> String {
     format!(
-        "[shortcuts] global shortcut {} ({}) could not be registered and is unavailable this session; \
-         another application or another Wenlan instance is likely holding it: {error}",
+        "[shortcuts] global shortcut {} ({}) could not be registered and is unavailable this session: {error}",
         spec.id, spec.accelerator
     )
 }
 
-/// Split per-shortcut registration outcomes into what the app holds and what it
-/// lost. Order follows [`SHORTCUTS`] so both lists read the same way every run.
+/// Ask for every shortcut in `specs`, one at a time, and report what came back.
 ///
-/// Takes outcomes rather than doing the registering, so the partition is
-/// testable without a Tauri app or a real hotkey manager.
-pub fn partition_registrations<I>(outcomes: I) -> GlobalShortcutStatus
-where
-    I: IntoIterator<Item = (ShortcutSpec, Result<(), String>)>,
-{
+/// `register` is the caller's registrar — in the app it parses the accelerator
+/// and calls `on_shortcut`; in tests it is a closure. Injecting it is the point:
+/// the rule this function exists to hold is "a refusal never skips the shortcuts
+/// after it", and that rule is only observable from the sequence of calls made,
+/// not from a status computed out of outcomes someone else already gathered.
+///
+/// So: no early return, no `?`, no `break`. Every spec is attempted, every
+/// failure is logged, and the caller gets a status instead of an error.
+pub fn register_all(
+    specs: &[ShortcutSpec],
+    mut register: impl FnMut(ShortcutSpec) -> Result<(), String>,
+) -> GlobalShortcutStatus {
     let mut status = GlobalShortcutStatus::default();
-    for (spec, outcome) in outcomes {
-        match outcome {
+    for &spec in specs {
+        match register(spec) {
             Ok(()) => status.active.push(ActiveShortcut {
                 id: spec.id,
                 accelerator: spec.accelerator.to_string(),
             }),
-            Err(error) => status.unavailable.push(UnavailableShortcut {
-                id: spec.id,
-                accelerator: spec.accelerator.to_string(),
-                error,
-            }),
+            Err(error) => {
+                // Explicit, never swallowed. Logged here rather than at the
+                // call site so no caller can register without reporting.
+                log::warn!("{}", registration_warning(spec, &error));
+                status.unavailable.push(UnavailableShortcut {
+                    id: spec.id,
+                    accelerator: spec.accelerator.to_string(),
+                    error,
+                });
+            }
         }
     }
     status
@@ -193,6 +200,8 @@ pub fn global_shortcut_status(
 mod tests {
     use super::*;
 
+    const TAKEN: &str = "HotKey already registered: HotKey { mods: CONTROL, key: KeyK }";
+
     fn spec(id: ShortcutId) -> ShortcutSpec {
         SHORTCUTS
             .iter()
@@ -208,7 +217,7 @@ mod tests {
         // where it costs nothing.
         for spec in SHORTCUTS {
             assert!(
-                parse(&spec).is_ok(),
+                parse(spec).is_ok(),
                 "{} accelerator {:?} does not parse",
                 spec.id,
                 spec.accelerator
@@ -217,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_list_is_the_three_bindings_the_frontend_listens_for() {
+    fn shortcut_list_is_the_three_bindings_the_app_registers() {
         assert_eq!(
             SHORTCUTS.map(|s| (s.id, s.accelerator)),
             [
@@ -239,17 +248,31 @@ mod tests {
 
     #[test]
     fn a_taken_shortcut_does_not_cost_the_others() {
-        // The regression in one assertion: `Ctrl+K` refused, the other two
-        // still held. `on_shortcuts` used to abort the whole batch instead.
-        let status = partition_registrations([
-            (
-                spec(ShortcutId::ToggleSearch),
-                Err("HotKey already registered: HotKey { mods: CONTROL, key: KeyK }".to_string()),
-            ),
-            (spec(ShortcutId::ShowMemory), Ok(())),
-            (spec(ShortcutId::QuickCapture), Ok(())),
-        ]);
+        // The regression itself. The FIRST shortcut is refused — the exact
+        // shape of the crash, where `Ctrl+K` was already held — and the test
+        // watches the registrar, not just the result: `on_shortcuts` used to
+        // abandon the batch on the first refusal, so the other two were never
+        // even attempted. An early `break` here fails this test.
+        let mut attempted: Vec<ShortcutId> = Vec::new();
 
+        let status = register_all(&SHORTCUTS, |spec| {
+            attempted.push(spec.id);
+            if spec.id == ShortcutId::ToggleSearch {
+                Err(TAKEN.to_string())
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(
+            attempted,
+            vec![
+                ShortcutId::ToggleSearch,
+                ShortcutId::ShowMemory,
+                ShortcutId::QuickCapture,
+            ],
+            "every shortcut must be attempted, including the ones after a refusal"
+        );
         assert_eq!(
             status.active,
             vec![
@@ -268,64 +291,59 @@ mod tests {
             vec![UnavailableShortcut {
                 id: ShortcutId::ToggleSearch,
                 accelerator: "CmdOrCtrl+K".to_string(),
-                error: "HotKey already registered: HotKey { mods: CONTROL, key: KeyK }".to_string(),
+                error: TAKEN.to_string(),
             }]
         );
-        assert!(!status.all_registered());
     }
 
     #[test]
     fn every_failure_keeps_its_own_error() {
-        let status = partition_registrations([
-            (
-                spec(ShortcutId::ToggleSearch),
-                Err("taken by A".to_string()),
-            ),
-            (spec(ShortcutId::ShowMemory), Err("taken by B".to_string())),
-            (spec(ShortcutId::QuickCapture), Ok(())),
-        ]);
+        let status = register_all(&SHORTCUTS, |spec| match spec.id {
+            ShortcutId::ToggleSearch => Err("taken by A".to_string()),
+            ShortcutId::ShowMemory => Err("taken by B".to_string()),
+            ShortcutId::QuickCapture => Ok(()),
+        });
 
         assert_eq!(
             status
                 .unavailable
                 .iter()
-                .map(|u| u.error.as_str())
+                .map(|u| (u.id, u.error.as_str()))
                 .collect::<Vec<_>>(),
-            vec!["taken by A", "taken by B"],
+            vec![
+                (ShortcutId::ToggleSearch, "taken by A"),
+                (ShortcutId::ShowMemory, "taken by B"),
+            ],
         );
         assert_eq!(status.active.len(), 1);
     }
 
     #[test]
-    fn all_registered_only_when_nothing_failed() {
-        let all_ok = partition_registrations(SHORTCUTS.map(|spec| (spec, Ok(()))));
-        assert!(all_ok.all_registered());
-        assert!(all_ok.unavailable.is_empty());
+    fn nothing_is_unavailable_when_every_registration_succeeds() {
+        let status = register_all(&SHORTCUTS, |_| Ok(()));
 
-        // Nothing asked for is not the same claim as nothing refused.
-        assert!(!GlobalShortcutStatus::default().all_registered());
+        assert_eq!(status.active.len(), SHORTCUTS.len());
+        assert!(status.unavailable.is_empty());
     }
 
     #[test]
     fn warning_names_the_shortcut_the_key_and_the_error() {
-        let warning = registration_warning(
-            &spec(ShortcutId::ToggleSearch),
-            "HotKey already registered: HotKey { mods: CONTROL, key: KeyK }",
-        );
+        let warning = registration_warning(spec(ShortcutId::ToggleSearch), TAKEN);
 
         assert!(warning.contains("toggle-search"), "{warning}");
         assert!(warning.contains("CmdOrCtrl+K"), "{warning}");
         assert!(warning.contains("unavailable this session"), "{warning}");
-        assert!(
-            warning.contains("HotKey already registered: HotKey { mods: CONTROL, key: KeyK }"),
-            "{warning}"
-        );
+        assert!(warning.contains(TAKEN), "{warning}");
+        // No invented cause: the same line carries parse failures too, where
+        // "something else is holding it" would be false.
+        assert!(!warning.contains("likely"), "{warning}");
     }
 
     #[test]
     fn status_serializes_with_the_stable_kebab_ids() {
-        let status =
-            partition_registrations([(spec(ShortcutId::QuickCapture), Err("nope".to_string()))]);
+        let status = register_all(&[spec(ShortcutId::QuickCapture)], |_| {
+            Err("nope".to_string())
+        });
         let json = serde_json::to_value(&status).expect("status serializes");
 
         assert_eq!(json["unavailable"][0]["id"], "quick-capture");

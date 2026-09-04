@@ -942,15 +942,17 @@ pub fn run() {
             // at the first refusal — so one taken hotkey also cost the other
             // two — and the `?` carried the error out of `setup()`, which Tauri
             // turns into `Failed to setup app: HotKey already registered: ...`
-            // and a panic, seconds after the window was already visible. See
-            // `global_shortcuts` for the whole story.
+            // and a panic, seconds after the window was already visible.
+            //
+            // `register_all` owns the keep-going rule and the WARN for each
+            // refusal; this closure is only the registrar it drives. See
+            // `global_shortcuts` for the whole story and its tests.
             let shortcut_status = {
                 use crate::global_shortcuts::ShortcutId;
 
-                let mut outcomes = Vec::with_capacity(global_shortcuts::SHORTCUTS.len());
-                for spec in global_shortcuts::SHORTCUTS {
+                global_shortcuts::register_all(&global_shortcuts::SHORTCUTS, |spec| {
                     let handle_for_shortcuts = handle.clone();
-                    let outcome = global_shortcuts::parse(&spec).and_then(|shortcut| {
+                    global_shortcuts::parse(spec).and_then(|shortcut| {
                         app.global_shortcut()
                             .on_shortcut(shortcut, move |_app, _shortcut, event| {
                                 use tauri::Emitter;
@@ -958,79 +960,74 @@ pub fn run() {
                                 if event.state != ShortcutState::Pressed {
                                     return;
                                 }
-                                if spec.id == ShortcutId::ToggleSearch {
-                                    let _ = handle_for_shortcuts.emit("toggle-spotlight", ());
-                                } else if spec.id == ShortcutId::ShowMemory {
-                                    if let Some(window) = handle_for_shortcuts.get_webview_window("main") {
-                                        if window.is_visible().unwrap_or(false) {
-                                            let _ = window.hide();
-                                            set_main_window_dock_visibility(&handle_for_shortcuts, false);
-                                        } else {
-                                            set_main_window_dock_visibility(&handle_for_shortcuts, true);
-                                            let _ = window.show();
-                                            let _ = window.set_focus();
-                                            let _ = handle_for_shortcuts.emit("show-memory", ());
+                                match spec.id {
+                                    ShortcutId::ToggleSearch => {
+                                        let _ = handle_for_shortcuts.emit("toggle-spotlight", ());
+                                    }
+                                    ShortcutId::ShowMemory => {
+                                        if let Some(window) = handle_for_shortcuts.get_webview_window("main") {
+                                            if window.is_visible().unwrap_or(false) {
+                                                let _ = window.hide();
+                                                set_main_window_dock_visibility(&handle_for_shortcuts, false);
+                                            } else {
+                                                set_main_window_dock_visibility(&handle_for_shortcuts, true);
+                                                let _ = window.show();
+                                                let _ = window.set_focus();
+                                                let _ = handle_for_shortcuts.emit("show-memory", ());
+                                            }
                                         }
                                     }
-                                } else if spec.id == ShortcutId::QuickCapture {
-                                    if let Some(window) =
-                                        handle_for_shortcuts.get_webview_window("quick-capture")
-                                    {
-                                        #[cfg(target_os = "macos")]
-                                        #[allow(deprecated)]
+                                    ShortcutId::QuickCapture => {
+                                        if let Some(window) =
+                                            handle_for_shortcuts.get_webview_window("quick-capture")
                                         {
-                                            use cocoa::base::id;
-                                            use raw_window_handle::HasWindowHandle;
-                                            if let Ok(raw_handle) = window.window_handle() {
-                                                if let raw_window_handle::RawWindowHandle::AppKit(appkit) = raw_handle.as_raw() {
-                                                    let ns_view = appkit.ns_view.as_ptr() as id;
-                                                    unsafe {
-                                                        let ns_win: id = objc::msg_send![ns_view, window];
-                                                        let visible: bool = objc::msg_send![ns_win, isVisible];
-                                                        if visible {
-                                                            // orderOut removes the window without
-                                                            // triggering macOS window promotion
-                                                            let _: () = objc::msg_send![ns_win, orderOut: ns_win];
-                                                        } else {
-                                                            // makeKeyAndOrderFront shows + focuses
-                                                            // without activating the app (main stays put)
-                                                            let _: () = objc::msg_send![ns_win, setLevel: 3_i64]; // NSFloatingWindowLevel
-                                                            let _: () = objc::msg_send![ns_win, makeKeyAndOrderFront: ns_win];
-                                                            tauri::async_runtime::spawn({
-                                                                let h = handle_for_shortcuts.clone();
-                                                                async move {
-                                                                    let _ = crate::search::position_quick_capture(h).await;
-                                                                }
-                                                            });
+                                            #[cfg(target_os = "macos")]
+                                            #[allow(deprecated)]
+                                            {
+                                                use cocoa::base::id;
+                                                use raw_window_handle::HasWindowHandle;
+                                                if let Ok(raw_handle) = window.window_handle() {
+                                                    if let raw_window_handle::RawWindowHandle::AppKit(appkit) = raw_handle.as_raw() {
+                                                        let ns_view = appkit.ns_view.as_ptr() as id;
+                                                        unsafe {
+                                                            let ns_win: id = objc::msg_send![ns_view, window];
+                                                            let visible: bool = objc::msg_send![ns_win, isVisible];
+                                                            if visible {
+                                                                // orderOut removes the window without
+                                                                // triggering macOS window promotion
+                                                                let _: () = objc::msg_send![ns_win, orderOut: ns_win];
+                                                            } else {
+                                                                // makeKeyAndOrderFront shows + focuses
+                                                                // without activating the app (main stays put)
+                                                                let _: () = objc::msg_send![ns_win, setLevel: 3_i64]; // NSFloatingWindowLevel
+                                                                let _: () = objc::msg_send![ns_win, makeKeyAndOrderFront: ns_win];
+                                                                tauri::async_runtime::spawn({
+                                                                    let h = handle_for_shortcuts.clone();
+                                                                    async move {
+                                                                        let _ = crate::search::position_quick_capture(h).await;
+                                                                    }
+                                                                });
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
-                                        }
-                                        #[cfg(not(target_os = "macos"))]
-                                        {
-                                            if window.is_visible().unwrap_or(false) {
-                                                let _ = window.hide();
-                                            } else {
-                                                let _ = window.show();
-                                                let _ = window.set_focus();
+                                            #[cfg(not(target_os = "macos"))]
+                                            {
+                                                if window.is_visible().unwrap_or(false) {
+                                                    let _ = window.hide();
+                                                } else {
+                                                    let _ = window.show();
+                                                    let _ = window.set_focus();
+                                                }
                                             }
                                         }
                                     }
                                 }
                             })
                             .map_err(|e| e.to_string())
-                    });
-
-                    // Explicit, never swallowed: the shortcut, the keys the
-                    // user would press, and the OS error, in the app log.
-                    if let Err(ref error) = outcome {
-                        log::warn!("{}", global_shortcuts::registration_warning(&spec, error));
-                    }
-                    outcomes.push((spec, outcome));
-                }
-
-                global_shortcuts::partition_registrations(outcomes)
+                    })
+                })
             };
             // Recorded so a surface can answer "why does Ctrl+K do nothing?".
             // Read it with the `global_shortcut_status` command.
