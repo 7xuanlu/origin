@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.17.8](https://github.com/7xuanlu/wenlan/compare/v0.17.7...v0.17.8) (2026-09-04)
+
+
+### Bug Fixes
+
+* **app:** stop the Windows window starting blank and link the desktop app from the release notes ([3e22db7](https://github.com/7xuanlu/wenlan/commit/3e22db798d33591ecf196ce7ec650aa16121a662))
+* **core:** accept the whole staged body when a page revision card chunks ([#688](https://github.com/7xuanlu/wenlan/issues/688)) ([5a0e194](https://github.com/7xuanlu/wenlan/commit/5a0e194aeba06a8c2b9c64c2c1c994acbe49acaa))
+
 ## [0.17.7](https://github.com/7xuanlu/wenlan/compare/v0.17.6...v0.17.7) (2026-09-04)
 
 
