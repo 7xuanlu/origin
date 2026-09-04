@@ -5082,6 +5082,148 @@ async fn accept_pending_revision_page_write_card_with_matching_source_revision_w
     );
 }
 
+/// Issue #650: a page long enough to chunk must survive its own accept.
+///
+/// `memories` stores one row per chunk, and every chunk of a staged card
+/// shares the card's `source_id` and `last_modified`. A read that takes one
+/// row therefore returns an arbitrary fragment, which the accept path then
+/// writes as the page's complete new body -- observed live turning a 21,038
+/// character page into 1,814. The staged card is not at fault:
+/// `stage_page_revision_card` puts the whole body in `source_text` on every
+/// chunk row, so the whole body is always there to be read.
+///
+/// The multi-chunk assertion below is the test's own gate. Under the
+/// character fallback splitter a body has to clear roughly 1,500 characters
+/// to split at all, so a shorter fixture would pass against the broken read
+/// and prove nothing.
+#[tokio::test]
+async fn accepting_a_multi_chunk_page_card_keeps_the_whole_body() {
+    let (db, _dir) = test_db().await;
+    let mem_id = "mem_650_multi_chunk";
+    let new_mem_id = "mem_650_multi_chunk_source";
+    let original_content = "Ownership rules make Rust memory safety explicit";
+    // Kept close to the cited source: the human write runs through the same
+    // hallucination guard, and an unrelated sentence fails it before the test
+    // reaches the behaviour under test.
+    let human_content =
+        "Ownership rules make Rust memory safety explicit. A human maintains this page.";
+
+    // Long enough to split, and structured so the split lands on section
+    // boundaries the way a real wiki page does.
+    let proposed_content = (1..=8)
+        .map(|section| {
+            format!(
+                "## Section {section}\n\n{}\n",
+                format!(
+                    "Paragraph {section} of the proposed revision carries enough prose to \
+                     push this page past the chunker's size budget so the write lands as \
+                     several rows rather than one. "
+                )
+                .repeat(4)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        proposed_content.len() > 1500,
+        "fixture must exceed the character splitter's budget, got {} chars",
+        proposed_content.len()
+    );
+
+    seed_memory(&db, mem_id, original_content).await;
+    // The staging path checks the proposed prose against its cited sources,
+    // so the card needs a source that actually carries this body.
+    seed_memory(&db, new_mem_id, &proposed_content).await;
+    let page_id = seed_page(&db, mem_id, original_content).await;
+    update_page(
+        &db,
+        &page_id,
+        UpdatePageRequest {
+            content: human_content.to_string(),
+            source_memory_ids: vec![mem_id.to_string()],
+            expected_version: None,
+            caller_id: None,
+            operation_id: None,
+        },
+        "fs_edit",
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let before = db.get_page(&page_id).await.unwrap().unwrap();
+    let staged_source_revision = db.get_page_source_revision(&page_id).await.unwrap();
+    let card = stage_page_revision_card(
+        &db,
+        &before,
+        &proposed_content,
+        &[mem_id.to_string(), new_mem_id.to_string()],
+        staged_source_revision,
+        "page_growth",
+        None,
+    )
+    .await
+    .unwrap();
+    let card_id = card
+        .revision_card_id
+        .as_deref()
+        .expect("staged page card must return an id");
+
+    // Gate: without more than one chunk row the broken read cannot truncate,
+    // so the assertion below would pass on unfixed code.
+    let chunk_rows: i64 = {
+        let conn = db.test_primary_session().await;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM memories WHERE source = 'memory' AND source_id = ?1",
+                libsql::params![card_id.to_string()],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    };
+    assert!(
+        chunk_rows > 1,
+        "fixture must stage a card that actually chunked, got {chunk_rows} row(s)"
+    );
+
+    // The queue a human reads before clicking accept must show the same body
+    // the accept will write. Previewing one chunk hides what is about to
+    // happen at the exact moment the human is deciding.
+    let queued = db
+        .list_pending_revisions_scoped(10, &crate::read_scope::ReadScope::Global)
+        .await
+        .unwrap();
+    let queued_card = queued
+        .iter()
+        .find(|item| item.revision_source_id == card_id)
+        .expect("the staged card must appear in the pending queue");
+    assert_eq!(
+        queued_card.revision_content,
+        proposed_content,
+        "the review queue must preview the whole staged body, not one chunk \
+         (got {} chars, staged {} chars)",
+        queued_card.revision_content.len(),
+        proposed_content.len()
+    );
+
+    accept_pending_revision(&db, card_id, "test-agent")
+        .await
+        .unwrap();
+
+    let after = db.get_page(&page_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.content,
+        proposed_content,
+        "accepting a chunked card must write the whole staged body, not one chunk \
+         (got {} chars, staged {} chars)",
+        after.content.len(),
+        proposed_content.len()
+    );
+}
+
 /// Proves the source_revision fence is actually wired end-to-end through
 /// the daemon-internal path a machine refresh uses to reach a human-owned
 /// page's gate: `update_page_at_source_revision` (the same wrapper

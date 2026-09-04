@@ -42078,7 +42078,18 @@ impl MemoryDB {
         };
         let limit_param = values.len();
         let sql = format!(
-            "SELECT revision.supersedes, revision.source_id, revision.content,
+            // A page card's preview comes from `source_text`, which carries the
+            // whole staged body on every chunk row, while `content` holds one
+            // chunk. Without this the human reviews the card's first ~1,500
+            // characters and cannot see what accepting it would write (issue
+            // #650). A memory card keeps reading `content` on purpose: there
+            // `source_text` is the pre-distillation prose, not the body the
+            // accept path writes, so previewing it would show text the accept
+            // never stores.
+            "SELECT revision.supersedes, revision.source_id,
+                    CASE WHEN EXISTS (SELECT 1 FROM pages page WHERE page.id = revision.supersedes)
+                         THEN COALESCE(revision.source_text, revision.content)
+                         ELSE revision.content END,
                     revision.source_agent, revision.last_modified, revision.structured_fields,
                     EXISTS (SELECT 1 FROM pages page WHERE page.id = revision.supersedes)
              FROM memories revision
