@@ -66,7 +66,6 @@ function renderHome(
     <QueryClientProvider client={qc}>
       <HomePage
         onNavigateMemory={() => {}}
-        onNavigateStream={() => {}}
         onNavigateLog={() => {}}
         onNavigateGraph={() => {}}
         onOpenDistillReview={props.onOpenDistillReview}
@@ -632,7 +631,10 @@ describe("HomePage redesign", () => {
     expect(screen.queryByText(/^Updated/i)).toBeNull();
   });
 
-  it("renders the retrievals list with known agent names", async () => {
+  // Retrievals belong to the Activity view, which already shows agents reading
+  // from the library. Home never renders them, however many events the daemon
+  // has — so a re-add has to delete this test on purpose rather than slip in.
+  it("does NOT render a retrievals section even when retrieval events exist", async () => {
     vi.mocked(tauri.listRecentRetrievals).mockResolvedValue([
       {
         timestamp_ms: Date.now(),
@@ -643,28 +645,19 @@ describe("HomePage redesign", () => {
         memory_snippets: [],
       },
     ]);
-    renderHome();
-    expect(await screen.findByTestId("retrievals")).toBeInTheDocument();
-    expect(screen.getByText(/Where AI looked/i)).toBeInTheDocument();
-    expect(screen.getByText(/Claude Code/)).toBeInTheDocument();
-    expect(screen.getByText(/Origin positioning/)).toBeInTheDocument();
-  });
-
-  it("filters unknown agents out of the retrievals list", async () => {
-    vi.mocked(tauri.listRecentRetrievals).mockResolvedValue([
-      {
-        timestamp_ms: Date.now(),
-        agent_name: "unknown",
-        query: "anything",
-        page_titles: ["Should not appear"],
-        page_ids: [],
-        memory_snippets: [],
-      },
+    vi.mocked(tauri.listPages).mockResolvedValue([
+      page({ id: "page-architecture", title: "Wenlan app architecture" }),
     ]);
+
     renderHome();
+
+    const home = await screen.findByTestId("wiki-home");
     await new Promise((r) => setTimeout(r, 100));
+    expect(within(home).queryByTestId("retrievals")).toBeNull();
     expect(screen.queryByTestId("retrievals")).toBeNull();
-    expect(screen.queryByText(/Should not appear/)).toBeNull();
+    expect(screen.queryByTestId("retrieval-item")).toBeNull();
+    expect(screen.queryByText(/Where AI looked/i)).toBeNull();
+    expect(screen.queryByText(/Origin positioning/)).toBeNull();
   });
 
   it("does NOT render contradiction resolver on home", async () => {
@@ -1274,30 +1267,6 @@ describe("HomePage redesign", () => {
     expect(tauri.acceptRefinement).not.toHaveBeenCalled();
   });
 
-  it("retrieval card with archived concept shows archived badge and does not navigate", async () => {
-    const onSelectPage = vi.fn();
-    // Event has page_ids: [] simulating an archived concept (no active match found at read time)
-    vi.mocked(tauri.listRecentRetrievals).mockResolvedValue([
-      {
-        timestamp_ms: Date.now(),
-        agent_name: "claude-code",
-        query: "origin arch",
-        page_titles: ["Origin Architecture"],
-        page_ids: [],
-        memory_snippets: [],
-      },
-    ]);
-    renderHome({ onSelectPage });
-    // Wait for the retrievals section to render
-    await screen.findByTestId("retrievals");
-    // The archived badge should be visible
-    expect(screen.getByTitle("This page has been archived")).toBeInTheDocument();
-    // Clicking should not navigate because page_ids is empty
-    const item = screen.getByTestId("retrieval-item");
-    await userEvent.click(item);
-    expect(onSelectPage).not.toHaveBeenCalled();
-  });
-
   it("does not flash the empty state while the pages query is still loading", async () => {
     let resolvePages!: (pages: tauri.Page[]) => void;
     vi.mocked(tauri.listPages).mockImplementation(
@@ -1471,7 +1440,7 @@ describe("HomePage redesign", () => {
     expect(screen.queryByText("Lucian")).toBeNull();
   });
 
-  it("keeps Where AI looked on the home surface when there are no pages yet", async () => {
+  it("keeps the empty state free of a retrievals section when there are no pages yet", async () => {
     vi.mocked(tauri.listRecentRetrievals).mockResolvedValue([
       {
         timestamp_ms: Date.now(),
@@ -1487,9 +1456,8 @@ describe("HomePage redesign", () => {
 
     const home = await screen.findByTestId("wiki-home");
     expect(await screen.findByTestId("wiki-page-empty")).toBeInTheDocument();
-    const retrievals = within(home).getByTestId("retrievals");
-    expect(within(retrievals).getByText(/Where AI looked/i)).toBeInTheDocument();
-    expect(within(retrievals).getByText(/Claude Code/)).toBeInTheDocument();
+    expect(within(home).queryByTestId("retrievals")).toBeNull();
+    expect(screen.queryByText(/Where AI looked/i)).toBeNull();
   });
 
   it("shows the page list and no empty state once pages exist", async () => {

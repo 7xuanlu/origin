@@ -1352,15 +1352,6 @@ const en = {
       turnOnModel: "Turn on a model",
       writePage: "Write a page",
     },
-    retrievals: {
-      title: "Where AI looked",
-      subtitle: "recent assistants pulling from your library",
-      justNow: "just now",
-      minutesAgo: "{{count}}m ago",
-      hoursAgo: "{{count}}h ago",
-      yesterday: "yesterday",
-      daysAgo: "{{count}}d ago",
-    },
     reasons: {
       sourceConflict: "Source conflict",
       sourceUpdated: "New sources waiting",
@@ -2914,15 +2905,6 @@ const zhHans = {
       turnOnModel: "启用模型",
       writePage: "自己写一个页面",
     },
-    retrievals: {
-      title: "AI 查阅了哪些内容",
-      subtitle: "最近从你的资料库中读取内容的助手",
-      justNow: "刚刚",
-      minutesAgo: "{{count}} 分钟前",
-      hoursAgo: "{{count}} 小时前",
-      yesterday: "昨天",
-      daysAgo: "{{count}} 天前",
-    },
     reasons: {
       sourceConflict: "来源冲突",
       sourceUpdated: "有新来源待处理",
@@ -4470,15 +4452,6 @@ const zhHant = {
         "當你的記憶中浮現出模式時，文瀾會整理成頁面，通常會在規律使用一天內出現。",
       turnOnModel: "啟用模型",
       writePage: "自己寫一個頁面",
-    },
-    retrievals: {
-      title: "AI 查閱了哪些內容",
-      subtitle: "最近從你的資料庫中讀取內容的助手",
-      justNow: "剛剛",
-      minutesAgo: "{{count}} 分鐘前",
-      hoursAgo: "{{count}} 小時前",
-      yesterday: "昨天",
-      daysAgo: "{{count}} 天前",
     },
     reasons: {
       sourceConflict: "來源衝突",

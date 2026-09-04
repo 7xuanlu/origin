@@ -97,6 +97,13 @@ vi.mock("./MemorySearchResult", () => ({
   ),
 }));
 vi.mock("./MemoryDetail", () => ({ default: () => <div data-testid="memory-detail" /> }));
+vi.mock("./RecapsList", () => ({
+  RecapsList: (props: { onBack: () => void }) => (
+    <section data-testid="recaps-list">
+      <button onClick={props.onBack} type="button">Recaps back</button>
+    </section>
+  ),
+}));
 vi.mock("./PageDetail", () => ({
   default: (props: {
     onBack?: () => void;
@@ -363,6 +370,19 @@ describe("Main search", () => {
     localStorage.clear();
     vi.unstubAllGlobals();
     await i18n.changeLanguage("en");
+  });
+
+  it("keeps recaps reachable from the Memories screen", async () => {
+    const user = userEvent.setup();
+    renderMain();
+
+    await user.click(screen.getByRole("button", { name: "Open memories" }));
+    await user.click(screen.getByRole("button", { name: "Recaps" }));
+
+    expect(screen.getByTestId("recaps-list")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Recaps back" }));
+    expect(screen.getByRole("heading", { name: "Memories" })).toBeInTheDocument();
   });
 
   it("reads and updates the persisted desktop sidebar preference", async () => {

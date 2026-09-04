@@ -229,11 +229,6 @@ src/components/memory/ProfilePage.tsx	What Wenlan knows	1
 src/components/memory/ProfileSummaryCard.tsx	Collapse	1
 src/components/memory/ProfileSummaryCard.tsx	Expand	1
 src/components/memory/ProfileSummaryCard.tsx	View all &rarr;	1
-src/components/memory/RetrievalsList.tsx	archived	1
-src/components/memory/RetrievalsList.tsx	on "	1
-src/components/memory/RetrievalsList.tsx	searched, found nothing relevant	1
-src/components/memory/RetrievalsList.tsx	This page has been archived	2
-src/components/memory/RetrievalsList.tsx	View all recaps &rarr;	1
 src/components/memory/settings/SettingsSidebar.tsx	Wenlan	1
 src/components/memory/SourceList.tsx	+ Add folder or vault	1
 src/components/memory/SourceList.tsx	Add source	2

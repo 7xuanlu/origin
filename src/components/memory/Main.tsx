@@ -949,7 +949,6 @@ export default function Main({
           ) : view.kind === "home" ? (
             <HomePage
               onNavigateMemory={(sid) => navigateTo({ kind: "memory", sourceId: sid })}
-              onNavigateStream={() => navigateTo({ kind: "recaps" })}
               onNavigateLog={() => navigateTo({ kind: "stream" })}
               onNavigateGraph={() => navigateTo({ kind: "graph" })}
               onSelectPage={(id) => navigateTo({ kind: "page", pageId: id })}
@@ -990,7 +989,24 @@ export default function Main({
               <button onClick={() => navigateTo({ kind: "home" })} className="p-1.5 -ml-1.5 rounded-md transition-colors duration-150 hover:bg-[var(--mem-hover)] mb-3" style={{ color: "var(--mem-text-tertiary)", background: "none", border: "none", cursor: "pointer", lineHeight: 0 }}>
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>
               </button>
-              <h2 style={{ fontFamily: "var(--mem-font-heading)", fontSize: "24px", fontWeight: 500, color: "var(--mem-text)", margin: "0 0 12px 0" }}>{t("main.memories")}</h2>
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <h2 style={{ fontFamily: "var(--mem-font-heading)", fontSize: "24px", fontWeight: 500, color: "var(--mem-text)", margin: 0 }}>{t("main.memories")}</h2>
+                <button
+                  className="rounded-md px-2.5 py-1.5 transition-colors duration-150 hover:bg-[var(--mem-hover)]"
+                  onClick={() => navigateTo({ kind: "recaps" })}
+                  style={{
+                    background: "transparent",
+                    border: "1px solid var(--mem-border)",
+                    color: "var(--mem-text-secondary)",
+                    cursor: "pointer",
+                    fontFamily: "var(--mem-font-body)",
+                    fontSize: "12px",
+                  }}
+                  type="button"
+                >
+                  {t("main.recaps")}
+                </button>
+              </div>
               <MemoryStream
                 memories={memories}
                 selectedDomain={null}
