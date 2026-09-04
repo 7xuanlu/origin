@@ -2281,6 +2281,16 @@ jobs:
       # promoted the release, leaving v0.15.5 stable but still labelled pending.
       pull-requests: write
     steps:
+      # The Install section prepare-release writes is entirely command line:
+      # three `npx`, two `curl | bash`. A Windows user has none of those, so the
+      # one artifact built for them was reachable only by expanding a collapsed
+      # list of fifteen assets. The links belong in the notes — but not in
+      # prepare-release, which creates the prerelease publicly and in parallel
+      # with the two bundle jobs, so a link written there points at nothing for
+      # the 40-210 minutes they run, and forever if either one fails. This job
+      # needs promote-app-assets, so by here the installers are really on the
+      # release; the step still checks rather than assuming, and refuses to
+      # write a link it cannot see the target of.
       - name: Publish SHA256SUMS
         run: |
           set -euo pipefail
@@ -2408,6 +2418,131 @@ jobs:
             <<<"$labels" >/dev/null
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # After Promote, before the cleanup PR. Publish SHA256SUMS and
+      # Promote are load-bearing and this step is cosmetic, so a filename
+      # it cannot match must never be what leaves a release unpromoted or
+      # unchecksummed. It sits ahead of the cleanup PR because that step
+      # can fail after creating its branch and then exit 0 on the re-run,
+      # so putting the links behind it would let a release keep the notes
+      # it shipped with.
+      - name: Link the desktop app from the release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Same derivation as app-bundle-windows: all four secrets, not one.
+          # Whether the installer is signed decides whether the notes should
+          # warn about SmartScreen, and hardcoding "unsigned" would quietly
+          # become a lie the day signing is switched on. Nothing is claimed
+          # about macOS, which is Developer ID signed and notarized from
+          # v0.17.4 (docs/code-signing.md) and needs no warning at all.
+          SIGNPATH_CONFIGURED: ${{ secrets.SIGNPATH_API_TOKEN != '' && secrets.SIGNPATH_ORGANIZATION_ID != '' && secrets.SIGNPATH_PROJECT_SLUG != '' && secrets.SIGNPATH_SIGNING_POLICY_SLUG != '' }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          win="Wenlan_${version}_x64-setup.exe"
+          dmg="Wenlan_${version}_aarch64.dmg"
+
+          names="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name')"
+          for asset in "$win" "$dmg"; do
+            grep -Fxq "$asset" <<<"$names" || {
+              echo "ERROR: $asset is not on $RELEASE_TAG; refusing to link it." >&2
+              exit 1
+            }
+          done
+
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG"
+          {
+            echo "**Desktop app:**"
+            echo
+            echo "- Windows: [$win]($base/$win)"
+            echo "- macOS (Apple silicon): [$dmg]($base/$dmg)"
+            echo
+            # Signing does not simply switch the warning off. Microsoft weighs
+            # the file's hash as well as the publisher certificate, so a newly
+            # signed binary can still warn until one of the two accumulates
+            # reputation, and the Foundation certificate names SignPath rather
+            # than Wenlan (docs/code-signing.md). Dropping this the day signing
+            # lands would take the instructions away from users who still need
+            # them; only the reason changes. Both branches say "may": SmartScreen
+            # can be off, and reputation can already have accumulated.
+            if [[ "$SIGNPATH_CONFIGURED" == "true" ]]; then
+              echo "Windows may still show \"Windows protected your PC\" until this download's hash or its publisher has built up enough reputation — choose **More info → Run anyway**."
+            else
+              echo "The Windows installer is not code-signed yet, so Windows may show \"Windows protected your PC\" on first run — choose **More info → Run anyway**."
+            fi
+            echo
+          } > "$RUNNER_TEMP/desktop.md"
+
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json body --jq .body > "$RUNNER_TEMP/body.md"
+
+          # GitHub stores whatever line endings the writer used, and anything
+          # edited through the web UI comes back CRLF. Left alone, awk's
+          # `$0 == "## Install"` would be comparing against "## Install\r" and
+          # the step would report a missing heading on a release that has one.
+          # Stripping CR changes no rendered character.
+          sed -i 's/\r$//' "$RUNNER_TEMP/body.md"
+
+          # Only the Install section counts as "already linked". A bullet
+          # identical to ours can sit in a changelog entry or a fenced example
+          # elsewhere in the notes, and treating that as the real section would
+          # exit green having linked nothing. Trailing whitespace is ignored
+          # here but preserved in the body that gets written back.
+          awk '/^## /{ inside = ($0 == "## Install") } inside' "$RUNNER_TEMP/body.md" \
+            | sed 's/[[:space:]]*$//' > "$RUNNER_TEMP/install.md"
+
+          # Both link lines or neither. Matching one would call a half-repaired
+          # note finished, and exiting green there restores the very defect this
+          # step exists to fix, so a partial state stops the step instead.
+          #
+          # The markers are the two rendered list items, matched whole-line with
+          # -Fx, and deliberately not the "**Desktop app:**" heading or a bare
+          # URL. The heading is what release-please renders for an ordinary
+          # `fix(Desktop app):` commit, so keying on it would make a normal
+          # changelog look half-linked. A bare URL is worse in both directions:
+          # a changelog that merely mentions the installer URL would fail the
+          # job, and a body that happened to carry both URLs somewhere else
+          # would be declared done while the Install section still had nothing
+          # in it. A whole line of the exact form written below is the section
+          # itself, not a substring that can wander in from prose.
+          present=0
+          while IFS= read -r marker; do
+            [[ -n "$marker" ]] || continue
+            # -- because every marker starts with "- ", which grep would
+            # otherwise read as a bundle of short options.
+            if grep -Fxq -- "$marker" "$RUNNER_TEMP/install.md"; then
+              present=$((present + 1))
+            fi
+          done <<<"$(grep '^- ' "$RUNNER_TEMP/desktop.md")"
+          if [[ "$present" -eq 2 ]]; then
+            echo "Desktop links already present on $RELEASE_TAG; nothing to do."
+            exit 0
+          fi
+          if [[ "$present" -ne 0 ]]; then
+            echo "ERROR: the $RELEASE_TAG notes already carry $present of the 2 desktop links; refusing to guess at the rest." >&2
+            exit 1
+          fi
+
+          # Insert under the Install heading so the desktop app is the first
+          # thing a reader of that section sees.
+          awk -v block="$RUNNER_TEMP/desktop.md" '
+            { print }
+            !inserted && $0 == "## Install" {
+              print ""
+              while ((getline line < block) > 0) print line
+              inserted = 1
+            }
+            END { if (!inserted) exit 3 }
+          ' "$RUNNER_TEMP/body.md" > "$RUNNER_TEMP/body.new.md" || {
+            echo "ERROR: no '## Install' heading in the $RELEASE_TAG notes; left unchanged." >&2
+            exit 1
+          }
+
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --notes-file "$RUNNER_TEMP/body.new.md"
+          echo "---- desktop section ----"
+          cat "$RUNNER_TEMP/desktop.md"
+
       - name: Open the release-as override cleanup PR
         # A deliberate minor/major is steered by a one-shot `release-as`
         # override in release-please-config.json (docs/RELEASING.md,
