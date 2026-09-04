@@ -15,17 +15,25 @@ export function GhostPagesRow() {
       >
         {t("onboarding.ghostPages")}
       </p>
+      {/*
+        All three ghosts must fit the column they sit in — the `minmax(0, 1fr)`
+        half of HomePage's `.wiki-content-grid`, 508px at the app's default
+        1280x720 window. The tracks below are what guarantee that; fixed card
+        widths overflowed it and sliced the second card in half.
+      */}
       <div
-        className="flex gap-3 pb-2"
-        style={{ overflowX: "auto", scrollbarWidth: "none" }}
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+          gap: "12px",
+        }}
       >
         {[0, 1, 2].map((i) => (
           <div
             key={i}
             data-ghost-card
-            className="rounded-xl shrink-0"
+            className="rounded-xl"
             style={{
-              width: "280px",
               height: "110px",
               border: "1px solid var(--mem-border)",
               opacity: 0.4,
