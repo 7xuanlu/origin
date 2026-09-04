@@ -11,6 +11,7 @@
 
 ### Bug Fixes
 
+* **app:** a reading that failed no longer renders as a measured negative ([#684](https://github.com/7xuanlu/wenlan/issues/684)) ([3e7c14c](https://github.com/7xuanlu/wenlan/commit/3e7c14c60644f93cdc42e4de56c1ebda3a209cef))
 * **app:** drop the quick-capture halo where the platform draws no window shadow ([#666](https://github.com/7xuanlu/wenlan/issues/666)) ([e4ab575](https://github.com/7xuanlu/wenlan/commit/e4ab575c76a0c4448e53c484ddddc2d23eb5a1b7))
 * **app:** open citation files through open_file and surface refused opens ([#657](https://github.com/7xuanlu/wenlan/issues/657)) ([5b0c2ae](https://github.com/7xuanlu/wenlan/commit/5b0c2ae99602e3dacc04e8bc2504d0096aad7325)), closes [#656](https://github.com/7xuanlu/wenlan/issues/656)
 * **ci:** stop requiring a version bump in a file that no longer has one ([#681](https://github.com/7xuanlu/wenlan/issues/681)) ([c94d8bf](https://github.com/7xuanlu/wenlan/commit/c94d8bfc9421fb6798c68df43b3660c346fb337e))
@@ -23,7 +24,9 @@
 * **core:** surface citation-gate refresh failures instead of silently discarding ([#654](https://github.com/7xuanlu/wenlan/issues/654)) ([3a2776d](https://github.com/7xuanlu/wenlan/commit/3a2776d697b56801ed3eec96572272813012e03c))
 * **deps:** drop quick-xml 0.30, and hold lopdf back on purpose ([#680](https://github.com/7xuanlu/wenlan/issues/680)) ([781f96b](https://github.com/7xuanlu/wenlan/commit/781f96bb59ac42e780d987a6c641f4cc0d8c7915))
 * **deps:** raise twelve dependencies past their advisories ([#677](https://github.com/7xuanlu/wenlan/issues/677)) ([e411ea5](https://github.com/7xuanlu/wenlan/commit/e411ea5a691bcb2023a7c3b342fdc6debbae7e24))
+* **first-run:** make the Windows channels prove they own a tree before deleting it ([#664](https://github.com/7xuanlu/wenlan/issues/664)) ([d6743ff](https://github.com/7xuanlu/wenlan/commit/d6743ff41c2a26541ba32a5a79a3269145c01740))
 * **graph:** lay out a focused neighborhood's names so none is buried ([#660](https://github.com/7xuanlu/wenlan/issues/660)) ([a5646a1](https://github.com/7xuanlu/wenlan/commit/a5646a1e67dc97c4327b623f7ec37bee3d80cd76))
+* **scripts:** stop reporting "nothing is running" when nothing could be measured ([#663](https://github.com/7xuanlu/wenlan/issues/663)) ([66f0580](https://github.com/7xuanlu/wenlan/commit/66f05805fe427276fffa94d48cc51c7ccba65c0f))
 
 ## [0.17.6](https://github.com/7xuanlu/wenlan/compare/v0.17.5...v0.17.6) (2026-08-31)
 
