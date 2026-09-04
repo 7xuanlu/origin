@@ -6,6 +6,109 @@
     <!-- Served from public/fonts, not from Google. See that directory's fonts.css. -->
     <link rel="stylesheet" href="/fonts/fonts.css" />
     <title>Wenlan</title>
+    <style>
+      /*
+        First paint, before index.css or React exist.
+
+        index.css keeps `html` and `body` transparent so the toast and
+        quick-capture webviews can float over the desktop, and the main window
+        inherits that: from the moment it is shown until React's first render it
+        paints nothing at all. macOS never revealed this because app/src/lib.rs
+        gives the main window a native NSColor background; there is no such call
+        on Windows or Linux, and app/tauri.conf.json shows the window from
+        config on purpose ("launch cannot depend on a frontend event to
+        appear"), so a cold start there is a blank rectangle for as long as the
+        bundle, the fonts and the daemon health check take. On a version upgrade
+        that also waits on database migrations, which is tens of seconds.
+
+        Painting the app's own base colour costs two rules and closes that
+        window — from the first parse of this file until React renders —
+        without weakening the guarantee. Scoped to the main window: the overlay
+        webviews must stay transparent.
+
+        It does not cover the frame before that. The main window declares no
+        backgroundColor, so Wry leaves WebView2's controller background unset
+        and Windows paints its default white until this file is parsed. That is
+        a much shorter flash than the one above, but it is a real one for a
+        dark-theme user, and closing it means setting a window background
+        colour from Rust. A static one cannot be right for both themes, and
+        Rust cannot read the theme from localStorage before the webview exists,
+        so it needs the OS preference instead. Deliberately left alone here.
+
+        `html[data-window="main"]` is (0,1,1) against index.css's `html, body`
+        at (0,0,1), so this wins on specificity whatever order the bundler emits
+        the stylesheets in.
+      */
+      html[data-window="main"] {
+        background: #11131a;
+      }
+      html[data-window="main"][data-theme="light"] {
+        background: #fcfcfb;
+      }
+    </style>
+    <script>
+      // A classic script, so it runs to completion before the module below and
+      // its attributes land on the first frame.
+      (function () {
+        // Tauri injects __TAURI_INTERNALS__ ahead of any page script, and
+        // getCurrentWindow() reads currentWindow.label straight out of it. That
+        // label is the window's real identity. The URL fragment is only a
+        // routing convention, and reading it instead gets this wrong twice:
+        // `index.html#` has an empty `location.hash`, and a fragment added
+        // after parsing arrives too late. So ask the window what it is, and
+        // fall back to the fragment only where there are no internals to ask —
+        // `pnpm dev` in a plain browser and the preview harness, neither of
+        // which creates an overlay window.
+        var label;
+        try {
+          label = window.__TAURI_INTERNALS__.metadata.currentWindow.label;
+        } catch (e) {
+          label = undefined;
+        }
+        var isMain =
+          typeof label === "string"
+            ? label === "main"
+            : !window.location.hash.replace(/^#/, "");
+        if (!isMain) return;
+
+        document.documentElement.setAttribute("data-window", "main");
+
+        // Resolve the theme to the same value src/lib/theme.ts would, so what
+        // applyTheme() writes a moment later is already on screen and nothing
+        // flashes: readPreference()'s key order — current key, then the legacy
+        // key only when the current one is absent — and resolveTheme(), which
+        // sends only "system" to the media query and passes every other value
+        // through untouched, including one this file would not recognise.
+        //
+        // It departs from those two in exactly two ways, both because an
+        // exception here would abort the script and leave the window
+        // transparent, which is the defect this is here to fix.
+        // readPreference() copies a legacy value into the current key as it
+        // reads; a first-paint script has no business writing to storage, and
+        // not writing cannot change what is painted because applyTheme()
+        // migrates it moments later. And resolveTheme() calls matchMedia
+        // unconditionally, which throws where it does not exist, so the call
+        // is guarded here and the light default stands in.
+        var stored = null;
+        try {
+          stored = localStorage.getItem("wenlan-theme");
+          if (stored === null) stored = localStorage.getItem("origin-theme");
+        } catch (e) {
+          // Storage can be unavailable; the media query below decides instead.
+        }
+
+        var theme = stored === null ? "system" : stored;
+        var resolved =
+          theme === "system"
+            ? !!window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light"
+            : theme;
+
+        document.documentElement.setAttribute("data-theme", resolved);
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

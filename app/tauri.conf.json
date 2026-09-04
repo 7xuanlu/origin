@@ -69,7 +69,12 @@
       "binaries/wenlan-server",
       "binaries/wenlan-mcp",
       "binaries/cloudflared"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico"
+      }
+    }
   },
   "plugins": {
     "updater": {

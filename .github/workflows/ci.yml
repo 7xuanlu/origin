@@ -288,6 +288,14 @@ jobs:
               - 'scripts/validate-versions.test.sh'
               - 'scripts/bump-version.sh'
               - 'scripts/bump-version.test.sh'
+              # validate-versions.test.sh runs the release contract suite, and
+              # this is its only LINUX lane. One of that suite's mutations --
+              # dropping the CR strip from the release-note link step -- can
+              # only be seen where awk keeps the CR of a CRLF line, which the
+              # Windows lane's MSYS awk does not, so it prints UNCHECKED there.
+              # Without this entry a change to the truth table alone would be
+              # measured only on the host that cannot measure that row.
+              - 'scripts/release-workflow-contract.test.py'
               - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
             # The release workflow's shipped contracts. `docs` already routes
@@ -298,9 +306,10 @@ jobs:
             # feeds the Windows lane that runs the same suite with
             # WENLAN_REQUIRE_AUTHENTICODE=1, where UNCHECKED is fatal.
             #
-            # The suite's own file is listed, which `docs` does not do: a change
-            # to release-workflow-contract.test.py alone currently runs nothing
-            # at all.
+            # The suite's own file is listed here too, so a change to it alone
+            # reaches BOTH lanes: this one, where Authenticode is required, and
+            # the Ubuntu provenance lane, which is the only host where the
+            # release-note step's CRLF mutation can bite.
             release-contract:
               - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
@@ -2463,6 +2472,17 @@ jobs:
         run: pnpm test:i18n
       - name: Frontend unit tests
         run: pnpm test
+      # index.html's first-paint style and script sit outside the module graph,
+      # so the unit run above can only check the source. dist/ is gitignored and
+      # nothing before this point builds it, which left the assertions about the
+      # shipped file skipped on every run. This builds, then re-runs that one
+      # file with WENLAN_REQUIRE_DIST set so an absent dist/ fails instead of
+      # skipping. The build on the same line is what makes the artifact current;
+      # the test's own mtime check only catches a local edit-without-rebuild.
+      - name: First paint survives the production bundle
+        run: pnpm build && pnpm vitest run src/__tests__/firstPaint.test.ts
+        env:
+          WENLAN_REQUIRE_DIST: "1"
       - name: Build + verify fixture-only Review app
         run: pnpm review:build && pnpm review:verify
       - name: Install Playwright Chromium

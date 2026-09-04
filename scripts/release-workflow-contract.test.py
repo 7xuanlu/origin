@@ -2090,6 +2090,461 @@ def signpath_guard_behaviour_violations(release: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# finalize-release -- the desktop links in the published notes
+# --------------------------------------------------------------------------
+#
+# The Install section prepare-release writes is entirely command line, so the
+# one artifact built for Windows users is reachable only by expanding a
+# collapsed list of fifteen assets. finalize-release links it into the notes.
+#
+# Everything that step decides is arithmetic and whole-line matching that no
+# reading of the YAML can check: whether both assets are really on the release,
+# whether the Install section already carries the links, whether one link is a
+# finished re-run or a half-written section. Both defects found while writing it
+# were found by running it, not by reading it -- `grep -Fxq` read a marker
+# beginning "- " as a bundle of short options and never matched anything, and
+# matching the whole body instead of the Install section declared a release
+# already linked when the only copy of the links was in a changelog line.
+
+DESKTOP_LINK_STEP = "Link the desktop app from the release notes"
+
+# Deliberately not a version that exists. The step derives both filenames from
+# RELEASE_TAG, and a fixture reusing a shipped version would pass just as well
+# against a step that had them hardcoded.
+DESKTOP_LINK_TAG = "v9.9.9"
+DESKTOP_LINK_REPO = "7xuanlu/wenlan"
+DESKTOP_LINK_WIN = "Wenlan_9.9.9_x64-setup.exe"
+DESKTOP_LINK_DMG = "Wenlan_9.9.9_aarch64.dmg"
+DESKTOP_LINK_BASE = (
+    f"https://github.com/{DESKTOP_LINK_REPO}/releases/download/{DESKTOP_LINK_TAG}"
+)
+
+# `gh` as a shell FUNCTION, not an executable on a doctored PATH. An
+# extensionless stub in a scratch directory does not shadow gh.exe on Windows:
+# PATHEXT resolution walks straight past it to the real binary, which answers
+# the asset query with "401 Bad credentials" and turns rows green for a reason
+# that has nothing to do with the step. A function is resolved before PATH is
+# consulted at all, on every platform.
+DESKTOP_LINK_GH_STUB = """
+gh() {
+  case "$*" in
+    *"--json assets"*) cat "$WORK/assets.txt"; return 0 ;;
+    *"--json body"*)   cat "$WORK/body.txt";   return 0 ;;
+  esac
+  if [[ "$1" == "release" && "$2" == "edit" ]]; then
+    local arg
+    for arg in "$@"; do [[ -f "$arg" ]] && cp "$arg" "$WORK/edited.md"; done
+    echo GH-RELEASE-EDIT-CALLED
+    return 0
+  fi
+  echo "gh stub: unexpected $*" >&2
+  return 9
+}
+"""
+
+DESKTOP_LINK_EDITED = "GH-RELEASE-EDIT-CALLED"
+
+DESKTOP_LINK_NOTES = """## What's Changed
+
+### Bug Fixes
+
+* **app:** something
+
+## Install
+
+**Wenlan setup (local runtime + daemon):**
+
+```
+npx -y wenlan setup
+```
+"""
+
+DESKTOP_LINK_NO_INSTALL = "## What's Changed\n\nNothing here.\n"
+
+DESKTOP_LINK_SECTION = (
+    "## Install\n\n**Desktop app:**\n\n"
+    f"- Windows: [{DESKTOP_LINK_WIN}]({DESKTOP_LINK_BASE}/{DESKTOP_LINK_WIN})\n"
+    f"- macOS (Apple silicon): [{DESKTOP_LINK_DMG}]({DESKTOP_LINK_BASE}/{DESKTOP_LINK_DMG})\n"
+)
+# A release whose notes the step has already edited.
+DESKTOP_LINK_DONE = DESKTOP_LINK_NOTES.replace("## Install", DESKTOP_LINK_SECTION, 1)
+# One of the two rendered items, which is damage and not a completed run.
+DESKTOP_LINK_HALF = DESKTOP_LINK_NOTES.replace(
+    "## Install",
+    "## Install\n\n**Desktop app:**\n\n"
+    f"- Windows: [{DESKTOP_LINK_WIN}]({DESKTOP_LINK_BASE}/{DESKTOP_LINK_WIN})\n",
+    1,
+)
+
+
+class DesktopLinkCase(NamedTuple):
+    """One release-note shape, and what the step must do with it.
+
+    `expect` and `forbid` are matched against the step's own output AND the
+    notes it wrote back; `ordered` only against the notes, and in sequence, so
+    a block inserted in the right file but the wrong place still fails.
+    """
+
+    description: str
+    assets: tuple[str, ...]
+    body: str
+    signpath: str
+    status: int
+    expect: tuple[str, ...] = ()
+    forbid: tuple[str, ...] = ()
+    ordered: tuple[str, ...] = ()
+
+
+# Not in the table, and deliberately: a body carrying TWO `## Install` headings.
+# awk's `inside` toggles on each, so the extracted section is both of them
+# concatenated, and links under the second would report the first as done. That
+# is a real wrong answer, but prepare-release composes exactly one Install
+# heading and nothing else writes to these notes before this step runs, so there
+# is no shape to assert against without first inventing the release that
+# produces it. Named here rather than left to be discovered as a silent gap.
+DESKTOP_LINK_TRUTH_TABLE: tuple[DesktopLinkCase, ...] = (
+    DesktopLinkCase(
+        "links both installers, under the Install heading and above the CLI methods",
+        (DESKTOP_LINK_WIN, DESKTOP_LINK_DMG, "SHA256SUMS"),
+        DESKTOP_LINK_NOTES,
+        "false",
+        0,
+        expect=(
+            "**Desktop app:**",
+            f"- Windows: [{DESKTOP_LINK_WIN}]({DESKTOP_LINK_BASE}/{DESKTOP_LINK_WIN})",
+            f"- macOS (Apple silicon): [{DESKTOP_LINK_DMG}]"
+            f"({DESKTOP_LINK_BASE}/{DESKTOP_LINK_DMG})",
+            "Windows protected your PC",
+        ),
+        ordered=("## Install", "**Desktop app:**", "npx -y wenlan setup"),
+    ),
+    # The whole point of checking rather than assuming. promote-app-assets is a
+    # `needs`, so the assets should be there -- but "should" is what published
+    # the dead link this step exists to avoid.
+    DesktopLinkCase(
+        "refuses when the Windows installer is not on the release",
+        (DESKTOP_LINK_DMG, "SHA256SUMS"),
+        DESKTOP_LINK_NOTES,
+        "false",
+        1,
+        expect=(f"ERROR: {DESKTOP_LINK_WIN} is not on {DESKTOP_LINK_TAG}",),
+        forbid=(DESKTOP_LINK_EDITED,),
+    ),
+    DesktopLinkCase(
+        "refuses when the macOS dmg is not on the release",
+        (DESKTOP_LINK_WIN, "SHA256SUMS"),
+        DESKTOP_LINK_NOTES,
+        "false",
+        1,
+        expect=(f"ERROR: {DESKTOP_LINK_DMG} is not on {DESKTOP_LINK_TAG}",),
+        forbid=(DESKTOP_LINK_EDITED,),
+    ),
+    DesktopLinkCase(
+        "refuses notes with no Install heading instead of editing them blindly",
+        (DESKTOP_LINK_WIN, DESKTOP_LINK_DMG),
+        DESKTOP_LINK_NO_INSTALL,
+        "false",
+        1,
+        expect=("no '## Install' heading",),
+        forbid=(DESKTOP_LINK_EDITED,),
+    ),
+    # `--jq .body` on a release with no notes returns an empty string. Refusing
+    # is the only safe answer: the alternative is a release whose entire body is
+    # the desktop block, written over whatever prepare-release failed to write.
+    DesktopLinkCase(
+        "refuses a release with no notes at all",
+        (DESKTOP_LINK_WIN, DESKTOP_LINK_DMG),
+        "",
+        "false",
+        1,
+        expect=("no '## Install' heading",),
+        forbid=(DESKTOP_LINK_EDITED,),
+    ),
+    # Install last, with no following `## ` to switch awk's `inside` back off,
+    # so the extracted section runs to end of file. The insert still has to land
+    # directly under the heading and not at the end of it.
+    DesktopLinkCase(
+        "links notes whose Install section is the last one",
+        (DESKTOP_LINK_WIN, DESKTOP_LINK_DMG),
+        "## What's Changed\n\n* **app:** something\n\n"
+        "## Install\n\n```\nnpx -y wenlan setup\n```\n",
+        "false",
+        0,
+        expect=(DESKTOP_LINK_EDITED,),
+        ordered=("## Install", "**Desktop app:**", "npx -y wenlan setup"),
+    ),
+    # Signing changes the reason, never the click path: the user still meets
+    # SmartScreen while the hash or the publisher accumulates reputation.
+    DesktopLinkCase(
+        "keeps the SmartScreen instructions once signed, and changes only the reason",
+        (DESKTOP_LINK_WIN, DESKTOP_LINK_DMG),
+        DESKTOP_LINK_NOTES,
+        "true",
+        0,
+        expect=(
+            "**Desktop app:**",
+            "hash or its publisher has built up enough reputation",
+            "More info → Run anyway",
+        ),
+        forbid=("is not code-signed yet",),
+    ),
+    DesktopLinkCase(
+        "is a no-op on a re-run rather than appending a second block",
+        (DESKTOP_LINK_WIN, DESKTOP_LINK_DMG),
+        DESKTOP_LINK_DONE,
+        "false",
+        0,
+        expect=("already present",),
+        forbid=(DESKTOP_LINK_EDITED,),
+    ),
+    DesktopLinkCase(
+        "stops on a half-written section instead of calling it finished",
+        (DESKTOP_LINK_WIN, DESKTOP_LINK_DMG),
+        DESKTOP_LINK_HALF,
+        "false",
+        1,
+        expect=("1 of the 2 desktop links",),
+        forbid=(DESKTOP_LINK_EDITED, "already present"),
+    ),
+    # Why the markers are the rendered list items and not bare URLs: a changelog
+    # line that merely mentions the installer must not stop the release.
+    DesktopLinkCase(
+        "inserts normally when a changelog entry mentions the installer URL",
+        (DESKTOP_LINK_WIN, DESKTOP_LINK_DMG),
+        DESKTOP_LINK_NOTES.replace(
+            "* **app:** something",
+            f"* **app:** stop shipping a broken {DESKTOP_LINK_BASE}/{DESKTOP_LINK_WIN}",
+            1,
+        ),
+        "false",
+        0,
+        expect=(DESKTOP_LINK_EDITED, "- macOS (Apple silicon): ["),
+        forbid=("refusing to guess", "already present"),
+    ),
+    # And why they are not the heading: release-please renders a
+    # `fix(Desktop app):` scope as exactly the bold string this step writes.
+    DesktopLinkCase(
+        "is not fooled by a changelog entry scoped 'Desktop app'",
+        (DESKTOP_LINK_WIN, DESKTOP_LINK_DMG),
+        DESKTOP_LINK_NOTES.replace(
+            "* **app:** something",
+            "* **Desktop app:** stop the window flashing on cold start",
+            1,
+        ),
+        "false",
+        0,
+        expect=(DESKTOP_LINK_EDITED, f"- Windows: [{DESKTOP_LINK_WIN}]"),
+        forbid=("refusing to guess", "already present"),
+    ),
+    # GitHub hands back whatever line endings the body was stored with, and
+    # anything edited through the web UI comes back CRLF.
+    DesktopLinkCase(
+        "links a CRLF release body",
+        (DESKTOP_LINK_WIN, DESKTOP_LINK_DMG),
+        DESKTOP_LINK_NOTES.replace("\n", "\r\n"),
+        "false",
+        0,
+        expect=(DESKTOP_LINK_EDITED, f"- Windows: [{DESKTOP_LINK_WIN}]"),
+        forbid=("no '## Install' heading",),
+    ),
+    DesktopLinkCase(
+        "treats an already-linked CRLF body as done",
+        (DESKTOP_LINK_WIN, DESKTOP_LINK_DMG),
+        DESKTOP_LINK_DONE.replace("\n", "\r\n"),
+        "false",
+        0,
+        expect=("already present",),
+        forbid=(DESKTOP_LINK_EDITED,),
+    ),
+    DesktopLinkCase(
+        "ignores trailing whitespace on links that are already there",
+        (DESKTOP_LINK_WIN, DESKTOP_LINK_DMG),
+        DESKTOP_LINK_DONE.replace(
+            f"]({DESKTOP_LINK_BASE}/{DESKTOP_LINK_WIN})",
+            f"]({DESKTOP_LINK_BASE}/{DESKTOP_LINK_WIN})  ",
+            1,
+        ),
+        "false",
+        0,
+        expect=("already present",),
+        forbid=(DESKTOP_LINK_EDITED,),
+    ),
+    # The row that made whole-body matching wrong. Both bullets are present, but
+    # quoted in a later section; the Install section still has nothing in it, and
+    # a step that reported "already present" here would leave it that way.
+    DesktopLinkCase(
+        "does not count links quoted outside the Install section",
+        (DESKTOP_LINK_WIN, DESKTOP_LINK_DMG),
+        DESKTOP_LINK_NOTES
+        + "\n## Notes for maintainers\n\nThe release should end up with:\n\n"
+        f"- Windows: [{DESKTOP_LINK_WIN}]({DESKTOP_LINK_BASE}/{DESKTOP_LINK_WIN})\n"
+        f"- macOS (Apple silicon): [{DESKTOP_LINK_DMG}]"
+        f"({DESKTOP_LINK_BASE}/{DESKTOP_LINK_DMG})\n",
+        "false",
+        0,
+        expect=(DESKTOP_LINK_EDITED,),
+        forbid=("already present", "refusing to guess"),
+    ),
+)
+
+
+def desktop_link_script(release: str) -> str:
+    """The SHIPPED body of the release-note link step, ready to run under bash.
+
+    Keyed on the job and the step name, and required to appear exactly once, for
+    the same reason as `signpath_guard_script`: an extractor that takes the
+    first `run: |` it finds tests whichever block happens to come first.
+    """
+    job = job_body(release, "finalize-release")
+    if not job:
+        raise AssertionError("release.yml has no finalize-release job")
+    occurrences = job.count(f"- name: {DESKTOP_LINK_STEP}\n")
+    if occurrences != 1:
+        raise AssertionError(
+            f"expected exactly one {DESKTOP_LINK_STEP!r} step, found {occurrences}"
+        )
+    step = named_step_body(job, DESKTOP_LINK_STEP)
+    match = re.search(r"^[ ]*run: \|\n(?P<body>.*)\Z", step, re.MULTILINE | re.DOTALL)
+    if not match:
+        raise AssertionError(f"{DESKTOP_LINK_STEP!r} has no `run: |` block")
+    body = match.group("body").split("\n")
+    indent = len(body[0]) - len(body[0].lstrip())
+    script = "\n".join(line[indent:] if len(line) >= indent else line for line in body)
+    for shape in ('gh release edit "$RELEASE_TAG"', "$RUNNER_TEMP/desktop.md"):
+        if shape not in script:
+            raise AssertionError(
+                f"the extracted step is not the link step; {shape!r} is gone"
+            )
+    return script
+
+
+def desktop_link_order_violations(release: str) -> list[str]:
+    """Where the step sits in finalize-release is part of what it promises.
+
+    It edits prose and nothing else in the release depends on it. `Publish
+    SHA256SUMS` and `Promote` are load-bearing, so an asset filename this step
+    cannot match must never be what leaves a release unchecksummed or
+    unpromoted -- which is exactly what happens if it runs ahead of them and
+    exits 1. It must equally stay AHEAD of the cleanup PR, which can fail after
+    creating its branch and then exit 0 on the re-run: behind it, a release that
+    met that failure would keep the unlinked notes it shipped with for good.
+    """
+    job = job_body(release, "finalize-release")
+    if not job:
+        return ["release.yml has no finalize-release job"]
+    order = re.findall(r"^      - name: (.+)$", job, re.MULTILINE)
+    violations: list[str] = []
+    if DESKTOP_LINK_STEP not in order:
+        return [f"finalize-release has no {DESKTOP_LINK_STEP!r} step"]
+    here = order.index(DESKTOP_LINK_STEP)
+    for earlier in ("Publish SHA256SUMS", "Promote"):
+        if earlier not in order:
+            violations.append(f"finalize-release no longer has a {earlier!r} step")
+        elif order.index(earlier) > here:
+            violations.append(
+                f"{DESKTOP_LINK_STEP!r} runs before {earlier!r}; a filename it "
+                "cannot match would leave the release unpromoted or unchecksummed"
+            )
+    later = "Open the release-as override cleanup PR"
+    if later in order and order.index(later) < here:
+        violations.append(
+            f"{DESKTOP_LINK_STEP!r} runs after {later!r}, which can fail after "
+            "creating its branch and then exit 0 on the re-run, so the links "
+            "would never be written"
+        )
+    return violations
+
+
+def desktop_link_behaviour_violations(release: str) -> list[str]:
+    """Run the shipped step against every note shape it can be handed."""
+    script = desktop_link_script(release)
+    violations: list[str] = []
+    for case in DESKTOP_LINK_TRUTH_TABLE:
+        with tempfile.TemporaryDirectory() as work:
+            runner_temp = os.path.join(work, "runner_temp")
+            os.makedirs(runner_temp)
+            # Bytes, so the CRLF rows carry the line endings they say they do
+            # and nothing on the way in normalises them back.
+            Path(work, "body.txt").write_bytes(case.body.encode("utf-8"))
+            Path(work, "assets.txt").write_bytes(
+                "".join(f"{name}\n" for name in case.assets).encode("utf-8")
+            )
+            result = subprocess.run(
+                [posix_bash(), "-c", DESKTOP_LINK_GH_STUB + script],
+                env={
+                    "PATH": os.environ.get("PATH", ""),
+                    "WORK": work.replace("\\", "/"),
+                    "RUNNER_TEMP": runner_temp.replace("\\", "/"),
+                    "RELEASE_TAG": DESKTOP_LINK_TAG,
+                    "GITHUB_REPOSITORY": DESKTOP_LINK_REPO,
+                    "SIGNPATH_CONFIGURED": case.signpath,
+                    "GH_TOKEN": "stub-token-the-real-gh-never-sees",
+                },
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            output = (result.stdout or "") + (result.stderr or "")
+            edited = Path(work, "edited.md")
+            written = edited.read_text(encoding="utf-8") if edited.exists() else ""
+
+        label = f"desktop links: {case.description}"
+        if result.returncode != case.status:
+            violations.append(
+                f"{label}: expected exit {case.status}, got {result.returncode}; "
+                f"output={output.strip()[:600]!r}"
+            )
+            continue
+        # Right status, wrong reason is still wrong: three rows exit 1 and three
+        # exit 0, each through a different branch, and a step that reaches the
+        # right answer by the wrong route is not the step the next edit reads.
+        haystack = f"{written}\n{output}"
+        for needle in case.expect:
+            if needle not in haystack:
+                violations.append(
+                    f"{label}: exited {result.returncode} as expected but never "
+                    f"said {needle!r}; output={haystack.strip()[:600]!r}"
+                )
+        for needle in case.forbid:
+            if needle in haystack:
+                violations.append(f"{label}: should not have said {needle!r}")
+        cursor = -1
+        for needle in case.ordered:
+            found = written.find(needle, cursor + 1)
+            if found < 0:
+                violations.append(
+                    f"{label}: the notes it wrote back have no {needle!r} after "
+                    "the text that must precede it"
+                )
+                break
+            cursor = found
+    return violations
+
+
+def awk_compares_crlf_lines_intact() -> bool:
+    """Whether this machine's awk sees the CR at the end of a CRLF line.
+
+    GNU Awk under MSYS reads in text mode and strips it, so `$0 == "## Install"`
+    matches a CRLF heading there and the CR-stripping `sed` in the step looks
+    like dead code. On GitHub's Ubuntu runners it does not, and dropping that
+    `sed` makes the step report a missing heading on a release that has one.
+    This is the difference between the two, asked directly rather than assumed,
+    so the mutation below is enforced where it is real and reported as
+    unchecked where it cannot be.
+    """
+    probe = subprocess.run(
+        [posix_bash(), "-c", "printf '## Install\\r\\n' | awk '$0 == \"## Install\"'"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # awk echoes the line only if the comparison held, i.e. only if the CR was
+    # already gone. No output means the CR was still there to be compared.
+    return not probe.stdout.strip()
+
+
+# --------------------------------------------------------------------------
 # signpath-status.yml -- the activation monitor
 # --------------------------------------------------------------------------
 #
@@ -4316,6 +4771,7 @@ def main() -> None:
         sync_release_pr,
     )
     violations.extend(windows_recipe_drift_violations(ci, release))
+    violations.extend(desktop_link_order_violations(release))
     violations.extend(candidate_observer_contract_violations(ci, observer, validator, archive))
     violations.extend(trusted_candidate_gate_violations(ci, classifier, validator))
     violations.extend(signpath_status_violations())
@@ -4995,8 +5451,14 @@ def main() -> None:
     # cannot see must change at least one row's exit status, or the table is
     # decoration.
     for old, new, why in (
+        # Anchored on the line above it as well: finalize-release's link step
+        # counts with an identically indented `present=$((present + 1))`, and a
+        # bare fixture would depend on which job happens to come first in the
+        # file for the mutation to land in this one.
         (
+            '            if [[ -n "${!var:-}" ]]; then\n'
             "              present=$((present + 1))",
+            '            if [[ -n "${!var:-}" ]]; then\n'
             "              present=$((present + 0))",
             "the count that decides whether the guard fires",
         ),
@@ -5029,6 +5491,75 @@ def main() -> None:
             raise AssertionError(
                 f"the SignPath guard truth table did not notice a mutation of {why}"
             )
+    # The other step in this file whose whole job is a decision no reading of
+    # the YAML can check: the desktop links in the published release notes.
+    link_violations = desktop_link_behaviour_violations(release)
+    if link_violations:
+        raise AssertionError(
+            "desktop release-note link behaviour contract failed:\n  "
+            + "\n  ".join(link_violations)
+        )
+    # Same rule as above: a truth table that cannot fail is decoration. Each
+    # mutation below is a way the step has actually been wrong, or a way it
+    # would silently go wrong; every one must turn at least one row red.
+    desktop_link_unchecked: list[str] = []
+    for old, new, why, needs_strict_awk in (
+        (
+            'for asset in "$win" "$dmg"; do',
+            'for asset in "$win"; do',
+            "the check that BOTH installers are on the release before linking",
+            False,
+        ),
+        # The `--` was missing once. Every marker starts with "- ", so grep read
+        # it as a bundle of short options, matched nothing, and the step
+        # re-inserted the section on a release that already had it.
+        (
+            'grep -Fxq -- "$marker" "$RUNNER_TEMP/install.md"',
+            'grep -Fxq "$marker" "$RUNNER_TEMP/install.md"',
+            "the -- that stops a marker being read as grep options",
+            False,
+        ),
+        # And matching the whole body was the first version. Both links quoted
+        # in a maintainers' note made it report success having linked nothing.
+        (
+            'grep -Fxq -- "$marker" "$RUNNER_TEMP/install.md"',
+            'grep -Fxq -- "$marker" "$RUNNER_TEMP/body.md"',
+            "scoping the already-linked check to the Install section",
+            False,
+        ),
+        (
+            '          if [[ "$present" -eq 2 ]]; then',
+            '          if [[ "$present" -ge 1 ]]; then',
+            "the refusal to call a half-written section finished",
+            False,
+        ),
+        (
+            "          sed -i 's/\\r$//' \"$RUNNER_TEMP/body.md\"\n",
+            "",
+            "the CR strip that lets a CRLF body find its own Install heading",
+            True,
+        ),
+    ):
+        if release.count(old) != 1:
+            raise AssertionError(
+                f"desktop link mutation fixture is stale or ambiguous: {old!r}"
+            )
+        if needs_strict_awk and not awk_compares_crlf_lines_intact():
+            # MSYS awk strips the CR before comparing, so removing the `sed`
+            # changes nothing here. Saying so beats a row that quietly passes:
+            # on Linux, where the release actually runs, this mutation bites.
+            desktop_link_unchecked.append(
+                f"{why}: this machine's awk strips CR from a CRLF line before "
+                "comparing it, so the mutation is invisible here; it is checked "
+                "on the Linux runners this workflow ships from"
+            )
+            continue
+        if not desktop_link_behaviour_violations(release.replace(old, new, 1)):
+            raise AssertionError(
+                f"the desktop link truth table did not notice a mutation of {why}"
+            )
+    for line in desktop_link_unchecked:
+        print(f"UNCHECKED: desktop release-note links: {line}")
     # The activation monitor, run against a fake SignPath. Its whole subject is
     # states nobody can produce here -- an accepted application, a resolving
     # project slug -- so a stub server is the only way any of it is measured at
