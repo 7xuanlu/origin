@@ -25,6 +25,12 @@ export interface ProviderConfiguredStatus {
  * Settings → Intelligence builds its availability triple from
  * (`settings/sections/IntelligenceSection.tsx`), so the two surfaces read one
  * shared cache and cannot disagree about what is turned on.
+ *
+ * Mount it in the component whose copy actually branches on the answer, not in
+ * an ancestor that merely passes it down: the three commands are settings IPC,
+ * so a caller that renders in the fixture-only Review flavor sends them outside
+ * that build's command contract (`review/commandCapabilities.ts`) and they fail
+ * closed.
  */
 export function useProviderConfigured(): ProviderConfiguredStatus {
   const anthropic = useApiKeyStatus();

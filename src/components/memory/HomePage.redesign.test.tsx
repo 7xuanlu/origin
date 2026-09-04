@@ -1510,6 +1510,41 @@ describe("HomePage redesign", () => {
     ).toBeInTheDocument();
   });
 
+  it("never asks for provider status on a home that has pages", async () => {
+    // The provider triple is settings IPC, and only the empty state branches on
+    // it. Read one level up it fired on every home mount, and in the
+    // fixture-only Review flavor those three commands sit outside the Review
+    // command contract (`review/commandCapabilities.ts`), which fails closed —
+    // so the home page rejected three commands on a screen that never asks the
+    // question. Keep the read inside the component that answers it.
+    vi.mocked(tauri.listPages).mockResolvedValue([
+      page({ id: "page-architecture", title: "Wenlan app architecture" }),
+    ]);
+
+    renderHome();
+
+    await screen.findByTestId("wiki-page-list");
+    // Give any stray query a turn of the event loop to fire before asserting.
+    await waitFor(() => expect(screen.queryByTestId("wiki-page-empty")).toBeNull());
+    expect(tauri.getApiKey).not.toHaveBeenCalled();
+    expect(tauri.getExternalLlm).not.toHaveBeenCalled();
+    expect(tauri.getOnDeviceModel).not.toHaveBeenCalled();
+  });
+
+  it("asks for provider status exactly where the empty state answers it", async () => {
+    // The mirror of the case above: with nothing to list, the empty state
+    // renders and its copy really does depend on the live provider, so all
+    // three reads must go out.
+    vi.mocked(tauri.listPages).mockResolvedValue([]);
+
+    renderHome();
+
+    await screen.findByTestId("wiki-page-empty");
+    await waitFor(() => expect(tauri.getApiKey).toHaveBeenCalled());
+    expect(tauri.getExternalLlm).toHaveBeenCalled();
+    expect(tauri.getOnDeviceModel).toHaveBeenCalled();
+  });
+
   it("shows a load-error state with retry in the needs-review rail when the queue fetch fails and the queue is empty, never All caught up", async () => {
     vi.mocked(tauri.listRefinements).mockRejectedValue(new Error("daemon can't deserialize a proposal variant"));
     vi.mocked(tauri.listPages).mockResolvedValue([

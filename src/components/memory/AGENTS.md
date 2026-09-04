@@ -40,6 +40,12 @@ sources, settings, remote access, imports, profile, and review surfaces.
   permanent latch, so it keeps claiming a provider that has since been removed
   and denies one that was configured a minute ago. Read the live provider
   through `useProviderConfigured`.
+- Do not hoist that read above the empty state. The three commands are settings
+  IPC and Home also renders in the fixture-only Review flavor, whose command
+  contract (`review/commandCapabilities.ts`) fails closed on them — so calling
+  the hook in `HomePage` rejects three commands on every Review home and breaks
+  `e2e/review-flavor.review.spec.ts`. Same rule for any other settings read: ask
+  from the component whose copy branches on the answer.
 - Do not promise pages will compile when no provider is configured. Page
   synthesis is LLM-gated, so that copy is a lie without a local model or an
   API key.

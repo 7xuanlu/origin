@@ -92,8 +92,6 @@ export default function HomePage({
     [knowledgePages],
   );
 
-  const provider = useProviderConfigured();
-
   const { milestones, acknowledge } = useMilestones();
 
   const firstConceptMs = milestones.find(
@@ -150,8 +148,6 @@ export default function HomePage({
         pages={recentlyRefinedPages}
         stats={stats}
         retrievals={retrievals}
-        providerConfigured={provider.configured}
-        providerResolved={provider.isResolved}
         onSelectPage={onSelectPage}
         onOpenDistillReview={onOpenDistillReview}
         onOpenMemory={onNavigateMemory}
@@ -249,8 +245,6 @@ function WikiHome({
   pages,
   stats,
   retrievals,
-  providerConfigured,
-  providerResolved,
   onSelectPage,
   onOpenDistillReview,
   onOpenMemory,
@@ -264,10 +258,6 @@ function WikiHome({
   pages: Page[];
   stats?: MemoryStats;
   retrievals: RetrievalEvent[];
-  /** An LLM provider is configured right now, so page synthesis can run. */
-  providerConfigured: boolean;
-  /** The provider queries have answered; before that, commit to neither variant. */
-  providerResolved: boolean;
   onSelectPage?: (pageId: string) => void;
   onOpenDistillReview?: () => void;
   onOpenMemory?: (sourceId: string) => void;
@@ -332,8 +322,6 @@ function WikiHome({
       >
         {knowledgePages.length === 0 ? (
           <HomeEmptyState
-            providerConfigured={providerConfigured}
-            providerResolved={providerResolved}
             onCreatePage={onCreatePage}
             onOpenIntelligenceSettings={onOpenIntelligenceSettings}
           />
@@ -466,19 +454,25 @@ const EMPTY_ACTION_STYLE: React.CSSProperties = {
  * ghost preview and "Write a page" are true in every state, so they render
  * immediately and the provider-dependent sentence and button appear once the
  * answer is actually known.
+ *
+ * The provider read lives here, not in `HomePage`, because this is the only
+ * screen on the home surface whose copy depends on the answer. Asked one level
+ * up it fired for every library, including the ones that already have pages and
+ * never render this component — three IPC calls per home mount whose result was
+ * discarded, and, in the fixture-only Review flavor, three commands outside the
+ * Review command contract (`review/commandCapabilities.ts`), which fails closed
+ * on anything it does not list.
  */
 function HomeEmptyState({
-  providerConfigured,
-  providerResolved,
   onCreatePage,
   onOpenIntelligenceSettings,
 }: {
-  providerConfigured: boolean;
-  providerResolved: boolean;
   onCreatePage: (space: string | null) => void;
   onOpenIntelligenceSettings: () => void;
 }) {
   const { t } = useTranslation();
+  const { configured: providerConfigured, isResolved: providerResolved } =
+    useProviderConfigured();
   const needsProvider = providerResolved && !providerConfigured;
   return (
     <section data-testid="wiki-page-empty" aria-labelledby="wiki-page-empty-title">
