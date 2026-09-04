@@ -1918,8 +1918,10 @@ mod tests {
         let started = std::time::Instant::now();
         let err = client.get_setup_status().await.unwrap_err();
 
+        // The bound is 5s, so 8s is slack for a loaded machine rather than a
+        // second ceiling — anything near 10s means the timeout is not applied.
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
+            started.elapsed() < std::time::Duration::from_secs(8),
             "setup status waited on the ingest-sized backstop: {:?}",
             started.elapsed()
         );

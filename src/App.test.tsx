@@ -54,6 +54,19 @@ vi.mock("@tauri-apps/api/window", () => ({
   }),
 }));
 
+// The real ladder is ~162s of wall clock by design (it has to outlast the
+// Rust health loop). Running it here would be a three-minute unit test, so
+// this file substitutes a two-attempt policy and asserts only the branching
+// it owns. The production schedule and its budget are pinned as arithmetic in
+// src/lib/bootRetryPolicy.test.ts.
+vi.mock("./lib/bootRetryPolicy", () => ({
+  ATTEMPT_TIMEOUT_MS: 5000,
+  RUST_HEALTH_LOOP_BUDGET_MS: 152_200,
+  BOOT_QUERY_RETRY: 1,
+  bootQueryRetryDelay: () => 10,
+  bootQueryBudgetMs: () => 10_010,
+}));
+
 // Heavy real children — swap for markers so this test only pins App's own
 // wizard-vs-home branching, not Main's or SetupWizard's internals.
 vi.mock("./components/memory/Main", () => ({
@@ -198,25 +211,18 @@ describe("App - first-run wizard gate", () => {
   });
 
   // The daemon's first-run install is async (app/src/lib.rs) and can race this
-  // query past its own retry budget. App.tsx's per-query retry (10 attempts,
-  // exponential backoff capped at 3s, ~27s of delay) overrides main.tsx's
-  // global retry:false, so this exercises the REAL production retry policy end
-  // to end rather than a shortened test double — hence the generous timeout.
-  it(
-    "fails closed to SetupWizard when shouldShowWizard rejects (daemon unreachable)",
-    async () => {
-      vi.mocked(shouldShowWizard).mockRejectedValue(new Error("connection refused"));
-      renderApp();
+  // query. App.tsx's per-query retry overrides main.tsx's global retry:false,
+  // and this pins that the query retries at all and then fails CLOSED. How
+  // MANY times and for how long is the policy module's contract, tested there.
+  it("fails closed to SetupWizard when shouldShowWizard rejects (daemon unreachable)", async () => {
+    vi.mocked(shouldShowWizard).mockRejectedValue(new Error("connection refused"));
+    renderApp();
 
-      expect(
-        await screen.findByTestId("setup-wizard", {}, { timeout: 45000 }),
-      ).toBeInTheDocument();
-      expect(screen.queryByTestId("home-main")).not.toBeInTheDocument();
-      // Proves retries actually happened, not just a single failed attempt.
-      expect(vi.mocked(shouldShowWizard).mock.calls.length).toBeGreaterThan(1);
-    },
-    50000,
-  );
+    expect(await screen.findByTestId("setup-wizard")).toBeInTheDocument();
+    expect(screen.queryByTestId("home-main")).not.toBeInTheDocument();
+    // Proves retries actually happened, not just a single failed attempt.
+    expect(vi.mocked(shouldShowWizard).mock.calls.length).toBeGreaterThan(1);
+  });
 
   it("waits for the active editor guard before an explicit quit reaches Tauri", async () => {
     let resolveFlush!: (saved: boolean) => void;

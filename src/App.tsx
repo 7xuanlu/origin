@@ -12,6 +12,7 @@ import {
   shouldShowWizard,
   setSetupCompleted,
 } from "./lib/tauri";
+import { BOOT_QUERY_RETRY, bootQueryRetryDelay } from "./lib/bootRetryPolicy";
 import Main from "./components/memory/Main";
 import SetupWizard from "./components/SetupWizard";
 import { RuntimeOverlays } from "./components/RuntimeOverlays";
@@ -26,12 +27,13 @@ export default function App() {
     // Overrides main.tsx's global retry:false — the first-run daemon install
     // (app/src/lib.rs) is spawned async and races this query, so it needs to
     // survive that window instead of failing on the first miss.
-    // 10, not 5: 5 attempts is ~12s of budget, and a cold start on a slow
-    // machine outlasts it — which drops an already-configured user into the
-    // fail-closed SetupWizard below. 10 attempts is ~27s of backoff plus
-    // request time, and each attempt is now bounded (app/src/api.rs).
-    retry: 10,
-    retryDelay: (attemptIndex) => Math.min(1000 * 2 ** attemptIndex, 3000),
+    // The schedule and, more importantly, the total budget live in
+    // ./lib/bootRetryPolicy: it has to outlast the Rust health loop's own
+    // ~152s wait for this same daemon, or the fail-closed branch below shows
+    // the first-run wizard to a configured user while startup is still
+    // waiting. Each attempt is separately bounded to 5s (app/src/api.rs).
+    retry: BOOT_QUERY_RETRY,
+    retryDelay: bootQueryRetryDelay,
     // This is a Tauri IPC call to a daemon on localhost, not a network request.
     // The default "online" mode would PAUSE it whenever navigator.onLine is
     // false (fetchStatus "paused", never "fetching"), so an offline machine
@@ -226,11 +228,12 @@ export default function App() {
   let body: ReactNode;
   if (wizardPending) {
     // The daemon can take seconds to answer on a cold start. Say so, instead
-    // of holding an empty window: same themed background as the first paint
-    // and as Home, so nothing flashes on either side of this state.
+    // of holding an empty window. --bg-primary is what index.html paints
+    // before React mounts (src/__tests__/firstPaint.test.ts pins the two to
+    // the same hex), so this panel takes over that background without a flash.
     body = (
       <div
-        className="flex flex-col items-center justify-center w-screen h-screen bg-[var(--bg-secondary)] text-[var(--text-secondary)]"
+        className="flex flex-col items-center justify-center w-screen h-screen bg-[var(--bg-primary)] text-[var(--text-secondary)]"
         role="status"
         aria-live="polite"
       >

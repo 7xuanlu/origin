@@ -31,13 +31,24 @@ const TAURI_CONF_PATH = path.join(ROOT, "app/tauri.conf.json");
 const APP_TSX_PATH = path.join(ROOT, "src/App.tsx");
 const SRC_DIR = path.join(ROOT, "src");
 
-/** Frontend calls that move or resize a native window. */
+/** Frontend calls that move, resize, or re-centre a native window. */
 const GEOMETRY_CALLS = [
   "resizeWindowCentered",
   "setSize(",
   "setPosition(",
+  ".center(",
   "currentMonitor(",
 ] as const;
+
+/**
+ * Files allowed to position a window, and why.
+ *
+ * ToastOverlay drives the separate `#toast` webview — a small always-on-top
+ * panel it parks in the corner of the primary monitor. That window has no
+ * declared geometry to be born with, so positioning it from the frontend is
+ * the only option. It never touches the main window.
+ */
+const GEOMETRY_ALLOWLIST = new Set(["src/components/ToastOverlay.tsx"]);
 
 type TauriWindow = {
   label?: string;
@@ -89,11 +100,28 @@ describe("main window geometry", () => {
     ).toEqual([]);
   });
 
-  it("keeps the resizeWindowCentered helper deleted across the frontend", () => {
+  // App.tsx is where the defect was, but it is not the only file that could
+  // reintroduce it — anything mounted into the main window can move it. So
+  // sweep the whole frontend, and name the one file that is allowed to.
+  it("moves no window from anywhere in the frontend but the toast overlay", () => {
     const offenders = listSourceFiles(SRC_DIR)
-      .filter((file) => readSourceText(file).includes("resizeWindowCentered"))
-      .map((file) => repoRelativePath(file, ROOT));
+      .map((file) => ({
+        file: repoRelativePath(file, ROOT),
+        calls: GEOMETRY_CALLS.filter((call) => readSourceText(file).includes(call)),
+      }))
+      .filter(({ file, calls }) => calls.length > 0 && !GEOMETRY_ALLOWLIST.has(file))
+      .map(({ file, calls }) => `${file}: ${calls.join(", ")}`);
 
     expect(offenders).toEqual([]);
+  });
+
+  it("keeps the toast overlay's own positioning in the allowlist honest", () => {
+    // A stale allowlist is worse than none: it silently exempts a file that
+    // stopped needing the exemption. If ToastOverlay ever stops positioning
+    // its window, this fails and the entry should be deleted.
+    const toastSource = readSourceText(path.join(ROOT, "src/components/ToastOverlay.tsx"));
+
+    expect(toastSource).toContain("setPosition(");
+    expect(toastSource).not.toContain(".center(");
   });
 });
