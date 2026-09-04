@@ -191,12 +191,21 @@ describe("App - first-run wizard gate", () => {
         resolveWizard = resolve;
       }),
     );
-    renderApp();
+    const { container } = renderApp();
 
     const status = await screen.findByRole("status");
     expect(status).toHaveTextContent(STARTING_RUNTIME);
     expect(screen.queryByTestId("setup-wizard")).not.toBeInTheDocument();
     expect(screen.queryByTestId("home-main")).not.toBeInTheDocument();
+
+    // The panel owns the whole window (`w-screen h-screen`, centred), so it has
+    // to be a top-level branch of App and not a child of the app shell. Nested
+    // inside `.memory-shell` it would centre itself in the content slot beside
+    // an expanded sidebar and land visibly right of centre in an otherwise
+    // empty window.
+    expect(status.parentElement).toBe(container);
+    expect(status.closest(".memory-shell")).toBeNull();
+    expect(container.querySelector(".memory-shell")).toBeNull();
     expect(screen.getByTestId("runtime-overlays")).toHaveAttribute(
       "data-variant",
       "updater-only",
