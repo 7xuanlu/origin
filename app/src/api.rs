@@ -1286,8 +1286,29 @@ impl WenlanClient {
     }
 
     /// GET /api/setup/status — return daemon-owned setup/model/key state.
+    ///
+    /// Bounded by [`HEALTH_TIMEOUT`], not the ingest-sized [`REQUEST_TIMEOUT`]:
+    /// the app's first-run gate (`should_show_wizard`, consumed by
+    /// `src/App.tsx`) calls this on every launch, while the daemon may have
+    /// bound its socket but not finished initializing. Inheriting the 600s
+    /// backstop lets one attempt hold the window on a status screen for
+    /// minutes. The caller retries, so a bounded failure is recoverable and a
+    /// hang is not.
     pub async fn get_setup_status(&self) -> Result<SetupStatusResponse, String> {
-        self.get_json("/api/setup/status").await
+        let path = "/api/setup/status";
+        let resp = self
+            .client
+            .get(self.url(path))
+            .timeout(HEALTH_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP GET {}: {}", path, e))?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP GET {} returned {}", path, resp.status()));
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("Parse {}: {}", path, e))
     }
 
     /// Mark setup complete/incomplete through the daemon config endpoint.
@@ -1878,6 +1899,32 @@ mod tests {
         );
         assert!(
             err.contains("HTTP GET /api/health"),
+            "unexpected error shape: {err}"
+        );
+    }
+
+    /// The launch gate's request, against a daemon that accepts and then goes
+    /// quiet. Without the explicit per-request timeout this inherits
+    /// `REQUEST_TIMEOUT` (600s) and the app sits on its starting-runtime
+    /// screen for ten minutes instead of retrying.
+    #[tokio::test]
+    async fn setup_status_fails_fast_even_with_production_timeouts() {
+        let base_url = serve_hang_once().await;
+        let client = WenlanClient {
+            client: build_http_client(CONNECT_TIMEOUT, REQUEST_TIMEOUT),
+            base_url,
+        };
+
+        let started = std::time::Instant::now();
+        let err = client.get_setup_status().await.unwrap_err();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "setup status waited on the ingest-sized backstop: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.contains("HTTP GET /api/setup/status"),
             "unexpected error shape: {err}"
         );
     }

@@ -15,7 +15,7 @@
         "label": "main",
         "title": "Wenlan",
         "width": 1280,
-        "height": 760,
+        "height": 720,
         "resizable": true,
         "decorations": true,
         "titleBarStyle": "Overlay",

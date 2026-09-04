@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useCallback, useState, useEffect, useRef, type ReactNode } from "react";
+import { useTranslation } from "react-i18next";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { resizeWindowCentered } from "./lib/resizeWindow";
 import {
   acknowledgeGuardedQuitRequest,
   cancelGuardedQuitRequest,
@@ -16,10 +16,8 @@ import Main from "./components/memory/Main";
 import SetupWizard from "./components/SetupWizard";
 import { RuntimeOverlays } from "./components/RuntimeOverlays";
 
-const MEMORY_WIDTH = 1280;
-const MEMORY_HEIGHT = 720;
-
 export default function App() {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const { data: showWizard, isPending: wizardPending, isError: wizardError } = useQuery({
     queryKey: ["shouldShowWizard"],
@@ -27,8 +25,12 @@ export default function App() {
     staleTime: Infinity,
     // Overrides main.tsx's global retry:false — the first-run daemon install
     // (app/src/lib.rs) is spawned async and races this query, so it needs to
-    // survive that window (~12s) instead of failing on the first miss.
-    retry: 5,
+    // survive that window instead of failing on the first miss.
+    // 10, not 5: 5 attempts is ~12s of budget, and a cold start on a slow
+    // machine outlasts it — which drops an already-configured user into the
+    // fail-closed SetupWizard below. 10 attempts is ~27s of backoff plus
+    // request time, and each attempt is now bounded (app/src/api.rs).
+    retry: 10,
     retryDelay: (attemptIndex) => Math.min(1000 * 2 ** attemptIndex, 3000),
     // This is a Tauri IPC call to a daemon on localhost, not a network request.
     // The default "online" mode would PAUSE it whenever navigator.onLine is
@@ -213,17 +215,28 @@ export default function App() {
     return () => { unlisten.then((f) => f()); };
   }, []);
 
-  // Home is the only reachable page, so the window is always sized/centered once on mount.
-  useEffect(() => {
-    resizeWindowCentered(MEMORY_WIDTH, MEMORY_HEIGHT);
-  }, []);
+  // The window is born at its final size and centered by Tauri
+  // (app/tauri.conf.json: 1280x720, "center": true). Nothing here resizes or
+  // moves it afterwards — a mount-time resize made the window visibly shrink
+  // and jump a couple of seconds after launch, every launch.
 
   // isPending, not isLoading: isLoading is (isPending && isFetching), which goes
   // false whenever the query is paused rather than fetching — that would fall
   // through to Home with no answer. isPending is true until we actually have one.
   let body: ReactNode;
   if (wizardPending) {
-    body = <div className="w-screen min-h-screen bg-[var(--bg-secondary)]" />;
+    // The daemon can take seconds to answer on a cold start. Say so, instead
+    // of holding an empty window: same themed background as the first paint
+    // and as Home, so nothing flashes on either side of this state.
+    body = (
+      <div
+        className="flex flex-col items-center justify-center w-screen h-screen bg-[var(--bg-secondary)] text-[var(--text-secondary)]"
+        role="status"
+        aria-live="polite"
+      >
+        <p className="text-lg">{t("common.startingRuntime")}</p>
+      </div>
+    );
   } else if (showWizard || wizardError) {
     // ponytail: fail CLOSED. If the daemon is still unreachable after retries,
     // show the wizard rather than silently falling through to Home — an

@@ -3,6 +3,7 @@ export const supportedAppLocales = ["en", "zh-Hans", "zh-Hant"] as const;
 const en = {
   common: {
     close: "Close",
+    startingRuntime: "Starting the local runtime…",
   },
   setup: {
     welcomeTitle: "Welcome to Wenlan",
@@ -1603,6 +1604,7 @@ const en = {
 const zhHans = {
   common: {
     close: "关闭",
+    startingRuntime: "正在启动本地运行时…",
   },
   setup: {
     welcomeTitle: "欢迎使用文澜",
@@ -3155,6 +3157,7 @@ const zhHans = {
 const zhHant = {
   common: {
     close: "關閉",
+    startingRuntime: "正在啟動本機執行時…",
   },
   setup: {
     welcomeTitle: "歡迎使用文瀾",
