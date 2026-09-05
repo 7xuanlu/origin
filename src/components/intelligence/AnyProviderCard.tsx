@@ -35,6 +35,13 @@ const OLLAMA_ENDPOINT = presetEndpoint("ollama");
 const LMSTUDIO_ENDPOINT = presetEndpoint("lmstudio");
 const hostOf = (ep: string) => ep.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
 const localLabel = (name: string) => name.replace(/\s*\(local\)$/i, "");
+// "The server wants a token" is a different problem from "the server is
+// down", and the fix (paste a key) is different too. The daemon and the
+// Tauri discovery command both carry the upstream status verbatim
+// (`API error 401 Unauthorized from …`, `401 Unauthorized from …/models`),
+// so a status match is enough — no error-shape parsing.
+const isUnauthorized = (err: unknown): boolean =>
+  /\b40[13]\b|unauthori[sz]ed|forbidden/i.test(err instanceof Error ? err.message : String(err ?? ""));
 
 // Thread #5: the discovery query is keyed on live user input, so every
 // keystroke used to fire its own fetch. Delay only the value fed into that
@@ -130,6 +137,7 @@ export default function AnyProviderCard({
 
   const trimmedEndpoint = normalizeEndpoint(endpoint);
   const endpointValid = /^https?:\/\//.test(trimmedEndpoint);
+  const typedKey = apiKey.trim() !== "";
 
   // §9.2: probe BOTH local servers on pane mount — but only when this card's
   // scope can actually show them. A cloud- or Anthropic-only card has no
@@ -163,6 +171,11 @@ export default function AnyProviderCard({
     id === "ollama" ? OLLAMA_ENDPOINT : id === "lmstudio" ? LMSTUDIO_ENDPOINT : null;
   const selectedProbe =
     probedEndpointFor(presetId) === trimmedEndpoint ? probeFor(presetId) : null;
+  // The mount probe carries no key. Once the user types one the server may
+  // answer differently (LM Studio with "Require Authentication" on rejects
+  // the keyless probe with 401), so the keyless verdict stops speaking for
+  // this form and the discovery query below re-asks with the key.
+  const localQuery = typedKey ? null : selectedProbe;
 
   // Model auto-discovery; silent fallback to free text on failure. Ollama/LM
   // Studio already have a dedicated probe above — reusing this query for them
@@ -181,21 +194,22 @@ export default function AnyProviderCard({
   const discovery = useQuery({
     queryKey: ["external-models", debouncedEndpoint, debouncedApiKey],
     queryFn: () => listExternalModels(debouncedEndpoint, debouncedApiKey || null),
-    enabled: endpointValid && !selectedProbe && discoverySettled,
+    enabled: endpointValid && !localQuery && discoverySettled,
     retry: false,
     staleTime: 30_000,
   });
   const models = discovery.data ?? [];
-  const localQuery = selectedProbe;
   const localQueryModels = localQuery?.data ?? [];
   // A keyed cloud vendor's discovery results feed the same polished <Select>
   // that local presets get, once a key actually works — "paste key → model
-  // list appears → pick one." Custom keeps the old free-text + datalist
-  // experience: it never has a key step, so there's no equivalent moment
-  // where the dropdown should just fill itself in.
+  // list appears → pick one." A local/custom endpoint with a typed key gets
+  // the same treatment: the key is what made the list appear. Keyless
+  // custom keeps the old free-text + datalist experience: it has no key
+  // step, so there's no equivalent moment where the dropdown should just
+  // fill itself in.
   const showModelSelect = localQuery
     ? localQueryModels.length >= 1
-    : preset.keyRequired && models.length >= 1;
+    : (preset.keyRequired || typedKey) && models.length >= 1;
   const effectiveModels = localQuery ? localQueryModels : models;
   // The daemon never exposes a stored key's VALUE to the frontend (security
   // posture, not a gap) — only a presence flag, `keyConfigured`, scoped to
@@ -204,8 +218,8 @@ export default function AnyProviderCard({
   // a stored key cannot. `keyConfigured === true` must never be read as "we
   // have a key to discover with" — it may belong to a different vendor
   // entirely (paste an OpenAI key, click the Groq chip, and `keyConfigured`
-  // still reads true).
-  const typedKey = apiKey.trim() !== "";
+  // still reads true). `typedKey` (declared next to the endpoint above) is
+  // the only signal that a key is actually in hand.
   // Which vendor the daemon's currently-stored key/endpoint actually
   // belongs to — `keyConfigured` alone can't say that, so cross-reference
   // it against the saved endpoint's preset.
@@ -317,6 +331,14 @@ export default function AnyProviderCard({
   // re-hostable, so both keep the field.
   const knownCloudEndpoint = preset.keyRequired && !preset.native && preset.group === "cloud";
 
+  // Local/custom servers don't need a key, but some ask for one anyway: LM
+  // Studio 0.4+ with "Require Authentication" on refuses every request that
+  // carries no bearer token. Offer the field as optional, gated on the same
+  // daemon floor as the cloud keys — an older daemon drops the key on the
+  // floor silently, and a field that silently does nothing is worse than
+  // none.
+  const optionalKeyField = !preset.keyRequired && supportsExternalKey;
+
   // Dropdown-only Model field for the keyed cloud vendors (user report: "I
   // thought even the model don't need to type, only need to select from
   // dropdown"). Every keyRequired preset that reaches this branch IS a cloud
@@ -384,10 +406,25 @@ export default function AnyProviderCard({
               name: localLabel(preset.name),
               count: localQueryModels.length,
             })
-        : t("externalProvider.localNotDetectedChip", {
-            name: localLabel(preset.name),
-            host: hostOf(preset.endpoint),
-          });
+        : isUnauthorized(localQuery.error)
+          ? t("externalProvider.localUnauthorizedChip", {
+              name: localLabel(preset.name),
+              host: hostOf(preset.endpoint),
+            })
+          : t("externalProvider.localNotDetectedChip", {
+              name: localLabel(preset.name),
+              host: hostOf(preset.endpoint),
+            });
+
+  // Discovery with no typed key is a guaranteed 401 for a cloud vendor —
+  // expected, not worth surfacing. Local probes (localQuery) keep their own
+  // error path unconditionally. A 401 anywhere else is the server asking
+  // for a token, so the hint points at the key field rather than at "type a
+  // model name".
+  const discoveryFailed =
+    ((!knownCloudEndpoint || typedKey) && discovery.isError) || localQuery?.isError === true;
+  const discoveryUnauthorized =
+    discoveryFailed && (isUnauthorized(discovery.error) || isUnauthorized(localQuery?.error));
 
   const body = (
     <div className="flex flex-col" style={{ gap: "12px" }}>
@@ -461,19 +498,23 @@ export default function AnyProviderCard({
               </Field>
             )}
 
-            {/* Key precedes Model for the keyed cloud vendors: the key is
-                the precondition for model discovery, so the form reads in
-                the order the user actually fills it — paste key → models
-                load → pick one. (preset.keyRequired is true only for cloud
-                vendors here — see knownCloudEndpoint above — so this never
-                reorders the local/custom presets, which have no key field.) */}
-            {preset.keyRequired && (
+            {/* Key precedes Model: the key is the precondition for model
+                discovery, so the form reads in the order the user actually
+                fills it — paste key → models load → pick one. Cloud vendors
+                require it; local/custom presets get the same slot as an
+                optional field (optionalKeyField), since a typed key is what
+                unlocks discovery on a token-guarded LM Studio too. */}
+            {(preset.keyRequired || optionalKeyField) && (
               <Field
-                label={t("externalProvider.apiKeyLabel")}
+                label={preset.keyRequired ? t("externalProvider.apiKeyLabel") : t("externalProvider.apiKeyOptionalLabel")}
                 htmlFor="any-provider-key"
-                description={keyPrefixMismatch(preset, apiKey)
-                  ? t("externalProvider.keyHint", { vendor: preset.name, prefix: (preset.keyPrefixes ?? []).join(" or ") })
-                  : undefined}
+                description={
+                  keyPrefixMismatch(preset, apiKey)
+                    ? t("externalProvider.keyHint", { vendor: preset.name, prefix: (preset.keyPrefixes ?? []).join(" or ") })
+                    : optionalKeyField
+                      ? t("externalProvider.apiKeyOptionalHint")
+                      : undefined
+                }
               >
                 <Input
                   type="password"
@@ -554,14 +595,13 @@ export default function AnyProviderCard({
                 ))}
               </datalist>
             )}
-            {/* Discovery with no typed key is a guaranteed 401 for a cloud
-                vendor — expected, not worth surfacing. Local probes
-                (localQuery) keep their own error path unconditionally: they
-                have no key requirement at all, so there's no "expected
-                failure" case to suppress. */}
-            {(((!knownCloudEndpoint || typedKey) && discovery.isError) || localQuery?.isError) && (
+            {discoveryFailed && (
               <span style={{ fontFamily: "var(--mem-font-body)", fontSize: "var(--mem-text-xs)", color: "var(--mem-text-tertiary)" }}>
-                {t("externalProvider.modelDiscoveryFailed")}
+                {!discoveryUnauthorized
+                  ? t("externalProvider.modelDiscoveryFailed")
+                  : typedKey
+                    ? t("externalProvider.modelDiscoveryKeyRejected")
+                    : t("externalProvider.modelDiscoveryUnauthorized")}
               </span>
             )}
 
@@ -589,6 +629,16 @@ export default function AnyProviderCard({
             {testState.kind === "ok" && (
               <p style={{ fontFamily: "var(--mem-font-mono)", fontSize: "var(--mem-text-xs)", color: "var(--mem-text-secondary)" }}>
                 {t("externalProvider.testOk", { response: testState.response })}
+              </p>
+            )}
+            {/* The verbatim daemon error stays (it names the exact URL that
+                answered), but a 401 gets a plain-language line first. Test
+                only ever sends the key typed right now (keyToSend), so with
+                none typed the server is asking for one; with one typed the
+                server refused that key. */}
+            {testState.kind === "error" && isUnauthorized(testState.message) && (
+              <p style={{ fontFamily: "var(--mem-font-body)", fontSize: "var(--mem-text-sm)", color: "var(--mem-text-secondary)", lineHeight: 1.5 }}>
+                {t(typedKey ? "externalProvider.testKeyRejectedHint" : "externalProvider.testUnauthorizedHint")}
               </p>
             )}
             {testState.kind === "error" && (

@@ -1105,7 +1105,7 @@ pub async fn handle_recent_pages(
 pub async fn handle_test_llm(
     Json(req): Json<wenlan_types::requests::TestLlmRequest>,
 ) -> Result<Json<wenlan_types::requests::TestLlmResponse>, ServerError> {
-    use wenlan_core::llm_provider::{LlmProvider, LlmRequest, OpenAICompatibleProvider};
+    use wenlan_core::llm_provider::{LlmError, LlmProvider, LlmRequest, OpenAICompatibleProvider};
 
     let provider = OpenAICompatibleProvider::new_with_key(req.endpoint, req.model, req.api_key);
     let llm_req = LlmRequest {
@@ -1118,10 +1118,16 @@ pub async fn handle_test_llm(
         label: None,
         timeout_secs: None,
     };
-    let response = provider
-        .generate(llm_req)
-        .await
-        .map_err(|e| ServerError::Internal(format!("test_llm: {e}")))?;
+    // A failure here is the upstream server's answer (401 from LM Studio's
+    // auth toggle, a refused connection, a timeout), not a daemon fault.
+    // 502 says so; a bare 500 read as "wenlan crashed" when the server had
+    // merely rejected the request.
+    let response = provider.generate(llm_req).await.map_err(|e| match e {
+        LlmError::InferenceFailed(_) | LlmError::Timeout => {
+            ServerError::Upstream(format!("test_llm: {e}"))
+        }
+        other => ServerError::Internal(format!("test_llm: {other}")),
+    })?;
     Ok(Json(wenlan_types::requests::TestLlmResponse { response }))
 }
 
@@ -2327,13 +2333,40 @@ mod test_llm_bearer_tests {
         (addr, captured)
     }
 
-    async fn probe(addr: std::net::SocketAddr, body: serde_json::Value) -> StatusCode {
+    /// Mock server that refuses every request the way LM Studio does with
+    /// "Require Authentication" on and no bearer token supplied.
+    async fn spawn_unauthorized_mock() -> std::net::SocketAddr {
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({
+                        "error": {
+                            "message": "An LM Studio API token is required to make requests to this server",
+                            "type": "invalid_request_error",
+                            "code": "invalid_api_key"
+                        }
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    async fn probe_response(
+        addr: std::net::SocketAddr,
+        body: serde_json::Value,
+    ) -> (StatusCode, String) {
         let state = Arc::new(RwLock::new(ServerState::default()));
         let router = crate::router::build_router(state);
         let mut body = body;
         body["endpoint"] = serde_json::json!(format!("http://{addr}"));
         body["model"] = serde_json::json!("test-model");
-        router
+        let response = router
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2343,8 +2376,45 @@ mod test_llm_bearer_tests {
                     .unwrap(),
             )
             .await
-            .unwrap()
-            .status()
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    async fn probe(addr: std::net::SocketAddr, body: serde_json::Value) -> StatusCode {
+        probe_response(addr, body).await.0
+    }
+
+    /// The app showed `HTTP POST /api/llm/test returned 500 Internal Server
+    /// Error` wrapping LM Studio's own 401, which read as a daemon crash.
+    /// An upstream refusal is a 502 that names the URL and quotes the server.
+    #[tokio::test]
+    async fn test_llm_reports_upstream_rejection_as_502_naming_the_url() {
+        let addr = spawn_unauthorized_mock().await;
+        let (status, body) = probe_response(addr, serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let msg = json["error"].as_str().unwrap();
+        assert!(msg.contains("401 Unauthorized"), "{msg}");
+        assert!(
+            msg.contains(&format!("http://{addr}/chat/completions")),
+            "{msg}"
+        );
+        assert!(msg.contains("API token is required"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_llm_reports_unreachable_server_as_502() {
+        // Bind then drop: the port is free, so the connect is refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (status, body) = probe_response(addr, serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(body.contains("Request failed"), "{body}");
     }
 
     #[tokio::test]

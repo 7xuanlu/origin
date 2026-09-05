@@ -87,6 +87,9 @@ describe("AnyProviderCard — the Local-server card (spec §5.2)", () => {
     expect(screen.queryByText("Groq")).not.toBeInTheDocument();
     expect(screen.queryByText("Gemini")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("API key")).not.toBeInTheDocument();
+    // The optional local key field is behind the same 0.13 daemon floor as
+    // the cloud keys — on this 0.12 daemon it must not render either.
+    expect(screen.queryByLabelText("API key (optional)")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Ollama" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByLabelText("Endpoint URL")).toHaveValue("http://localhost:11434/v1");
   });
@@ -386,6 +389,125 @@ describe("AnyProviderCard — the Local-server card (spec §5.2)", () => {
     expect(mocks.listExternalModels).toHaveBeenCalledWith("http://localhost:9999/v1", null);
   });
 
+  // LM Studio 0.4+ can require a bearer token on every request ("Require
+  // Authentication" in its Server Settings). The daemon already threads a
+  // key end to end; the card just never offered a place to type one for a
+  // local/custom preset, so the only symptom was a 401 dressed as a 500.
+  describe("optional API key for local/custom presets (token-guarded LM Studio)", () => {
+    beforeEach(() => {
+      mocks.getDaemonVersion.mockResolvedValue("0.13.0");
+    });
+
+    it("gate CLOSED (0.12 daemon): LM Studio shows no key field at all — an old daemon would drop the key silently", async () => {
+      mocks.getDaemonVersion.mockResolvedValue("0.12.0");
+      renderCard();
+      await userEvent.click(await screen.findByRole("button", { name: "LM Studio" }));
+      await screen.findByText(/Connected to LM Studio/);
+      expect(screen.queryByLabelText("API key (optional)")).not.toBeInTheDocument();
+      expect(screen.queryByLabelText("API key")).not.toBeInTheDocument();
+    });
+
+    it("gate OPEN: LM Studio shows an optional password field; a typed key re-runs discovery with it and rides along on Test and Save", async () => {
+      renderCard();
+      await userEvent.click(await screen.findByRole("button", { name: "LM Studio" }));
+      await screen.findByText(/Connected to LM Studio/);
+      const key = await screen.findByLabelText("API key (optional)");
+      expect(key).toHaveAttribute("type", "password");
+      expect(screen.getByText(/Only if this server asks for a token/)).toBeInTheDocument();
+
+      await userEvent.type(key, "lm-token");
+      // The keyless mount probe no longer speaks for this form: discovery
+      // re-asks the same endpoint with the key…
+      await waitFor(() =>
+        expect(mocks.listExternalModels).toHaveBeenCalledWith("http://localhost:1234/v1", "lm-token")
+      );
+      // …and what it lists fills the same dropdown the probe would have.
+      await waitFor(() => expect(screen.getByLabelText("Model").tagName).toBe("SELECT"));
+      await userEvent.selectOptions(screen.getByLabelText("Model"), "llama3.2:3b");
+
+      await userEvent.click(screen.getByRole("button", { name: "Test" }));
+      await waitFor(() =>
+        expect(mocks.testExternalLlm).toHaveBeenCalledWith("http://localhost:1234/v1", "llama3.2:3b", "lm-token")
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() =>
+        expect(mocks.setExternalLlm).toHaveBeenCalledWith("http://localhost:1234/v1", "llama3.2:3b", "lm-token")
+      );
+    });
+
+    it("probe 401: the chip and the discovery hint say the server wants a key, not that it is down", async () => {
+      mocks.listExternalModels.mockRejectedValue(new Error("401 Unauthorized from http://localhost:1234/v1/models"));
+      renderCard();
+      await userEvent.click(await screen.findByRole("button", { name: "LM Studio" }));
+      expect(await screen.findByText(/LM Studio at localhost:1234 asks for an API key/)).toBeInTheDocument();
+      expect(screen.getByText(/wants an API key \(401\)/)).toBeInTheDocument();
+      expect(screen.queryByText(/is LM Studio running/)).not.toBeInTheDocument();
+    });
+
+    it("probe down (not 401): the not-detected chip and the generic hint are unchanged", async () => {
+      mocks.listExternalModels.mockRejectedValue(new Error("ECONNREFUSED"));
+      renderCard();
+      await userEvent.click(await screen.findByRole("button", { name: "LM Studio" }));
+      expect(await screen.findByText(/Not detected at localhost:1234/)).toBeInTheDocument();
+      expect(screen.getByText(/type a model name/i)).toBeInTheDocument();
+      expect(screen.queryByText(/asks for an API key/)).not.toBeInTheDocument();
+    });
+
+    it("custom endpoint, no key: a 401 on discovery names the key as the fix", async () => {
+      mocks.listExternalModels.mockRejectedValue(new Error("401 Unauthorized from http://192.168.1.252:1234/v1/models"));
+      renderCard();
+      await userEvent.click(await screen.findByRole("button", { name: "Custom…" }));
+      await userEvent.type(screen.getByLabelText("Endpoint URL"), "http://192.168.1.252:1234");
+      expect(await screen.findByText(/wants an API key \(401\)/)).toBeInTheDocument();
+      expect(screen.getByLabelText("API key (optional)")).toBeInTheDocument();
+    });
+
+    it("Test 401: a plain-language hint precedes the verbatim daemon error, which still names the URL", async () => {
+      mocks.testExternalLlm.mockRejectedValue(
+        new Error(
+          'HTTP POST /api/llm/test returned 502 Bad Gateway: {"error":"test_llm: Inference failed: API error 401 Unauthorized from http://localhost:1234/v1/chat/completions: token required"}',
+        ),
+      );
+      renderCard();
+      await userEvent.click(await screen.findByRole("button", { name: "LM Studio" }));
+      await screen.findByText(/Connected to LM Studio/);
+      await userEvent.selectOptions(screen.getByLabelText("Model"), "llama3.2:3b");
+      await userEvent.click(screen.getByRole("button", { name: "Test" }));
+      expect(await screen.findByText(/rejected the request as unauthorized \(401\)/)).toBeInTheDocument();
+      expect(
+        screen.getByText(/API error 401 Unauthorized from http:\/\/localhost:1234\/v1\/chat\/completions/),
+      ).toBeInTheDocument();
+    });
+
+    it("typed key refused: discovery and Test both say the key was rejected, not that one is missing", async () => {
+      mocks.listExternalModels.mockRejectedValue(new Error("401 Unauthorized from http://localhost:1234/v1/models"));
+      mocks.testExternalLlm.mockRejectedValue(
+        new Error('HTTP POST /api/llm/test returned 502 Bad Gateway: {"error":"test_llm: Inference failed: API error 401 Unauthorized from http://localhost:1234/v1/chat/completions: invalid token"}'),
+      );
+      renderCard();
+      await userEvent.click(await screen.findByRole("button", { name: "LM Studio" }));
+      await userEvent.type(await screen.findByLabelText("API key (optional)"), "wrong-token");
+      expect(await screen.findByText(/rejected this API key \(401\)/)).toBeInTheDocument();
+      expect(screen.queryByText(/wants an API key/)).not.toBeInTheDocument();
+      await userEvent.type(screen.getByLabelText("Model"), "google/gemma-4-12b-qat");
+      await userEvent.click(screen.getByRole("button", { name: "Test" }));
+      expect(await screen.findByText(/rejected this API key \(401 Unauthorized\)/)).toBeInTheDocument();
+    });
+
+    it("Test failure that is not an auth problem gets no key hint", async () => {
+      mocks.testExternalLlm.mockRejectedValue(
+        new Error('HTTP POST /api/llm/test returned 502 Bad Gateway: {"error":"test_llm: Inference failed: Request failed: connection refused"}'),
+      );
+      renderCard();
+      await userEvent.click(await screen.findByRole("button", { name: "LM Studio" }));
+      await screen.findByText(/Connected to LM Studio/);
+      await userEvent.selectOptions(screen.getByLabelText("Model"), "llama3.2:3b");
+      await userEvent.click(screen.getByRole("button", { name: "Test" }));
+      expect(await screen.findByText(/connection refused/)).toBeInTheDocument();
+      expect(screen.queryByText(/rejected the request as unauthorized/)).not.toBeInTheDocument();
+    });
+  });
+
   // §5.2a: the widened preset picker (cloud vendors + key auth) is gated on
   // the daemon-0.13 `supportsExternalKey` floor. Below the floor this card
   // must behave exactly as before the widening. These tests exercise the
@@ -595,9 +717,10 @@ describe("AnyProviderCard — the Local-server card (spec §5.2)", () => {
 
       // Same failing mock, but now with a key present — the guard flips and
       // the message appears, proving the earlier absence wasn't a fluke of
-      // being too early.
+      // being too early. A 401 with a key in hand is worded as "this key was
+      // refused", not the generic "couldn't list models".
       await userEvent.type(screen.getByLabelText("API key"), "sk-proj-test-key");
-      expect(await screen.findByText(/Couldn.t list models/, {}, { timeout: 2000 })).toBeInTheDocument();
+      expect(await screen.findByText(/rejected this API key \(401\)/, {}, { timeout: 2000 })).toBeInTheDocument();
     });
 
     it("cloud-scoped card on a sub-0.13 daemon shows Anthropic only — never an empty chip row", async () => {
