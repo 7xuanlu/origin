@@ -1294,9 +1294,12 @@ impl LlmProvider for OpenAICompatibleProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            // Name the URL that answered. A 401 from LM Studio's
+            // "Require Authentication" toggle reads as "wrong endpoint"
+            // without it.
             return Err(LlmError::InferenceFailed(format!(
-                "API error {}: {}",
-                status, text
+                "API error {} from {}: {}",
+                status, url, text
             )));
         }
 

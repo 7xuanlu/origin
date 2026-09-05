@@ -149,7 +149,7 @@ const en = {
   externalProvider: {
     title: "Your own local server",
     description:
-      "Route synthesis through Ollama, LM Studio, or any OpenAI-compatible local endpoint. No API key required.",
+      "Route synthesis through Ollama, LM Studio, or any OpenAI-compatible local endpoint. No API key needed unless your server asks for one.",
     titleWithCloud: "Bring your own model",
     descriptionWithCloud:
       "Route synthesis through a local server like Ollama or LM Studio, or a cloud provider with your own API key.",
@@ -167,6 +167,15 @@ const en = {
     modelDiscoveryFailed: "Couldn't list models — type a model name.",
     apiKeyLabel: "API key",
     apiKeyConfiguredPlaceholder: "••••••••  (key stored)",
+    apiKeyOptionalLabel: "API key (optional)",
+    apiKeyOptionalHint:
+      "Only if this server asks for a token. LM Studio does when \"Require Authentication\" is on (Server Settings > Manage Tokens).",
+    modelDiscoveryUnauthorized: "The server wants an API key (401). Enter it above, or type a model name.",
+    localUnauthorizedChip: "{{name}} at {{host}} asks for an API key",
+    modelDiscoveryKeyRejected: "The server rejected this API key (401). Check it, or type a model name.",
+    testKeyRejectedHint: "The server rejected this API key (401 Unauthorized). Check the key and test again.",
+    testUnauthorizedHint:
+      "The server rejected the request as unauthorized (401). It requires an API key: enter it above and test again.",
     test: "Test",
     testOk: "Response: {{response}}",
     save: "Save",
@@ -1732,7 +1741,7 @@ const zhHans = {
   },
   externalProvider: {
     title: "你自己的本地服务器",
-    description: "通过 Ollama、LM Studio 或任意 OpenAI 兼容本地端点进行合成。无需 API 密钥。",
+    description: "通过 Ollama、LM Studio 或任意 OpenAI 兼容本地端点进行合成。除非服务器要求令牌，否则无需 API 密钥。",
     titleWithCloud: "自带模型",
     descriptionWithCloud:
       "通过本地服务器（如 Ollama、LM Studio）或使用你自己 API 密钥的云服务商进行合成。",
@@ -1749,6 +1758,14 @@ const zhHans = {
     modelDiscoveryFailed: "无法列出模型 — 请手动输入模型名称。",
     apiKeyLabel: "API 密钥",
     apiKeyConfiguredPlaceholder: "••••••••（已保存密钥）",
+    apiKeyOptionalLabel: "API 密钥（可选）",
+    apiKeyOptionalHint:
+      "仅当服务器要求令牌时填写。LM Studio 开启“Require Authentication”后需要令牌（Server Settings > Manage Tokens）。",
+    modelDiscoveryUnauthorized: "服务器要求 API 密钥（401）。请在上方填写，或手动输入模型名称。",
+    localUnauthorizedChip: "{{host}} 上的 {{name}} 要求 API 密钥",
+    modelDiscoveryKeyRejected: "服务器拒绝了这个 API 密钥（401）。请检查密钥，或手动输入模型名称。",
+    testKeyRejectedHint: "服务器拒绝了这个 API 密钥（401 未授权）。请检查密钥后再次测试。",
+    testUnauthorizedHint: "服务器拒绝了请求（401 未授权）。它需要 API 密钥：请在上方填写后再次测试。",
     test: "测试",
     testOk: "响应：{{response}}",
     save: "保存",
@@ -3280,7 +3297,7 @@ const zhHant = {
   },
   externalProvider: {
     title: "你自己的本機伺服器",
-    description: "透過 Ollama、LM Studio 或任意 OpenAI 相容本機端點進行合成。無需 API 金鑰。",
+    description: "透過 Ollama、LM Studio 或任意 OpenAI 相容本機端點進行合成。除非伺服器要求權杖，否則無需 API 金鑰。",
     titleWithCloud: "自帶模型",
     descriptionWithCloud:
       "透過本機伺服器（如 Ollama、LM Studio）或使用你自己 API 金鑰的雲端服務商進行合成。",
@@ -3297,6 +3314,14 @@ const zhHant = {
     modelDiscoveryFailed: "無法列出模型 — 請手動輸入模型名稱。",
     apiKeyLabel: "API 金鑰",
     apiKeyConfiguredPlaceholder: "••••••••（已儲存金鑰）",
+    apiKeyOptionalLabel: "API 金鑰（選填）",
+    apiKeyOptionalHint:
+      "僅在伺服器要求權杖時填寫。LM Studio 開啟「Require Authentication」後需要權杖（Server Settings > Manage Tokens）。",
+    modelDiscoveryUnauthorized: "伺服器要求 API 金鑰（401）。請在上方填寫，或手動輸入模型名稱。",
+    localUnauthorizedChip: "{{host}} 上的 {{name}} 要求 API 金鑰",
+    modelDiscoveryKeyRejected: "伺服器拒絕了這個 API 金鑰（401）。請檢查金鑰，或手動輸入模型名稱。",
+    testKeyRejectedHint: "伺服器拒絕了這個 API 金鑰（401 未授權）。請檢查金鑰後再次測試。",
+    testUnauthorizedHint: "伺服器拒絕了請求（401 未授權）。它需要 API 金鑰：請在上方填寫後再次測試。",
     test: "測試",
     testOk: "回應：{{response}}",
     save: "儲存",

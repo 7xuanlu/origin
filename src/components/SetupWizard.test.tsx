@@ -364,9 +364,12 @@ describe("SetupWizard", () => {
     fireEvent.click(screen.getByText("Your own local server"));
 
     expect(await screen.findByRole("heading", { name: "Your own local server" })).toBeInTheDocument();
-    // No key field for any preset in this pane (none of ollama/lmstudio/custom
-    // require a key) — the keyed-vendor story is gone from the wizard too.
+    // No required key field for any preset in this pane (none of
+    // ollama/lmstudio/custom require a key) — the keyed-vendor story is gone
+    // from the wizard too. The optional local key field sits behind the
+    // 0.13 daemon floor, so this 0.12 mock never shows it either.
     expect(screen.queryByLabelText("API key")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("API key (optional)")).not.toBeInTheDocument();
   });
 
   it("import step offers chat history and vault side by side", async () => {

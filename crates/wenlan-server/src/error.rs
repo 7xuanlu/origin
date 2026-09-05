@@ -14,6 +14,10 @@ pub enum ServerError {
     SearchFailed(String),
     IngestFailed(String),
     Internal(String),
+    /// The daemon reached an upstream service (an LLM endpoint) and that
+    /// service failed or refused the request. Mapped to 502 so a client can
+    /// tell "LM Studio answered 401" apart from a daemon fault.
+    Upstream(String),
     Conflict(String),
     AgentDisabled(String),
     NotFound(String),
@@ -41,6 +45,7 @@ impl std::fmt::Display for ServerError {
             ServerError::SearchFailed(msg) => write!(f, "Search failed: {}", msg),
             ServerError::IngestFailed(msg) => write!(f, "Ingest failed: {}", msg),
             ServerError::Internal(msg) => write!(f, "Internal error: {}", msg),
+            ServerError::Upstream(msg) => write!(f, "Upstream error: {}", msg),
             ServerError::Conflict(msg) => write!(f, "Conflict: {}", msg),
             ServerError::AgentDisabled(msg) => write!(f, "Agent disabled: {}", msg),
             ServerError::NotFound(msg) => write!(f, "Not found: {}", msg),
@@ -85,6 +90,7 @@ impl IntoResponse for ServerError {
             ServerError::SearchFailed(msg) => (StatusCode::BAD_REQUEST, msg),
             ServerError::IngestFailed(msg) => (StatusCode::BAD_REQUEST, msg),
             ServerError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ServerError::Upstream(msg) => (StatusCode::BAD_GATEWAY, msg),
             ServerError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             ServerError::AgentDisabled(msg) => (StatusCode::FORBIDDEN, msg),
             ServerError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
