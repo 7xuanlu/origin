@@ -30,8 +30,21 @@ CMD="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c 'import sys,json; d=json.load(sys
 # mentions "--no-verify" gets blocked.
 case "$CMD" in
   *git\ *)
+    # Normalize whitespace so `-c commit.gpgsign = false` (spaced =) can't bypass
+    # the literal `-c commit.gpgsign=false` match.
+    NORM_CMD="$(printf '%s' "$CMD" | tr -d '[:space:]')"
     case "$CMD" in
-      *"--no-verify"*|*"--no-gpg-sign"*|*"-c commit.gpgsign=false"*)
+      *"--no-verify"*|*"--no-gpg-sign"*)
+        {
+          echo "🛑 Blocked: git command uses --no-verify / --no-gpg-sign / signing-bypass."
+          echo "    Command: $CMD"
+          echo "    Per project policy hooks must run. Fix the underlying issue."
+        } >&2
+        exit 2
+        ;;
+    esac
+    case "$NORM_CMD" in
+      *"-ccommit.gpgsign=false"*)
         {
           echo "🛑 Blocked: git command uses --no-verify / --no-gpg-sign / signing-bypass."
           echo "    Command: $CMD"

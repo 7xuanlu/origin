@@ -52,6 +52,7 @@ crates/*/.fastembed_cache
 !.claude/settings.json
 !.claude/hooks/
 !.claude/agents/
+!.claude/rules/
 # Skills are tracked selectively: verification skills ship with the repo,
 # personal/local skills stay local.
 !.claude/skills/
