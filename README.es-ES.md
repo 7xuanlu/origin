@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=7c7d6c8fba5ea5036d603ad2670082ab97e41a3629c9fee2b1d790fd98384738 -->
+<!-- README_SYNC: source=README.md sha256=e8b2ae58b31176519b022dc30f37a0f728d5f19a1ba28c16a4937865053228a7 -->
 
 <p align="center">
   <picture>
@@ -28,7 +28,7 @@ El trabajo útil con IA no debería desaparecer cuando termina una conversación
   <a href="#learn-more">Leer&nbsp;más</a>
 </p>
 
-https://github.com/user-attachments/assets/77272089-84ea-4eb0-a074-c9cc8b7b28fd
+https://github.com/user-attachments/assets/24364236-6c19-41f8-baf8-6982fe72663e
 
 <p align="center">
   <sub>Una Página mantenida en la aplicación de escritorio: abre cualquier cita para inspeccionar la Fuente o Memoria detrás de la afirmación.</sub>

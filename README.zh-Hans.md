@@ -1,4 +1,4 @@
-<!-- README_SYNC: source=README.md sha256=7c7d6c8fba5ea5036d603ad2670082ab97e41a3629c9fee2b1d790fd98384738 -->
+<!-- README_SYNC: source=README.md sha256=e8b2ae58b31176519b022dc30f37a0f728d5f19a1ba28c16a4937865053228a7 -->
 
 <p align="center">
   <picture>
@@ -28,7 +28,7 @@
   <a href="#learn-more">进&#8288;一&#8288;步&#8288;了&#8288;解</a>
 </p>
 
-https://github.com/user-attachments/assets/fd1631cd-8fe3-4f7e-9334-c7772f5d1ed7
+https://github.com/user-attachments/assets/26fd756f-5825-4f06-9dac-082361edaebc
 
 <p align="center">
   <sub>桌面 app 中持续维护的页面：打开任意引用，就能检查这条结论背后的来源或记忆。</sub>
