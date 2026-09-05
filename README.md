@@ -26,7 +26,7 @@ Useful work with AI shouldn't disappear when a conversation ends. Wenlan builds 
   <a href="#learn-more">Learn&nbsp;more</a>
 </p>
 
-https://github.com/user-attachments/assets/24364236-6c19-41f8-baf8-6982fe72663e
+https://github.com/user-attachments/assets/d8b2ad4a-f97a-4a15-97a8-9105478de18a
 
 <p align="center">
   <sub>A maintained Page in the desktop app: open any citation to inspect the Source or Memory behind the claim.</sub>
