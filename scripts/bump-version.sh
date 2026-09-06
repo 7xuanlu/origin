@@ -56,18 +56,9 @@ jq ".version = \"${NEW_VERSION}+codex\"" "$CODEX_PLUGIN_MANIFEST" > "${CODEX_PLU
 mv "${CODEX_PLUGIN_MANIFEST}.tmp" "$CODEX_PLUGIN_MANIFEST"
 echo "  Updated $CODEX_PLUGIN_MANIFEST"
 
-# 4. Plugin's MCP server pin — the wrapper script falls back to
-# `npx -y wenlan-mcp@^X.Y.Z` so a floating tag can't auto-RCE on every
-# Claude Code session. The pin lives in the runner shell script, not
-# .mcp.json, so dev users can override the wenlan-mcp binary via
-# WENLAN_MCP_DEV_BIN.
-CODEX_PLUGIN_MCP_RUNNER="plugin-codex/bin/wenlan-mcp-runner.sh"
-if [[ "$(uname)" == "Darwin" ]]; then
-    sed -i '' -E "s|(wenlan-mcp@\\^)[0-9]+\\.[0-9]+\\.[0-9]+|\\1${NEW_VERSION}|g" "$CODEX_PLUGIN_MCP_RUNNER"
-else
-    sed -i -E "s|(wenlan-mcp@\\^)[0-9]+\\.[0-9]+\\.[0-9]+|\\1${NEW_VERSION}|g" "$CODEX_PLUGIN_MCP_RUNNER"
-fi
-echo "  Updated $CODEX_PLUGIN_MCP_RUNNER (wenlan-mcp pin)"
+# 4. The plugin MCP runner scripts (plugin/bin, plugin-codex/bin) derive their
+# `npx -y wenlan-mcp@^X.Y.Z` fallback pin from the sibling plugin.json at run
+# time, so they carry no version string and are not touched by the release PR.
 
 # 5. /setup skill install.sh URL pinned to current tag (not `main`), so the
 # install one-liner is reproducible at the release boundary.
@@ -131,4 +122,4 @@ awk -v ver="$NEW_VERSION" '
 echo "  Updated Cargo.lock (workspace member versions)"
 
 echo ""
-echo "Versions synced from version.txt (${NEW_VERSION}) to Cargo.toml + npm + plugin manifests + plugin MCP/skills + desktop app trio + Cargo.lock."
+echo "Versions synced from version.txt (${NEW_VERSION}) to Cargo.toml + npm + plugin manifests + plugin skills + desktop app trio + Cargo.lock."
