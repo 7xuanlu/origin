@@ -16,6 +16,7 @@ pub(super) const ROUTES: &[SensitiveReadRoute] = &[
     row!(Get,"/api/agents","agent_list",NoSelector,UnauthenticatedLocal,Global,NoGate,NotApplicable,GlobalRead),
     row!(Get,"/api/agents/{name}","agent_detail",NoSelector,UnauthenticatedLocal,Global,NoGate,NotApplicable,GlobalRead),
     row!(Post,"/api/memory/entities/list","entity_list",BodyThenHeader,UnauthenticatedLocal,EntitySpace,NoGate,Rejected,Forbidden),
+    row!(Post,"/api/memory/entities/query","entity_query",BodyThenHeader,UnauthenticatedLocal,EntitySpace,NoGate,Rejected,Forbidden),
     row!(Post,"/api/memory/entities/search","entity_search",BodyThenHeader,UnauthenticatedLocal,EntitySpace,NoGate,Rejected,Forbidden),
     row!(Get,"/api/memory/entities/{entity_id}","entity_detail",HeaderOnly,UnauthenticatedLocal,EntitySpace,SingleId404,Rejected,Forbidden),
     row!(Get,"/api/memory/graph","knowledge_graph",HeaderOnly,UnauthenticatedLocal,EntitySpace,NoGate,Rejected,Forbidden),

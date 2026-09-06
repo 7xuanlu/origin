@@ -81,6 +81,9 @@ vi.mock("../../lib/tauri", () => ({
   daemonMeetsFloor: vi.fn().mockReturnValue(true),
   recordPageEditorDiagnostic: vi.fn().mockResolvedValue(undefined),
   deletePage: vi.fn().mockResolvedValue(undefined),
+  // None of this file's delete-rejection scenarios carry an entity_id body;
+  // the guard-parsing path itself is covered by PageDetail.entityGuard.test.tsx.
+  parseEntityGuardError: vi.fn().mockReturnValue(null),
   FACET_COLORS: {},
   STABILITY_TIERS: {},
   getPendingRevision: vi.fn().mockResolvedValue(null),

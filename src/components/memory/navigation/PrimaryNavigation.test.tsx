@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { PrimaryNavigation } from "./PrimaryNavigation";
 
 const labels = {
+  entities: "Entities",
   graph: "Graph",
   home: "Home",
   memories: "Memories",
@@ -20,6 +21,7 @@ const preservedIconGeometry = {
 
 function renderNavigation(active: "home" | "spaces" | null = null) {
   const callbacks = {
+    entities: vi.fn(),
     graph: vi.fn(),
     home: vi.fn(),
     memories: vi.fn(),
@@ -31,6 +33,7 @@ function renderNavigation(active: "home" | "spaces" | null = null) {
     <PrimaryNavigation
       active={active}
       labels={labels}
+      onNavigateEntities={callbacks.entities}
       onNavigateGraph={callbacks.graph}
       onNavigateHome={callbacks.home}
       onNavigateLog={callbacks.memories}
@@ -55,6 +58,7 @@ describe("PrimaryNavigation", () => {
       <PrimaryNavigation
         active={null}
         labels={labels}
+        onNavigateEntities={() => {}}
         onNavigateGraph={() => {}}
         onNavigateHome={() => {}}
         onNavigateLog={() => {}}
@@ -66,14 +70,14 @@ describe("PrimaryNavigation", () => {
       />,
     );
 
-    const destinations = ["Home", "Wiki", "Spaces", "Graph", "Memories", "Sources"].map((name) => screen.getByRole("button", { name }));
+    const destinations = ["Home", "Wiki", "Entities", "Spaces", "Graph", "Memories", "Sources"].map((name) => screen.getByRole("button", { name }));
     for (const [index, destination] of destinations.entries()) {
       const next = destinations[index + 1];
       if (next) expect(destination.compareDocumentPosition(next) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     }
     const recentPages = screen.getByText("Recent pages");
     const recentSpaces = screen.getByText("Recent spaces");
-    expect(destinations[5]?.compareDocumentPosition(recentPages) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(destinations[6]?.compareDocumentPosition(recentPages) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(recentPages.compareDocumentPosition(recentSpaces) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(recentPages.closest("nav")).not.toBe(destinations[0]?.closest("nav"));
   });
@@ -270,6 +274,7 @@ describe("PrimaryNavigation", () => {
     await user.click(screen.getByRole("button", { name: "Home" }));
     await user.click(screen.getByRole("button", { name: "Memories" }));
     await user.click(screen.getByRole("button", { name: "Wiki" }));
+    await user.click(screen.getByRole("button", { name: "Entities" }));
     await user.click(screen.getByRole("button", { name: "Graph" }));
     await user.click(screen.getByRole("button", { name: "Sources" }));
     await user.click(screen.getByRole("button", { name: "Spaces" }));
@@ -278,6 +283,7 @@ describe("PrimaryNavigation", () => {
     expect(callbacks.home).toHaveBeenCalledTimes(1);
     expect(callbacks.memories).toHaveBeenCalledTimes(1);
     expect(callbacks.pages).toHaveBeenCalledTimes(1);
+    expect(callbacks.entities).toHaveBeenCalledTimes(1);
     expect(callbacks.graph).toHaveBeenCalledTimes(1);
     expect(callbacks.sources).toHaveBeenCalledTimes(1);
     expect(callbacks.spaces).toHaveBeenCalledWith(false);

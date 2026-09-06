@@ -74,6 +74,9 @@ const detail: EntityDetailRecord = {
     confirmed: false,
     created_at: 1_700_000_000,
     updated_at: 1_700_086_400,
+    memory_count: 0,
+    status: "detected",
+    established_by: null,
   },
   observations: [
     {

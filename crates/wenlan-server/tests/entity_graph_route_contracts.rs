@@ -13,13 +13,16 @@ use wenlan_server::{router::build_router, state::ServerState};
 use wenlan_types::entities::EntityDetail;
 use wenlan_types::requests::{
     AddEntityAliasRequest, AddEntityObservationRequest, AddObservationRequest,
-    ConfirmEntityRequest, ConfirmObservationRequest, CreateEntityRequest, CreateRelationRequest,
-    LinkEntityRequest, ListEntitiesRequest, MergeEntityRequest, UpdateObservationRequest,
+    ArchiveEntitiesRequest, ConfirmEntityRequest, ConfirmObservationRequest, CreateEntityRequest,
+    CreateRelationRequest, EntitySelection, LinkEntityRequest, ListEntitiesRequest,
+    MergeEntityRequest, RestoreEntitiesRequest, UpdateObservationRequest,
 };
 use wenlan_types::responses::{
     AddObservationResponse, CreateEntityResponse, CreateRelationResponse, EntityAliasesResponse,
-    ListEntitiesResponse, MergeEntityResponse, SearchEntitiesResponse, SuccessResponse,
+    EntityBulkResponse, ListEntitiesResponse, MergeEntityResponse, SearchEntitiesResponse,
+    SuccessResponse,
 };
+use wenlan_types::EntityStatus;
 use wenlan_types::{WriteOutcome, WriteSpaceSource, WriteSpaceTarget};
 
 #[derive(Debug, Deserialize)]
@@ -1172,4 +1175,193 @@ async fn entity_write_routes_succeed_with_matching_space_header() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(deleted.ok);
+}
+
+/// #708: the Entities view's three routes. `/query` sees every lifecycle state
+/// and reports the unpaged total; `/archive` and `/restore` are exact inverses
+/// and take either explicit ids or the same filter the view is showing.
+#[tokio::test]
+async fn entity_graph_routes_query_archive_and_restore_round_trip() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+    let quiet = create_test_entity(&router, "Zephyr Analytics", "organization").await;
+    let loud = create_test_entity(&router, "Borealis Freight", "organization").await;
+
+    // Establishing one of them by hand leaves exactly one detected entity.
+    let (status, confirmed): (StatusCode, SuccessResponse) = request_typed(
+        &router,
+        Method::PUT,
+        &format!("/api/memory/entities/{}/confirm", loud.id),
+        json_body(&ConfirmEntityRequest { confirmed: true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(confirmed.ok);
+
+    let detected_filter = ListEntitiesRequest {
+        status: Some(EntityStatus::Detected),
+        ..Default::default()
+    };
+    let (status, detected): (StatusCode, ListEntitiesResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/query",
+        json_body(&detected_filter),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detected.total, 1);
+    assert_eq!(detected.entities.len(), 1);
+    assert_eq!(detected.entities[0].id, quiet.id);
+    assert_eq!(detected.entities[0].status, EntityStatus::Detected);
+    assert_eq!(detected.entities[0].memory_count, 0);
+    assert_eq!(detected.entities[0].established_by, None);
+
+    let (status, established): (StatusCode, ListEntitiesResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/query",
+        json_body(&ListEntitiesRequest {
+            status: Some(EntityStatus::Established),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(established.entities.len(), 1);
+    assert_eq!(established.entities[0].id, loud.id);
+    assert_eq!(
+        established.entities[0].established_by.as_deref(),
+        Some("manual")
+    );
+
+    // The legacy list route now reports a total alongside its rows.
+    let (status, listed): (StatusCode, ListEntitiesResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/list",
+        json_body(&ListEntitiesRequest::default()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed.total, listed.entities.len() as u64);
+
+    // A dry run answers "how many, and which" without touching anything.
+    let by_ids = EntitySelection {
+        ids: Some(vec![quiet.id.clone()]),
+        filter: None,
+    };
+    let (status, preview): (StatusCode, EntityBulkResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/archive",
+        json_body(&ArchiveEntitiesRequest {
+            selection: by_ids.clone(),
+            dry_run: true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(preview.count, 1);
+    assert!(preview.dry_run);
+    assert_eq!(preview.entity_ids, vec![quiet.id.clone()]);
+
+    let (status, still_detected): (StatusCode, ListEntitiesResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/query",
+        json_body(&detected_filter),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(still_detected.total, 1, "a dry run must not archive");
+
+    let (status, archived): (StatusCode, EntityBulkResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/archive",
+        json_body(&ArchiveEntitiesRequest {
+            selection: by_ids.clone(),
+            dry_run: false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(archived.count, 1);
+    assert!(!archived.dry_run);
+
+    let (status, now_archived): (StatusCode, ListEntitiesResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/query",
+        json_body(&ListEntitiesRequest {
+            status: Some(EntityStatus::Archived),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(now_archived.entities.len(), 1);
+    assert_eq!(now_archived.entities[0].id, quiet.id);
+
+    let (status, restored): (StatusCode, EntityBulkResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/restore",
+        json_body(&RestoreEntitiesRequest {
+            selection: by_ids,
+            dry_run: false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(restored.count, 1);
+
+    let (status, back): (StatusCode, ListEntitiesResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/query",
+        json_body(&detected_filter),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(back.total, 1);
+    assert_eq!(back.entities[0].id, quiet.id);
+}
+
+/// A selection must name exactly one of `ids` or `filter`: both is ambiguous,
+/// and neither would mean archiving the entire scope.
+#[tokio::test]
+async fn entity_graph_routes_refuse_an_ambiguous_bulk_selection() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+
+    for selection in [
+        EntitySelection::default(),
+        EntitySelection {
+            ids: Some(vec!["some-id".to_string()]),
+            filter: Some(ListEntitiesRequest::default()),
+        },
+    ] {
+        for uri in [
+            "/api/memory/entities/archive",
+            "/api/memory/entities/restore",
+        ] {
+            let (status, body) = request_bytes(
+                &router,
+                Method::POST,
+                uri,
+                json_body(&ArchiveEntitiesRequest {
+                    selection: selection.clone(),
+                    dry_run: true,
+                }),
+                false,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{uri} must refuse an ambiguous selection: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
 }

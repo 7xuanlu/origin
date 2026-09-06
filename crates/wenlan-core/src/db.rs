@@ -458,6 +458,251 @@ pub(crate) fn parse_pages_aliases(raw: Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The three #708 lifecycle columns an entity read appends AFTER its own
+/// columns, in this order: linked-memory count, the shadow page's `status`,
+/// and `established_by`.
+///
+/// Written once because the count is also what auto-promotion thresholds on
+/// (`maybe_establish_entity_in_transaction`) -- if the number a reader shows
+/// and the number that promotes ever disagreed, an entity would sit at
+/// "3 memories" in the Entities view without establishing. Assumes the query
+/// aliases `entity_page_map` as `epm` and `pages` as `p`, which every entity
+/// reader since G6 does.
+macro_rules! entity_memory_count_expr {
+    () => {
+        "(SELECT COUNT(*) FROM memory_entities me WHERE me.entity_id = epm.entity_id)"
+    };
+}
+
+/// The linked-memory count on its own, for filters that bound it
+/// (`min_memories` / `max_memories`). Shares its text with
+/// [`ENTITY_LIFECYCLE_COLUMNS`] so a filtered count and a displayed count
+/// cannot drift apart.
+pub(crate) const ENTITY_MEMORY_COUNT_EXPR: &str = entity_memory_count_expr!();
+
+pub(crate) const ENTITY_LIFECYCLE_COLUMNS: &str =
+    concat!(entity_memory_count_expr!(), ", p.status, p.established_by");
+
+/// What a `kind='entity'` shadow page stands for, as the page-mutation guard
+/// sees it.
+#[derive(Debug, Clone)]
+pub struct EntityShadowPage {
+    /// The entity's display name, which is the shadow page's title.
+    pub entity_name: String,
+    /// The entity's id. Absent only when the `entity_page_map` bridge row is
+    /// missing, which is a broken invariant rather than a normal state; the
+    /// guard refuses either way.
+    pub entity_id: Option<String>,
+}
+
+/// What a person is told when they try to archive or delete an entity's page
+/// from the page surface (#708).
+///
+/// Written once because two callers must produce the same sentence: the core
+/// guard, whose only channel is an error string, and the HTTP page routes,
+/// which send the same sentence with the entity id as a separate field. The
+/// old message named an internal concept ("entity shadow page") and an
+/// audience of one ("the entity API"); this one names the entity and the
+/// screen to go to.
+pub fn entity_shadow_page_guard_message(entity_name: &str) -> String {
+    format!("This page belongs to the entity '{entity_name}'. Archive or delete it from Entities")
+}
+
+/// How many entities one bulk archive/restore transaction covers.
+const ENTITY_BULK_CHUNK: usize = 500;
+
+/// How many ids one selection-resolution statement binds, kept well under
+/// SQLite's bound-parameter ceiling.
+const ENTITY_ID_LOOKUP_CHUNK: usize = 400;
+
+/// How many ids a bulk response echoes back; `count` is always exact.
+const ENTITY_BULK_ID_ECHO_LIMIT: usize = 1000;
+
+/// Which half of the archive/restore pair a bulk run is executing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntityBulkAction {
+    Archive,
+    Restore,
+}
+
+impl EntityBulkAction {
+    /// The state an entity must already be in for this action to change
+    /// anything. Matches the `WHERE` in the per-entity helper, so the
+    /// selection and the mutation agree on what "eligible" means.
+    fn eligible_predicate(self) -> &'static str {
+        match self {
+            Self::Archive => "p.status = 'active'",
+            Self::Restore => "p.status = 'archived'",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Archive => "archive_entities",
+            Self::Restore => "restore_entities",
+        }
+    }
+}
+
+/// The SQL twin of [`entity_lifecycle_from_row`]'s status derivation.
+///
+/// Kept in the same shape as the Rust side on purpose: the three states must
+/// partition every entity row, so a filtered tab and the badge on the row it
+/// shows can never disagree. Assumes `pages` is aliased `p`.
+pub(crate) fn entity_status_predicate(status: wenlan_types::EntityStatus) -> &'static str {
+    match status {
+        wenlan_types::EntityStatus::Archived => "p.status = 'archived'",
+        wenlan_types::EntityStatus::Established => {
+            "(p.status != 'archived' AND COALESCE(p.entity_confirmed, 0) = 1)"
+        }
+        wenlan_types::EntityStatus::Detected => {
+            "(p.status != 'archived' AND COALESCE(p.entity_confirmed, 0) = 0)"
+        }
+    }
+}
+
+/// Escape a user-supplied substring for a `LIKE ... ESCAPE '\'` match, so a
+/// query containing `%` or `_` looks for those characters instead of matching
+/// everything.
+pub(crate) fn escape_like_substring(needle: &str) -> String {
+    let mut out = String::with_capacity(needle.len() + 2);
+    out.push('%');
+    for ch in needle.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch.to_lowercase().next().unwrap_or(ch));
+    }
+    out.push('%');
+    out
+}
+
+/// Build the `WHERE` fragments for a [`wenlan_types::requests::ListEntitiesRequest`]
+/// over the standard `entity_page_map epm JOIN pages p` shape.
+///
+/// Shared by `query_entities_scoped` and the bulk archive/restore selection so
+/// a filter previewed in the Entities view and the same filter handed to
+/// `/archive` select exactly the same rows. `filter.space` is deliberately
+/// ignored: the route folds it into `scope` before calling in, exactly as the
+/// legacy list route does. `limit`/`offset` are the caller's business.
+pub(crate) fn entity_filter_conditions(
+    filter: &wenlan_types::requests::ListEntitiesRequest,
+    scope: &ReadScope,
+) -> (Vec<String>, Vec<libsql::Value>) {
+    let mut conditions = vec!["p.kind = 'entity'".to_string()];
+    let mut values: Vec<libsql::Value> = Vec::new();
+    if let Some(entity_type) = filter.entity_type.as_deref() {
+        conditions.push("p.entity_type = ?".to_string());
+        values.push(libsql::Value::Text(entity_type.to_string()));
+    }
+    if let Some(status) = filter.status {
+        conditions.push(entity_status_predicate(status).to_string());
+    }
+    if let Some(min) = filter.min_memories {
+        conditions.push(format!("{ENTITY_MEMORY_COUNT_EXPR} >= ?"));
+        values.push(libsql::Value::Integer(i64::from(min)));
+    }
+    if let Some(max) = filter.max_memories {
+        conditions.push(format!("{ENTITY_MEMORY_COUNT_EXPR} <= ?"));
+        values.push(libsql::Value::Integer(i64::from(max)));
+    }
+    if let Some(query) = filter
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    {
+        let needle = escape_like_substring(query);
+        conditions.push(
+            "(LOWER(p.title) LIKE ? ESCAPE '\\' \
+              OR EXISTS (SELECT 1 FROM json_each(COALESCE(p.aliases, '[]')) alias \
+                          WHERE LOWER(alias.value) LIKE ? ESCAPE '\\'))"
+                .to_string(),
+        );
+        values.push(libsql::Value::Text(needle.clone()));
+        values.push(libsql::Value::Text(needle));
+    }
+    push_read_scope_filter_folded(scope, "p.space", &mut conditions, &mut values);
+    (conditions, values)
+}
+
+/// Decode [`ENTITY_LIFECYCLE_COLUMNS`] starting at `first`.
+///
+/// `confirmed` is the row's `entity_confirmed`, already decoded by the
+/// caller: the three lifecycle states are derived, not stored. Archived wins
+/// over established, because an archived entity is out of the Wiki whether or
+/// not it had earned its place there, and restoring it must put it back
+/// exactly as it was.
+pub(crate) fn entity_lifecycle_from_row(
+    row: &libsql::Row,
+    first: i32,
+    confirmed: bool,
+) -> (u64, wenlan_types::EntityStatus, Option<String>) {
+    let memory_count = row.get::<i64>(first).unwrap_or(0).max(0) as u64;
+    let page_status = row
+        .get::<Option<String>>(first + 1)
+        .unwrap_or(None)
+        .unwrap_or_else(|| "active".to_string());
+    let established_by = row.get::<Option<String>>(first + 2).unwrap_or(None);
+    let status = if page_status == "archived" {
+        wenlan_types::EntityStatus::Archived
+    } else if confirmed {
+        wenlan_types::EntityStatus::Established
+    } else {
+        wenlan_types::EntityStatus::Detected
+    };
+    (memory_count, status, established_by)
+}
+
+/// The `entity_id` column expression a page read selects (#708).
+///
+/// A `kind='entity'` shadow page's own `entity_id` column is NULL -- the
+/// shadow insert never set it, and the entity's id lives in
+/// `entity_page_map`. The Wiki classifies a row as an Entity by looking at
+/// `Page.entity_id`, so every detected shadow rendered as a blank `Page`.
+/// Filling it in at read time is what makes an established entity render as
+/// an Entity and open its dossier, without touching the frozen `Page` wire
+/// shape.
+///
+/// `page_alias` is the `pages` alias plus its dot (`"c."`), or `""` when the
+/// query selects unaliased columns. `entity_page_map.page_id` is UNIQUE, so
+/// at most one row can match; the `ORDER BY ... LIMIT 1` states the tie-break
+/// anyway so the read stays deterministic if that constraint is ever relaxed.
+pub(crate) fn page_entity_id_column(page_alias: &str) -> String {
+    format!(
+        "COALESCE({page_alias}entity_id, \
+         (SELECT epm.entity_id FROM entity_page_map epm \
+           WHERE epm.page_id = {page_alias}id ORDER BY epm.rowid LIMIT 1))"
+    )
+}
+
+/// The default entity-row fence for a BROWSE page read (#708): an entity's
+/// shadow page appears in the Wiki only once the entity is established and
+/// active.
+///
+/// Detected entities are an index the system grows and prunes itself, not a
+/// review queue -- at onboarding scale there can be six figures of them, and
+/// listing them buries every real page. Archived entities are excluded for
+/// the same reason plus their own: an archived entity is deliberately out of
+/// the Wiki, and it is restored from the Entities view, not from a page row.
+/// Non-entity pages are untouched by this clause.
+///
+/// The fenced (non-browse) twin uses the stricter `kind != 'entity'` instead;
+/// this is only for the surfaces that were showing shadow rows.
+pub(crate) fn entity_row_browse_predicate(page_alias: &str) -> String {
+    format!(
+        "(COALESCE({page_alias}kind, 'concept') != 'entity' \
+          OR (COALESCE({page_alias}entity_confirmed, 0) = 1 \
+              AND {page_alias}status = 'active'))"
+    )
+}
+
+/// [`entity_row_browse_predicate`] as a clause to append to an existing
+/// `WHERE`.
+pub(crate) fn entity_row_browse_fence(page_alias: &str) -> String {
+    format!(" AND {}", entity_row_browse_predicate(page_alias))
+}
+
 /// Names a merge adds to the canonical's `pages.aliases`: the loser's alias
 /// array plus its bare lowercased name, minus whatever the canonical already
 /// carries -- the same candidate set `merge_entities`' canonical-shadow UNION
@@ -1157,7 +1402,14 @@ pub const EMBEDDING_DIM: usize = 768;
 /// `REFERENCES entities(id)` foreign key. Migration 123 (G6 Stage 3) drops
 /// `entities` and `entity_aliases` outright. Migration 127 adds
 /// `pages.refresh_blocked_reason` (citation-gate surfacing). Migration 128
-/// adds `pages.incarnation` (delete-and-recreate ABA fencing).
+/// adds `pages.incarnation` (delete-and-recreate ABA fencing). Migration 129
+/// adds `pages.established_by` and backfills `'manual'` onto every already
+/// confirmed entity shadow (#708 detected-entity index). Migration 130 drops
+/// and recreates both fence triggers again with the `entity` arm resolving an
+/// endpoint's space whatever its shadow page's `status`, so an edge can be
+/// written against an ARCHIVED entity -- the precondition for an archived
+/// entity absorbing a recurring mention instead of a duplicate being created
+/// beside it (#708).
 ///
 /// This constant is also the **downgrade barrier**. `run_migrations` refuses
 /// to open a database whose `user_version` exceeds it, so a build that
@@ -1165,7 +1417,47 @@ pub const EMBEDDING_DIM: usize = 768;
 /// `entities` table, skip every `version < N` branch, and quietly operate
 /// against a schema it cannot see. Refusing to open is recoverable; writing is
 /// not.
-pub const SCHEMA_VERSION: u32 = 128;
+pub const SCHEMA_VERSION: u32 = 130;
+
+/// `pages.established_by` for an entity a person or agent confirmed by hand.
+pub const ESTABLISHED_BY_MANUAL: &str = "manual";
+/// `pages.established_by` for an entity the linked-memory threshold promoted.
+pub const ESTABLISHED_BY_AUTO_MEMORIES: &str = "auto:memories";
+/// `pages.established_by` for an entity a distilled page's citation promoted.
+pub const ESTABLISHED_BY_AUTO_CITATION: &str = "auto:citation";
+
+/// How many linked memories establish a detected entity
+/// (`refinery.entity_establish_min_memories`, default 3).
+///
+/// Read once per process and cached: this sits on the memory→entity link
+/// write path, which an import walks once per extracted entity per memory,
+/// and re-reading `intelligence.toml` there would put a file open on every
+/// link. Clamped to at least 1 so a `0` in the config cannot establish an
+/// entity the instant it is detected, which would defeat the whole index.
+///
+/// Under `cfg(test)` this answers the compiled-in default without touching
+/// the filesystem. `test_db()` isolates the database file but not
+/// `WENLAN_DATA_DIR`, so a file read here would resolve to the developer's
+/// real `~/.wenlan/intelligence.toml` and make promotion tests depend on
+/// whatever that machine has configured.
+pub(crate) fn entity_establish_min_memories() -> usize {
+    #[cfg(test)]
+    {
+        crate::tuning::RefineryConfig::default()
+            .entity_establish_min_memories
+            .max(1)
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            crate::tuning::TuningConfig::load(&crate::tuning::TuningConfig::config_path())
+                .refinery
+                .entity_establish_min_memories
+                .max(1)
+        })
+    }
+}
 
 /// Reserved id AND name of the uncategorized-page sentinel space (M1 honest
 /// columns). Uncategorized pages store this value in `pages.space`/`workspace`
@@ -9836,6 +10128,26 @@ impl MemoryDB {
             if version < 128 {
                 self.migrate_128_page_incarnation(version).await?;
             }
+
+            // Migration 129 (#708 detected entities are an index): adds
+            // `pages.established_by`, the provenance of an entity's
+            // promotion out of the detected index. See
+            // migrate_129_entity_established_by.
+            if version < 129 {
+                self.migrate_129_entity_established_by(version).await?;
+            }
+
+            // Migration 130 (#708 archived entities absorb recurring
+            // mentions): recreates `edges_space_fence`/
+            // `edges_space_fence_update` with the `entity` arm resolving an
+            // endpoint's space whatever its shadow page's status, so an edge
+            // touching an archived entity is fenced on SPACE alone rather
+            // than aborted for being archived. See
+            // migrate_130_edges_space_fence_archived_entities.
+            if version < 130 {
+                self.migrate_130_edges_space_fence_archived_entities(version)
+                    .await?;
+            }
         }
 
         // Private M4 builds could already have stamped user_version=95 before
@@ -17002,6 +17314,206 @@ impl MemoryDB {
             .map_err(|e| WenlanError::VectorDb(format!("m128 bump: {e}")))?;
         log::info!(
             "[migration] Migration 128 applied: {stamped} page row(s) stamped with an incarnation token"
+        );
+        Ok(())
+    }
+
+    /// Migration 129 (#708 detected entities are an index, not a to-do): add
+    /// `pages.established_by`, the provenance of an entity leaving the
+    /// detected index -- `'manual'` (a person or agent confirmed it),
+    /// `'auto:memories'` (its linked-memory count reached
+    /// `entity_establish_min_memories`), or `'auto:citation'` (a distilled
+    /// page cites it). NULL while the entity is still detected.
+    ///
+    /// Nullable TEXT, no new table: the three lifecycle states are already
+    /// spelled by `entity_confirmed` and the shadow page's `status`, and this
+    /// column only records HOW a confirmed one got there. Every row that is
+    /// already `entity_confirmed = 1` predates automatic promotion, so the
+    /// only honest backfill is `'manual'`. The column-exists check keeps a
+    /// crash-replay (ALTER applied, version bump lost) idempotent, same
+    /// pattern as migrations 117/127/128.
+    async fn migrate_129_entity_established_by(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(129, prior_version).await?;
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m129 begin: {e}")))?;
+
+        let result: Result<u64, WenlanError> = async {
+            let has_col = {
+                let mut rows = conn
+                    .query(
+                        "SELECT COUNT(*) FROM pragma_table_info('pages') \
+                         WHERE name = 'established_by'",
+                        (),
+                    )
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m129 col check: {e}")))?;
+                rows.next()
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m129 col row: {e}")))?
+                    .is_some_and(|row| row.get::<i64>(0).unwrap_or(0) > 0)
+            };
+            if !has_col {
+                conn.execute("ALTER TABLE pages ADD COLUMN established_by TEXT", ())
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m129 add column: {e}")))?;
+            }
+            conn.execute(
+                "UPDATE pages SET established_by = 'manual' \
+                 WHERE kind = 'entity' AND COALESCE(entity_confirmed, 0) = 1 \
+                   AND established_by IS NULL",
+                (),
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m129 backfill: {e}")))
+        }
+        .await;
+
+        let backfilled = match result {
+            Ok(value) => {
+                commit_or_rollback(&conn)
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m129 commit: {e}")))?;
+                value
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+
+        conn.execute("PRAGMA user_version = 129", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m129 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 129 applied: pages.established_by added, \
+             {backfilled} confirmed entity shadow(s) stamped 'manual'"
+        );
+        Ok(())
+    }
+
+    /// Migration 130 (#708 detected entities are an index, not a to-do): drop
+    /// and recreate `edges_space_fence`/`edges_space_fence_update` with the
+    /// `entity` arm resolving an endpoint's shadow-page space whatever that
+    /// page's `status`.
+    ///
+    /// Migration 121's arm requires `p.status = 'active'`, so an ARCHIVED
+    /// entity endpoint resolves to NULL and `IS NOT NEW.space` aborts every
+    /// non-legacy edge touching it. That made archive a one-way door in
+    /// practice: an archived entity could not take an edge from a later
+    /// mention, so the next import wrote a duplicate beside it and a bulk
+    /// archive undid itself. Archive is reversible by contract, so the fence
+    /// judges an endpoint by its SPACE -- what it exists to police -- and not
+    /// by its lifecycle state, which it was never asked to. A missing shadow
+    /// page still resolves to NULL and still aborts (fail-closed, unchanged),
+    /// and every non-entity arm is identical to migration 121's.
+    ///
+    /// Migrations 81/98/121 keep their bodies untouched: this is a fresh
+    /// drop-and-recreate positioned after them, the same move migration 121
+    /// itself made, so those frozen replays stay frozen.
+    async fn migrate_130_edges_space_fence_archived_entities(
+        &self,
+        prior_version: i64,
+    ) -> Result<(), WenlanError> {
+        self.backup_before_migration(130, prior_version).await?;
+        let conn = self.conn.lock().await;
+
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m130 begin: {e}")))?;
+
+        // One body for both triggers. The INSERT and UPDATE twins have always
+        // carried identical predicates and differ only in their WHEN clause,
+        // so writing the predicate once is what keeps them that way.
+        const FENCE_BODY: &str = "
+                     SELECT RAISE(ABORT, 'edges_space_fence: cross-space edge rejected')
+                     WHERE (
+                         NOT (NEW.edge_type = 'attests' AND NEW.src_kind = 'root')
+                         AND (
+                             CASE NEW.src_kind
+                                 WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.src_id)
+                                 WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.src_id)
+                                 WHEN 'entity' THEN (
+                                     SELECT p.space FROM entity_page_map epm
+                                       JOIN pages p ON p.id = epm.page_id
+                                      WHERE epm.entity_id = NEW.src_id
+                                        AND p.kind = 'entity'
+                                 )
+                                 WHEN 'claim_revision' THEN (
+                                     SELECT p.space FROM claim_revisions cr
+                                       JOIN claims c ON c.claim_id = cr.claim_id
+                                       JOIN pages p ON p.id = c.page_id
+                                      WHERE cr.claim_revision_id = NEW.src_id
+                                 )
+                                 ELSE NULL
+                             END
+                         ) IS NOT NEW.space
+                     )
+                     OR (
+                         NOT (NEW.edge_type = 'cites' AND NEW.dst_kind = 'external')
+                         AND (
+                             CASE NEW.dst_kind
+                                 WHEN 'page' THEN (SELECT space FROM pages WHERE id = NEW.dst_id)
+                                 WHEN 'memory' THEN (SELECT space FROM memories WHERE source_id = NEW.dst_id)
+                                 WHEN 'entity' THEN (
+                                     SELECT p.space FROM entity_page_map epm
+                                       JOIN pages p ON p.id = epm.page_id
+                                      WHERE epm.entity_id = NEW.dst_id
+                                        AND p.kind = 'entity'
+                                 )
+                                 WHEN 'claim_revision' THEN (
+                                     SELECT p.space FROM claim_revisions cr
+                                       JOIN claims c ON c.claim_id = cr.claim_id
+                                       JOIN pages p ON p.id = c.page_id
+                                      WHERE cr.claim_revision_id = NEW.dst_id
+                                 )
+                                 ELSE NULL
+                             END
+                         ) IS NOT NEW.space
+                     );
+                 ";
+
+        let result: Result<(), WenlanError> = async {
+            conn.execute_batch(&format!(
+                "DROP TRIGGER IF EXISTS edges_space_fence;
+                 DROP TRIGGER IF EXISTS edges_space_fence_update;
+                 CREATE TRIGGER edges_space_fence
+                 AFTER INSERT ON edges
+                 WHEN NEW.lineage != 'legacy'
+                 BEGIN{FENCE_BODY}END;
+                 CREATE TRIGGER edges_space_fence_update
+                 AFTER UPDATE ON edges
+                 WHEN NEW.lineage != 'legacy' AND NEW.valid_until IS NULL
+                 BEGIN{FENCE_BODY}END;"
+            ))
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m130 fence trigger: {e}")))?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                commit_or_rollback(&conn)
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("m130 commit: {e}")))?;
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        }
+
+        conn.execute("PRAGMA user_version = 130", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("m130 bump: {e}")))?;
+        log::info!(
+            "[migration] Migration 130 applied: edges_space_fence entity arm accepts \
+             archived endpoints"
         );
         Ok(())
     }
@@ -29783,13 +30295,15 @@ impl MemoryDB {
         // off `entities` too, now that `store_entity` no longer writes it --
         // a shadow-only entity has no legacy row for the fallback to find.
         let fetch_limit = (limit * 3) as i64;
-        let sql = "SELECT m.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, vector_distance_cos(p.embedding, vector32(?1)) AS dist, p.aliases
+        let sql = format!(
+            "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, vector_distance_cos(p.embedding, vector32(?1)) AS dist, p.aliases, {ENTITY_LIFECYCLE_COLUMNS}
                    FROM vector_top_k('idx_pages_embedding', vector32(?1), ?2) AS vt
                    JOIN pages p ON p.rowid = vt.id
-                   JOIN entity_page_map m ON m.page_id = p.id
+                   JOIN entity_page_map epm ON epm.page_id = p.id
                    WHERE p.kind = 'entity' AND p.status = 'active'
                    ORDER BY dist ASC
-                   LIMIT ?3";
+                   LIMIT ?3"
+        );
 
         let mut results = Vec::new();
         // A step error mid-scan leaves a partial prefix in `results`; without
@@ -29798,7 +30312,7 @@ impl MemoryDB {
         let mut primary_scan_failed = false;
         match conn
             .query(
-                sql,
+                &sql,
                 libsql::params![vec_str.clone(), fetch_limit, limit as i64],
             )
             .await
@@ -29814,6 +30328,9 @@ impl MemoryDB {
                             break;
                         }
                     };
+                    let confirmed = row.get::<i64>(6).unwrap_or(0) != 0;
+                    let (memory_count, status, established_by) =
+                        entity_lifecycle_from_row(&row, 11, confirmed);
                     let entity = Entity {
                         id: row.get::<String>(0).unwrap_or_default(),
                         name: row.get::<String>(1).unwrap_or_default(),
@@ -29827,13 +30344,13 @@ impl MemoryDB {
                         ),
                         source_agent: row.get::<Option<String>>(4).unwrap_or(None),
                         confidence: row.get::<Option<f64>>(5).unwrap_or(None).map(|v| v as f32),
-                        confirmed: row.get::<i64>(6).unwrap_or(0) != 0,
+                        confirmed,
                         created_at: row.get::<i64>(7).unwrap_or(0),
                         updated_at: row.get::<i64>(8).unwrap_or(0),
                         aliases: parse_pages_aliases(row.get::<Option<String>>(10).unwrap_or(None)),
-                        memory_count: 0,
-                        status: wenlan_types::EntityStatus::Detected,
-                        established_by: None,
+                        memory_count,
+                        status,
+                        established_by,
                     };
                     let distance: f64 = row.get::<f64>(9).unwrap_or(1.0);
                     results.push(EntitySearchResult {
@@ -29859,15 +30376,16 @@ impl MemoryDB {
             // Retry from scratch: the aborted prefix must not mix with (or
             // stand in for) the brute-force ranking.
             results.clear();
-            let fallback_sql =
-                "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, vector_distance_cos(p.embedding, vector32(?1)) as distance, p.aliases
+            let fallback_sql = format!(
+                "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, vector_distance_cos(p.embedding, vector32(?1)) as distance, p.aliases, {ENTITY_LIFECYCLE_COLUMNS}
                  FROM entity_page_map epm
                  JOIN pages p ON p.id = epm.page_id
                  WHERE p.kind = 'entity' AND p.status = 'active' AND p.embedding IS NOT NULL
                  ORDER BY distance ASC
-                 LIMIT ?2";
+                 LIMIT ?2"
+            );
             match conn
-                .query(fallback_sql, libsql::params![vec_str, limit as i64])
+                .query(&fallback_sql, libsql::params![vec_str, limit as i64])
                 .await
             {
                 Ok(mut rows) => {
@@ -29882,6 +30400,9 @@ impl MemoryDB {
                                 break;
                             }
                         };
+                        let confirmed = row.get::<i64>(6).unwrap_or(0) != 0;
+                        let (memory_count, status, established_by) =
+                            entity_lifecycle_from_row(&row, 11, confirmed);
                         let entity = Entity {
                             id: row.get::<String>(0).unwrap_or_default(),
                             name: row.get::<String>(1).unwrap_or_default(),
@@ -29895,15 +30416,15 @@ impl MemoryDB {
                             ),
                             source_agent: row.get::<Option<String>>(4).unwrap_or(None),
                             confidence: row.get::<Option<f64>>(5).unwrap_or(None).map(|v| v as f32),
-                            confirmed: row.get::<i64>(6).unwrap_or(0) != 0,
+                            confirmed,
                             created_at: row.get::<i64>(7).unwrap_or(0),
                             updated_at: row.get::<i64>(8).unwrap_or(0),
                             aliases: parse_pages_aliases(
                                 row.get::<Option<String>>(10).unwrap_or(None),
                             ),
-                            memory_count: 0,
-                            status: wenlan_types::EntityStatus::Detected,
-                            established_by: None,
+                            memory_count,
+                            status,
+                            established_by,
                         };
                         let distance: f64 = row.get::<f64>(9).unwrap_or(1.0);
                         results.push(EntitySearchResult {
@@ -34642,9 +35163,16 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
+                // #708: no `status` filter. An ARCHIVED entity still owns its
+                // aliases, so a later mention of it must resolve HERE, to the
+                // row the user archived, rather than fall through and create a
+                // duplicate beside it -- which is how a bulk archive used to
+                // undo itself on the next import. What happens next is the
+                // caller's business: below the establish threshold the entity
+                // just accumulates links and stays archived.
                 "SELECT epm.entity_id FROM entity_page_map epm
                  JOIN pages p ON p.id = epm.page_id
-                 WHERE p.kind = 'entity' AND p.status = 'active'
+                 WHERE p.kind = 'entity'
                    AND EXISTS (SELECT 1 FROM json_each(p.aliases) WHERE value = ?1)
                  ORDER BY p.created_at, epm.entity_id LIMIT 1",
                 libsql::params![name.trim().to_lowercase()],
@@ -34983,12 +35511,15 @@ impl MemoryDB {
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
-                "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
-                        p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, \
-                        p.aliases \
-                 FROM entity_page_map epm \
-                 JOIN pages p ON p.id = epm.page_id \
-                 WHERE p.kind = 'entity' AND p.status = 'active' AND LOWER(p.title) = LOWER(?1)",
+                &format!(
+                    "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
+                            p.confidence, p.entity_confirmed, p.entity_created_at, \
+                            p.entity_updated_at, p.aliases, {ENTITY_LIFECYCLE_COLUMNS} \
+                     FROM entity_page_map epm \
+                     JOIN pages p ON p.id = epm.page_id \
+                     WHERE p.kind = 'entity' AND p.status = 'active' \
+                       AND LOWER(p.title) = LOWER(?1)"
+                ),
                 libsql::params![name.to_string()],
             )
             .await
@@ -35000,6 +35531,9 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
+            let confirmed = row.get::<i64>(6).unwrap_or(0) != 0;
+            let (memory_count, status, established_by) =
+                entity_lifecycle_from_row(&row, 10, confirmed);
             entities.push(Entity {
                 id: row.get::<String>(0).unwrap_or_default(),
                 name: row.get::<String>(1).unwrap_or_default(),
@@ -35012,13 +35546,13 @@ impl MemoryDB {
                 ),
                 source_agent: row.get::<Option<String>>(4).unwrap_or(None),
                 confidence: row.get::<Option<f64>>(5).unwrap_or(None).map(|v| v as f32),
-                confirmed: row.get::<i64>(6).unwrap_or(0) != 0,
+                confirmed,
                 created_at: row.get::<i64>(7).unwrap_or(0),
                 updated_at: row.get::<i64>(8).unwrap_or(0),
                 aliases: parse_pages_aliases(row.get::<Option<String>>(9).unwrap_or(None)),
-                memory_count: 0,
-                status: wenlan_types::EntityStatus::Detected,
-                established_by: None,
+                memory_count,
+                status,
+                established_by,
             });
         }
         Ok(entities)
@@ -35929,6 +36463,19 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("merge_entities old links: {e}")))?;
 
+                // #708: the canonical just absorbed the loser's memory links,
+                // so it can have crossed the establish threshold on this
+                // statement. Checked after the DELETE above, so the count
+                // reads the settled link set. The loser is deleted further
+                // down and is deliberately not checked.
+                self.maybe_establish_entity_in_transaction(
+                    &conn,
+                    canonical_id,
+                    ESTABLISHED_BY_AUTO_MEMORIES,
+                    entity_establish_min_memories(),
+                )
+                .await?;
+
                 conn.execute(
                     "UPDATE pages SET entity_id = ?1 WHERE entity_id = ?2",
                     libsql::params![canonical_id, alias_id],
@@ -36603,13 +37150,13 @@ impl MemoryDB {
     ) -> Result<Vec<Entity>, WenlanError> {
         let conn = self.conn.lock().await;
 
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
                     p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, \
-                    p.aliases \
+                    p.aliases, {ENTITY_LIFECYCLE_COLUMNS} \
              FROM entity_page_map epm \
              JOIN pages p ON p.id = epm.page_id \
-             WHERE p.kind = 'entity' AND p.status = 'active'",
+             WHERE p.kind = 'entity' AND p.status = 'active'"
         );
         let mut params: Vec<libsql::Value> = Vec::new();
 
@@ -36645,6 +37192,9 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
+            let confirmed = row.get::<i64>(6).unwrap_or(0) != 0;
+            let (memory_count, status, established_by) =
+                entity_lifecycle_from_row(&row, 10, confirmed);
             entities.push(Entity {
                 id: row.get::<String>(0).unwrap_or_default(),
                 name: row.get::<String>(1).unwrap_or_default(),
@@ -36657,13 +37207,13 @@ impl MemoryDB {
                 ),
                 source_agent: row.get::<Option<String>>(4).unwrap_or(None),
                 confidence: row.get::<Option<f64>>(5).unwrap_or(None).map(|v| v as f32),
-                confirmed: row.get::<i64>(6).unwrap_or(0) != 0,
+                confirmed,
                 created_at: row.get::<i64>(7).unwrap_or(0),
                 updated_at: row.get::<i64>(8).unwrap_or(0),
                 aliases: parse_pages_aliases(row.get::<Option<String>>(9).unwrap_or(None)),
-                memory_count: 0,
-                status: wenlan_types::EntityStatus::Detected,
-                established_by: None,
+                memory_count,
+                status,
+                established_by,
             });
         }
         Ok(entities)
@@ -36683,12 +37233,14 @@ impl MemoryDB {
         // Fetch entity
         let mut rows = conn
             .query(
-                "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
-                        p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, \
-                        p.aliases \
-                 FROM entity_page_map epm \
-                 JOIN pages p ON p.id = epm.page_id \
-                 WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'",
+                &format!(
+                    "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
+                            p.confidence, p.entity_confirmed, p.entity_created_at, \
+                            p.entity_updated_at, p.aliases, {ENTITY_LIFECYCLE_COLUMNS} \
+                     FROM entity_page_map epm \
+                     JOIN pages p ON p.id = epm.page_id \
+                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'"
+                ),
                 libsql::params![entity_id],
             )
             .await
@@ -36699,6 +37251,9 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(e.to_string()))?
         {
+            let confirmed = row.get::<i64>(6).unwrap_or(0) != 0;
+            let (memory_count, status, established_by) =
+                entity_lifecycle_from_row(&row, 10, confirmed);
             Entity {
                 id: row.get::<String>(0).unwrap_or_default(),
                 name: row.get::<String>(1).unwrap_or_default(),
@@ -36711,13 +37266,13 @@ impl MemoryDB {
                 ),
                 source_agent: row.get::<Option<String>>(4).unwrap_or(None),
                 confidence: row.get::<Option<f64>>(5).unwrap_or(None).map(|v| v as f32),
-                confirmed: row.get::<i64>(6).unwrap_or(0) != 0,
+                confirmed,
                 created_at: row.get::<i64>(7).unwrap_or(0),
                 updated_at: row.get::<i64>(8).unwrap_or(0),
                 aliases: parse_pages_aliases(row.get::<Option<String>>(9).unwrap_or(None)),
-                memory_count: 0,
-                status: wenlan_types::EntityStatus::Detected,
-                established_by: None,
+                memory_count,
+                status,
+                established_by,
             }
         } else {
             return Err(WenlanError::NotFound("entity not found".to_string()));
@@ -36848,37 +37403,13 @@ impl MemoryDB {
     /// entity has no shadow page or was already archived.
     pub async fn archive_entity(&self, entity_id: &str) -> Result<bool, WenlanError> {
         let now = chrono::Utc::now();
-        let now_rfc3339 = now.to_rfc3339();
-        let now_ts = now.timestamp();
         let conn = self.conn.lock().await;
-        let Some(page_id) = entity_page_adapter::page_id_for_entity(&conn, entity_id).await? else {
-            return Ok(false);
-        };
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("archive_entity begin: {e}")))?;
-        let result: Result<bool, WenlanError> = async {
-            let affected = conn
-                .execute(
-                    "UPDATE pages
-                     SET status = 'archived', version = version + 1, last_modified = ?1
-                     WHERE id = ?2 AND kind = 'entity' AND status = 'active'",
-                    libsql::params![now_rfc3339, page_id.clone()],
-                )
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("archive_entity: {e}")))?;
-            if affected != 1 {
-                return Ok(false);
-            }
-            Self::append_page_history(&conn, &page_id, "archive", now_ts)
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("archive_entity history: {e}")))?;
-            self.retract_entity_incident_edges_in_transaction(&conn, entity_id, Some(entity_id))
-                .await
-                .map_err(|e| WenlanError::VectorDb(format!("archive_entity edges: {e}")))?;
-            Ok(true)
-        }
-        .await;
+        let result = self
+            .archive_entity_in_transaction(&conn, entity_id, &now)
+            .await;
         match result {
             Ok(archived) => {
                 commit_or_rollback(&conn)
@@ -36891,6 +37422,43 @@ impl MemoryDB {
                 Err(e)
             }
         }
+    }
+
+    /// The body of [`Self::archive_entity`], without `BEGIN`/`COMMIT`.
+    ///
+    /// Split out so [`Self::archive_entities`] can put many entities in one
+    /// transaction; a bulk archive that committed per entity would leave the
+    /// graph half-archived if it failed partway, and each commit costs a
+    /// separate fsync. The caller owns the transaction and the connection
+    /// guard, so this must never `BEGIN`, `COMMIT`, or `ROLLBACK`.
+    async fn archive_entity_in_transaction(
+        &self,
+        conn: &libsql::Connection,
+        entity_id: &str,
+        now: &chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, WenlanError> {
+        let Some(page_id) = entity_page_adapter::page_id_for_entity(conn, entity_id).await? else {
+            return Ok(false);
+        };
+        let affected = conn
+            .execute(
+                "UPDATE pages
+                 SET status = 'archived', version = version + 1, last_modified = ?1
+                 WHERE id = ?2 AND kind = 'entity' AND status = 'active'",
+                libsql::params![now.to_rfc3339(), page_id.clone()],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("archive_entity: {e}")))?;
+        if affected != 1 {
+            return Ok(false);
+        }
+        Self::append_page_history(conn, &page_id, "archive", now.timestamp())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("archive_entity history: {e}")))?;
+        self.retract_entity_incident_edges_in_transaction(conn, entity_id, Some(entity_id))
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("archive_entity edges: {e}")))?;
+        Ok(true)
     }
 
     /// Un-archive an entity: flip its `kind='entity'` shadow page back to
@@ -36908,29 +37476,53 @@ impl MemoryDB {
     /// entity has no shadow page or was not archived.
     pub async fn restore_entity(&self, entity_id: &str) -> Result<bool, WenlanError> {
         let now = chrono::Utc::now();
-        let now_rfc3339 = now.to_rfc3339();
-        let now_ts = now.timestamp();
         let conn = self.conn.lock().await;
-        let Some(page_id) = entity_page_adapter::page_id_for_entity(&conn, entity_id).await? else {
-            return Ok(false);
-        };
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| WenlanError::VectorDb(format!("restore_entity begin: {e}")))?;
+        let result = self
+            .restore_entity_in_transaction(&conn, entity_id, &now)
+            .await;
+        match result {
+            Ok(restored) => {
+                commit_or_rollback(&conn)
+                    .await
+                    .map_err(|e| WenlanError::VectorDb(format!("restore_entity commit: {e}")))?;
+                Ok(restored)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// The body of [`Self::restore_entity`], without `BEGIN`/`COMMIT`; the
+    /// bulk-transaction counterpart to [`Self::archive_entity_in_transaction`]
+    /// and subject to the same rule -- the caller owns the transaction.
+    async fn restore_entity_in_transaction(
+        &self,
+        conn: &libsql::Connection,
+        entity_id: &str,
+        now: &chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, WenlanError> {
+        let Some(page_id) = entity_page_adapter::page_id_for_entity(conn, entity_id).await? else {
+            return Ok(false);
+        };
         let result: Result<bool, WenlanError> = async {
             let affected = conn
                 .execute(
                     "UPDATE pages
                      SET status = 'active', version = version + 1, last_modified = ?1
                      WHERE id = ?2 AND kind = 'entity' AND status = 'archived'",
-                    libsql::params![now_rfc3339, page_id.clone()],
+                    libsql::params![now.to_rfc3339(), page_id.clone()],
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("restore_entity: {e}")))?;
             if affected != 1 {
                 return Ok(false);
             }
-            Self::append_page_history(&conn, &page_id, "restore", now_ts)
+            Self::append_page_history(conn, &page_id, "restore", now.timestamp())
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("restore_entity history: {e}")))?;
 
@@ -37006,25 +37598,203 @@ impl MemoryDB {
                     });
                 }
             }
-            let generation_updates = Self::bump_community_graph_generations(&conn, graph_changes)
+            let generation_updates = Self::bump_community_graph_generations(conn, graph_changes)
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("restore_entity generation: {e}")))?;
             self.record_community_dirty_nodes(generation_updates);
             Ok(true)
         }
         .await;
-        match result {
-            Ok(restored) => {
-                commit_or_rollback(&conn)
-                    .await
-                    .map_err(|e| WenlanError::VectorDb(format!("restore_entity commit: {e}")))?;
-                Ok(restored)
+        result
+    }
+
+    /// Archive every selected entity that is not archived already (#708).
+    ///
+    /// The bulk twin of [`Self::archive_entity`], and the whole point of the
+    /// Entities view: a person who has just filtered down to 300 one-mention
+    /// detected entities needs to clear them in one action, not 300. Already
+    /// archived, missing, and out-of-scope ids are skipped rather than failing
+    /// the batch, so re-sending the same selection is a no-op; `count` reports
+    /// what actually changed, so a caller can still tell the difference.
+    ///
+    /// `dry_run` resolves the selection and returns it without mutating.
+    pub async fn archive_entities(
+        &self,
+        selection: &wenlan_types::requests::EntitySelection,
+        scope: &ReadScope,
+        dry_run: bool,
+    ) -> Result<wenlan_types::responses::EntityBulkResponse, WenlanError> {
+        self.bulk_entity_lifecycle(selection, scope, dry_run, EntityBulkAction::Archive)
+            .await
+    }
+
+    /// Un-archive every selected entity that is archived (#708) -- the exact
+    /// inverse of [`Self::archive_entities`], with the same skip-don't-fail
+    /// contract.
+    pub async fn restore_entities(
+        &self,
+        selection: &wenlan_types::requests::EntitySelection,
+        scope: &ReadScope,
+        dry_run: bool,
+    ) -> Result<wenlan_types::responses::EntityBulkResponse, WenlanError> {
+        self.bulk_entity_lifecycle(selection, scope, dry_run, EntityBulkAction::Restore)
+            .await
+    }
+
+    async fn bulk_entity_lifecycle(
+        &self,
+        selection: &wenlan_types::requests::EntitySelection,
+        scope: &ReadScope,
+        dry_run: bool,
+        action: EntityBulkAction,
+    ) -> Result<wenlan_types::responses::EntityBulkResponse, WenlanError> {
+        let selected = {
+            let conn = self.conn.lock().await;
+            Self::select_bulk_entity_ids(&conn, selection, scope, action).await?
+        };
+        if dry_run {
+            return Ok(wenlan_types::responses::EntityBulkResponse {
+                count: selected.len() as u64,
+                entity_ids: Self::truncate_bulk_ids(selected),
+                dry_run: true,
+            });
+        }
+
+        let mut applied: Vec<String> = Vec::new();
+        // One transaction per chunk, not per entity: a half-applied archive
+        // would leave edges retired against a live page, and a commit per
+        // entity would cost one fsync each. Releasing the connection between
+        // chunks keeps a large batch from starving every other writer.
+        for chunk in selected.chunks(ENTITY_BULK_CHUNK) {
+            let now = chrono::Utc::now();
+            let conn = self.conn.lock().await;
+            conn.execute("BEGIN", ())
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("{} begin: {e}", action.label())))?;
+            let result: Result<Vec<String>, WenlanError> = async {
+                let mut done = Vec::new();
+                for entity_id in chunk {
+                    let changed = match action {
+                        EntityBulkAction::Archive => {
+                            self.archive_entity_in_transaction(&conn, entity_id, &now)
+                                .await?
+                        }
+                        EntityBulkAction::Restore => {
+                            self.restore_entity_in_transaction(&conn, entity_id, &now)
+                                .await?
+                        }
+                    };
+                    if changed {
+                        done.push(entity_id.clone());
+                    }
+                }
+                Ok(done)
             }
-            Err(e) => {
-                let _ = conn.execute("ROLLBACK", ()).await;
-                Err(e)
+            .await;
+            match result {
+                Ok(done) => {
+                    commit_or_rollback(&conn).await.map_err(|e| {
+                        WenlanError::VectorDb(format!("{} commit: {e}", action.label()))
+                    })?;
+                    applied.extend(done);
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
             }
         }
+        Ok(wenlan_types::responses::EntityBulkResponse {
+            count: applied.len() as u64,
+            entity_ids: Self::truncate_bulk_ids(applied),
+            dry_run: false,
+        })
+    }
+
+    /// Resolve a bulk selection into the entity ids the action can actually
+    /// act on: in scope, present as an entity, and in the right lifecycle
+    /// state for `action`.
+    ///
+    /// Scoping matches `delete_entity_in_scope` in effect (an entity outside
+    /// the scope is not there), but is applied in SQL rather than per id --
+    /// `entity_space` only sees ACTIVE pages, so an id-based restore checked
+    /// that way would drop every archived entity it was asked to restore.
+    async fn select_bulk_entity_ids(
+        conn: &libsql::Connection,
+        selection: &wenlan_types::requests::EntitySelection,
+        scope: &ReadScope,
+        action: EntityBulkAction,
+    ) -> Result<Vec<String>, WenlanError> {
+        match (&selection.ids, &selection.filter) {
+            (Some(_), Some(_)) => Err(WenlanError::Validation(
+                "entity selection: pass either `ids` or `filter`, not both".into(),
+            )),
+            (None, None) => Err(WenlanError::Validation(
+                "entity selection: one of `ids` or `filter` is required".into(),
+            )),
+            (Some(ids), None) => {
+                let mut out = Vec::new();
+                // SQLite caps bound parameters per statement, so a selection
+                // of thousands of ids is resolved in slices.
+                for slice in ids.chunks(ENTITY_ID_LOOKUP_CHUNK) {
+                    let mut conditions = vec!["p.kind = 'entity'".to_string()];
+                    let placeholders = vec!["?"; slice.len()].join(", ");
+                    conditions.push(format!("epm.entity_id IN ({placeholders})"));
+                    let mut values: Vec<libsql::Value> = slice
+                        .iter()
+                        .map(|id| libsql::Value::Text(id.clone()))
+                        .collect();
+                    push_read_scope_filter_folded(scope, "p.space", &mut conditions, &mut values);
+                    out.extend(
+                        Self::run_bulk_entity_selection(conn, conditions, values, action).await?,
+                    );
+                }
+                out.sort();
+                out.dedup();
+                Ok(out)
+            }
+            (None, Some(filter)) => {
+                let (conditions, values) = entity_filter_conditions(filter, scope);
+                Self::run_bulk_entity_selection(conn, conditions, values, action).await
+            }
+        }
+    }
+
+    async fn run_bulk_entity_selection(
+        conn: &libsql::Connection,
+        mut conditions: Vec<String>,
+        values: Vec<libsql::Value>,
+        action: EntityBulkAction,
+    ) -> Result<Vec<String>, WenlanError> {
+        conditions.push(action.eligible_predicate().to_string());
+        let sql = format!(
+            "SELECT epm.entity_id FROM entity_page_map epm \
+             JOIN pages p ON p.id = epm.page_id \
+             WHERE {} \
+             ORDER BY epm.entity_id ASC",
+            conditions.join(" AND ")
+        );
+        let mut rows = conn
+            .query(&sql, libsql::params_from_iter(values))
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("{} select: {e}", action.label())))?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("{} select row: {e}", action.label())))?
+        {
+            ids.push(row.get::<String>(0).unwrap_or_default());
+        }
+        Ok(ids)
+    }
+
+    /// `entity_ids` is an echo of what happened, not a page of data: a batch
+    /// of 40,000 must not turn into a 40,000-element JSON array. `count` stays
+    /// exact.
+    fn truncate_bulk_ids(mut ids: Vec<String>) -> Vec<String> {
+        ids.truncate(ENTITY_BULK_ID_ECHO_LIMIT);
+        ids
     }
 
     /// What an entity is currently carrying: linked memories, observations,
@@ -37323,10 +38093,149 @@ impl MemoryDB {
         Ok(updated)
     }
 
+    /// Promote a detected entity to established, inside the caller's already
+    /// open transaction, when it has earned it (#708).
+    ///
+    /// Detected entities are an index the system grows and prunes itself, not
+    /// a review queue, so promotion is a write-path step rather than a sweep:
+    /// this runs in the SAME transaction as the `memory_entities` insert that
+    /// changed the count, so an entity mentioned three times during an import
+    /// is established before the import summary is drawn. Purely synchronous
+    /// SQL on a connection the caller already holds -- it takes no lock of its
+    /// own and never awaits anything but `conn`.
+    ///
+    /// The promotion itself is one statement, so the count and the flip
+    /// cannot disagree under a concurrent link write. `min_memories` is the
+    /// threshold from [`entity_establish_min_memories`]; pass `0` for the
+    /// citation lane, where a distilled page citing the entity establishes it
+    /// regardless of how many memories it carries. An already established
+    /// entity keeps the `established_by` it has: a manual Establish is never
+    /// overwritten by a later automatic one.
+    ///
+    /// An ARCHIVED entity that reaches the threshold comes back (#708).
+    /// Archiving is how a person prunes the detected index, not a statement
+    /// that the entity is unreal, and the resolver now points recurring
+    /// mentions at the archived row instead of creating a duplicate beside
+    /// it. So an archived entity quietly accumulates links, and the mention
+    /// that carries it over the threshold restores it through the same path
+    /// [`Self::restore_entity`] uses -- edges un-retired, a `restore` history
+    /// row -- and then establishes it. The restore and the promotion run in
+    /// the caller's transaction, so an entity is never left established but
+    /// invisible. An archived entity that was ALREADY established stays
+    /// archived: it still absorbs the mention, but a deliberate archive of a
+    /// confirmed entity is a stronger signal than one more sighting.
+    ///
+    /// Returns true when this call is the one that promoted the entity.
+    async fn maybe_establish_entity_in_transaction(
+        &self,
+        conn: &libsql::Connection,
+        entity_id: &str,
+        reason: &str,
+        min_memories: usize,
+    ) -> Result<bool, WenlanError> {
+        let now = chrono::Utc::now();
+        if Self::archived_entity_has_earned_restore(conn, entity_id, min_memories).await? {
+            self.restore_entity_in_transaction(conn, entity_id, &now)
+                .await?;
+        }
+        let promoted = conn
+            .execute(
+                "UPDATE pages
+                    SET entity_confirmed = 1,
+                        established_by = ?1,
+                        last_modified = ?2,
+                        entity_updated_at = ?3
+                  WHERE kind = 'entity'
+                    AND status = 'active'
+                    AND COALESCE(entity_confirmed, 0) = 0
+                    AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?4)
+                    AND (SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?4) >= ?5",
+                libsql::params![
+                    reason,
+                    now.to_rfc3339(),
+                    now.timestamp(),
+                    entity_id,
+                    min_memories as i64
+                ],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("maybe_establish_entity: {e}")))?;
+        Ok(promoted == 1)
+    }
+
+    /// Is this entity archived, still detected, and now over the establish
+    /// threshold? The one question
+    /// [`Self::maybe_establish_entity_in_transaction`] has to answer before it
+    /// can decide whether to bring an entity back (#708). Read on the caller's
+    /// connection inside the caller's transaction, so the count it sees is the
+    /// one the promotion statement will see.
+    async fn archived_entity_has_earned_restore(
+        conn: &libsql::Connection,
+        entity_id: &str,
+        min_memories: usize,
+    ) -> Result<bool, WenlanError> {
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM entity_page_map epm
+                   JOIN pages p ON p.id = epm.page_id
+                  WHERE epm.entity_id = ?1
+                    AND p.kind = 'entity'
+                    AND p.status = 'archived'
+                    AND COALESCE(p.entity_confirmed, 0) = 0
+                    AND (SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?1) >= ?2
+                  LIMIT 1",
+                libsql::params![entity_id, min_memories as i64],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("archived_entity_threshold: {e}")))?;
+        let found = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("archived_entity_threshold row: {e}")))?
+            .is_some();
+        Ok(found)
+    }
+
+    /// [`Self::maybe_establish_entity_in_transaction`] for the citation lane:
+    /// a distilled page that cites this entity establishes it whatever its
+    /// linked-memory count. Opens its own transaction, so distill can call it
+    /// after the page write commits. A citation restores an archived entity
+    /// on the same terms a threshold crossing does -- a distilled page citing
+    /// something is the strongest evidence the system has that it is real.
+    pub async fn establish_entity_by_citation(&self, entity_id: &str) -> Result<bool, WenlanError> {
+        let conn = self.conn.lock().await;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("establish_by_citation begin: {e}")))?;
+        let result = self
+            .maybe_establish_entity_in_transaction(
+                &conn,
+                entity_id,
+                ESTABLISHED_BY_AUTO_CITATION,
+                0,
+            )
+            .await;
+        match result {
+            Ok(established) => {
+                commit_or_rollback(&conn).await.map_err(|e| {
+                    WenlanError::VectorDb(format!("establish_by_citation commit: {e}"))
+                })?;
+                Ok(established)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
     /// Write a row to `memory_entities` for each entity in `entity_ids`.
     ///
     /// Idempotent: `ON CONFLICT DO NOTHING` silently skips duplicates.
     /// Transactional: inserts are wrapped in BEGIN/COMMIT.
+    ///
+    /// #708: each insert is followed, in the same transaction, by the
+    /// auto-establish check for that entity.
     pub async fn link_memory_entities(
         &self,
         memory_source_id: &str,
@@ -37335,6 +38244,7 @@ impl MemoryDB {
         if entity_ids.is_empty() {
             return Ok(());
         }
+        let min_memories = entity_establish_min_memories();
         let conn = self.conn.lock().await;
         conn.execute("BEGIN", ())
             .await
@@ -37351,6 +38261,13 @@ impl MemoryDB {
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("link_memory_entities INSERT: {e}")))?;
+                self.maybe_establish_entity_in_transaction(
+                    &conn,
+                    eid,
+                    ESTABLISHED_BY_AUTO_MEMORIES,
+                    min_memories,
+                )
+                .await?;
             }
             Ok(())
         }
@@ -37747,12 +38664,17 @@ impl MemoryDB {
                 // G6 Stage 2 PR 2c sub-step 3 item 4: page-payload lookup,
                 // same JSON-containment + deterministic tie-break as
                 // `resolve_entity_by_alias` -- `entity_aliases` stopped
-                // being written this sub-step.
+                // being written this sub-step. #708 dropped the `status`
+                // filter here for the same reason it dropped it there, and
+                // the two must agree: this ambient lane is the one that sees
+                // the recurring mention of an archived entity, so leaving it
+                // active-only would create the duplicate the resolver fix
+                // exists to prevent.
                 let mut alias_rows = conn
                     .query(
                         "SELECT epm.entity_id FROM entity_page_map epm
                          JOIN pages p ON p.id = epm.page_id
-                         WHERE p.kind = 'entity' AND p.status = 'active'
+                         WHERE p.kind = 'entity'
                            AND EXISTS (SELECT 1 FROM json_each(p.aliases) WHERE value = ?1)
                          ORDER BY p.created_at, epm.entity_id LIMIT 1",
                         libsql::params![lower.as_str()],
@@ -37777,9 +38699,11 @@ impl MemoryDB {
                 if resolved.is_none() {
                     let mut exact_rows = conn
                         .query(
+                            // #708: archived entities included, matching the
+                            // alias arm above.
                             "SELECT epm.entity_id FROM entity_page_map epm
                              JOIN pages p ON p.id = epm.page_id
-                             WHERE p.kind = 'entity' AND p.status = 'active'
+                             WHERE p.kind = 'entity'
                                AND LOWER(p.title) = ?1
                              ORDER BY p.created_at, epm.entity_id LIMIT 1",
                             libsql::params![lower.as_str()],
@@ -38338,6 +39262,7 @@ impl MemoryDB {
                 }
             }
 
+            let establish_min = entity_establish_min_memories();
             for entity_id in entity_ids.values() {
                 conn.execute(
                     "INSERT INTO memory_entities (memory_id, entity_id)
@@ -38348,6 +39273,16 @@ impl MemoryDB {
                 .map_err(|e| {
                     WenlanError::VectorDb(format!("entity enrichment memory link: {e}"))
                 })?;
+                // #708: promote in the same transaction as the link, so an
+                // entity that reaches the threshold during an import is
+                // established before the import summary is drawn.
+                self.maybe_establish_entity_in_transaction(
+                    &conn,
+                    entity_id.as_str(),
+                    ESTABLISHED_BY_AUTO_MEMORIES,
+                    establish_min,
+                )
+                .await?;
             }
             if let Some(first_entity_id) = first_entity_id {
                 conn.execute(
@@ -38505,6 +39440,14 @@ impl MemoryDB {
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("entity link junction: {e}")))?;
+            // #708: same transaction as the link that changed the count.
+            self.maybe_establish_entity_in_transaction(
+                &conn,
+                entity_id,
+                ESTABLISHED_BY_AUTO_MEMORIES,
+                entity_establish_min_memories(),
+            )
+            .await?;
             conn.execute(
                 "UPDATE memories SET entity_id=?1 WHERE source_id=?2",
                 libsql::params![entity_id, source_id],
@@ -39373,14 +40316,25 @@ impl MemoryDB {
         // G6 Stage 2 PR 2c sub-step 2: direct targeted write -- only
         // `entity_confirmed` changed. Its `UPDATE entities SET confirmed`
         // counterpart retired at Stage 3.
+        //
+        // #708: confirm IS the manual Establish, so it stamps
+        // `established_by = 'manual'` -- overwriting an earlier automatic
+        // reason, because a person's decision outranks the threshold that
+        // guessed first. Un-confirming clears it: an entity back in the
+        // detected index was established by nothing.
         conn.execute(
-            "UPDATE pages SET entity_confirmed = ?1, last_modified = ?2
+            "UPDATE pages SET entity_confirmed = ?1, established_by = ?4, last_modified = ?2
              WHERE kind = 'entity'
                AND id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?3)",
             libsql::params![
                 if confirmed { 1i64 } else { 0i64 },
                 now_iso,
-                entity_id.to_string()
+                entity_id.to_string(),
+                if confirmed {
+                    libsql::Value::Text(ESTABLISHED_BY_MANUAL.to_string())
+                } else {
+                    libsql::Value::Null
+                }
             ],
         )
         .await
@@ -47146,45 +48100,54 @@ impl MemoryDB {
         let since_s: Option<i64> = since_ms.map(|ms| ms / 1000);
 
         // --- Phase A: fetch top-N active pages (scoped guard) ---
-        let concept_rows: Vec<(String, String, String, String, i64, String, String)> =
-            {
-                let conn = self.conn.lock().await;
-                let mut rows = conn
+        // #708: recent activity is a browse surface, and its Space arm
+        // delegates here for Global scope, so it carries the same entity-row
+        // rule as the other browse twins -- established entities appear,
+        // detected ones do not. In SQL rather than a Rust filter, so the rule
+        // lands before `LIMIT` and a burst of detected entities cannot starve
+        // real pages out of the window.
+        let entity_fence = entity_row_browse_fence("");
+        let concept_rows: Vec<(String, String, String, String, i64, String, String)> = {
+            let conn = self.conn.lock().await;
+            let mut rows = conn
                 .query(
+                    &format!(
                     "SELECT id, title, COALESCE(summary, ''), COALESCE(source_memory_ids, '[]'), \
                             version, created_at, last_modified \
                      FROM pages \
-                     WHERE status = 'active' \
+                     WHERE status = 'active'{entity_fence} \
                      ORDER BY last_modified DESC \
-                     LIMIT ?1",
+                     LIMIT ?1"),
                     libsql::params![limit],
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("list_recent_concepts scan: {e}")))?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next().await.map_err(|e| {
-                    WenlanError::VectorDb(format!("list_recent_pages row scan: {e}"))
-                })? {
-                    let id: String = row.get(0).unwrap_or_default();
-                    let title: String = row.get(1).unwrap_or_default();
-                    let summary: String = row.get(2).unwrap_or_default();
-                    let src_json: String = row.get(3).unwrap_or_else(|_| "[]".to_string());
-                    let version: i64 = row.get(4).unwrap_or(1);
-                    let created_at: String = row.get(5).unwrap_or_default();
-                    let last_modified: String = row.get(6).unwrap_or_default();
-                    out.push((
-                        id,
-                        title,
-                        summary,
-                        src_json,
-                        version,
-                        created_at,
-                        last_modified,
-                    ));
-                }
-                out
-                // conn guard dropped here
-            };
+            let mut out = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("list_recent_pages row scan: {e}")))?
+            {
+                let id: String = row.get(0).unwrap_or_default();
+                let title: String = row.get(1).unwrap_or_default();
+                let summary: String = row.get(2).unwrap_or_default();
+                let src_json: String = row.get(3).unwrap_or_else(|_| "[]".to_string());
+                let version: i64 = row.get(4).unwrap_or(1);
+                let created_at: String = row.get(5).unwrap_or_default();
+                let last_modified: String = row.get(6).unwrap_or_default();
+                out.push((
+                    id,
+                    title,
+                    summary,
+                    src_json,
+                    version,
+                    created_at,
+                    last_modified,
+                ));
+            }
+            out
+            // conn guard dropped here
+        };
 
         // --- Phase B: collect all source_memory_ids + call pending_review once ---
         let mut all_source_ids: Vec<String> = Vec::new();
@@ -48821,30 +49784,6 @@ impl MemoryDB {
         Ok(())
     }
 
-    async fn page_kind_on_conn(
-        conn: &libsql::Connection,
-        page_id: &str,
-    ) -> Result<Option<String>, WenlanError> {
-        let mut rows = conn
-            .query(
-                "SELECT COALESCE(kind, 'concept') FROM pages WHERE id = ?1",
-                libsql::params![page_id],
-            )
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("page kind: {e}")))?;
-        match rows
-            .next()
-            .await
-            .map_err(|e| WenlanError::VectorDb(format!("page kind row: {e}")))?
-        {
-            Some(row) => row
-                .get::<String>(0)
-                .map(Some)
-                .map_err(|e| WenlanError::VectorDb(format!("page kind value: {e}"))),
-            None => Ok(None),
-        }
-    }
-
     /// Reject a page mutation that targets a `kind='entity'` dual-write shadow
     /// page. Entity shadow pages mirror `entities` rows and are managed through
     /// the entity API only; the page archive/delete surface must never touch
@@ -48853,16 +49792,71 @@ impl MemoryDB {
     /// An unknown id falls through (returns Ok) so archive/delete keep their
     /// existing no-op-on-missing behavior -- only a positively identified
     /// shadow is rejected.
+    ///
+    /// The message names the entity and says where to go instead (#708): a
+    /// person who has just tried to archive a page has no idea what a "shadow
+    /// page" or "the entity API" is, and the old wording told them to do
+    /// nothing they could act on. Callers that can carry structured fields
+    /// (the HTTP page routes) send the id separately; the trailing
+    /// `(entity <id>)` is for the ones that only ever see a string.
     async fn reject_entity_shadow_page_on_conn(
         conn: &libsql::Connection,
         page_id: &str,
     ) -> Result<(), WenlanError> {
-        if Self::page_kind_on_conn(conn, page_id).await?.as_deref() == Some("entity") {
-            return Err(WenlanError::Validation(format!(
-                "page {page_id} is an entity shadow page; entity shadow pages are managed through the entity API"
-            )));
+        if let Some(owner) = Self::entity_shadow_page_owner_on_conn(conn, page_id).await? {
+            let message = entity_shadow_page_guard_message(&owner.entity_name);
+            return Err(WenlanError::Validation(match &owner.entity_id {
+                Some(entity_id) => format!("{message} (entity {entity_id})"),
+                None => message,
+            }));
         }
         Ok(())
+    }
+
+    /// The entity a page stands for, or `None` when the page is not an entity
+    /// shadow page (or does not exist).
+    ///
+    /// The page routes call this before a mutation so a refusal can name the
+    /// entity and hand the client its id as a field rather than as prose.
+    pub async fn entity_shadow_page_owner(
+        &self,
+        page_id: &str,
+    ) -> Result<Option<EntityShadowPage>, WenlanError> {
+        let conn = self.conn.lock().await;
+        Self::entity_shadow_page_owner_on_conn(&conn, page_id).await
+    }
+
+    async fn entity_shadow_page_owner_on_conn(
+        conn: &libsql::Connection,
+        page_id: &str,
+    ) -> Result<Option<EntityShadowPage>, WenlanError> {
+        // Keyed on `kind`, not on the bridge row: a shadow page whose
+        // `entity_page_map` row has gone missing is a broken invariant, and the
+        // guard must still refuse to delete it.
+        let mut rows = conn
+            .query(
+                "SELECT COALESCE(p.kind, 'concept'), COALESCE(p.title, ''), \
+                        (SELECT epm.entity_id FROM entity_page_map epm \
+                          WHERE epm.page_id = p.id ORDER BY epm.rowid LIMIT 1) \
+                 FROM pages p WHERE p.id = ?1",
+                libsql::params![page_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("entity_shadow_page_owner: {e}")))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("entity_shadow_page_owner row: {e}")))?
+        else {
+            return Ok(None);
+        };
+        if row.get::<String>(0).unwrap_or_default() != "entity" {
+            return Ok(None);
+        }
+        Ok(Some(EntityShadowPage {
+            entity_name: row.get::<String>(1).unwrap_or_default(),
+            entity_id: row.get::<Option<String>>(2).unwrap_or(None),
+        }))
     }
 
     /// Retrieve a page by id. Returns None if not found.
@@ -48895,11 +49889,15 @@ impl MemoryDB {
         } else {
             ""
         };
+        // An entity shadow page stores its link in `entity_page_map`, not in
+        // `pages.entity_id`, so the browse twin has to resolve it the same way
+        // the browse listings do or the row opens with no dossier to link to.
+        let entity_id_column = page_entity_id_column("");
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
                 &format!(
-                    "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
+                    "SELECT id, title, summary, content, {entity_id_column}, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
                  FROM pages WHERE id = ?1{fence_sql}"
                 ),
                 libsql::params![id],
@@ -48996,16 +49994,21 @@ impl MemoryDB {
         offset: i64,
         fence_entity: bool,
     ) -> Result<Vec<Page>, WenlanError> {
+        // #708: the browse twin keeps established, active entity rows and
+        // drops detected and archived ones; the fenced twin drops every
+        // entity row as before. Same rule as `list_pages_scoped_inner`, whose
+        // Global arm delegates here.
         let fence_sql = if fence_entity {
-            " AND COALESCE(kind, 'concept') != 'entity'"
+            " AND COALESCE(kind, 'concept') != 'entity'".to_string()
         } else {
-            ""
+            entity_row_browse_fence("")
         };
+        let entity_id_column = page_entity_id_column("");
         let conn = self.conn.lock().await;
         let mut rows = conn
             .query(
                 &format!(
-                    "SELECT id, title, summary, content, entity_id, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
+                    "SELECT id, title, summary, content, {entity_id_column}, space, source_memory_ids, version, status, created_at, last_compiled, last_modified, COALESCE(sources_updated_count, 0), stale_reason, COALESCE(user_edited, 0), COALESCE(changelog, '[]'), COALESCE(creation_kind, 'distilled'), COALESCE(review_status, 'confirmed'), workspace, citations, COALESCE(kind, 'concept'), refresh_blocked_reason
                  FROM pages WHERE status = ?1{fence_sql} ORDER BY last_modified DESC LIMIT ?2 OFFSET ?3"
                 ),
                 libsql::params![status, limit, offset],
@@ -52061,11 +53064,16 @@ impl MemoryDB {
 
         let conn = self.conn.lock().await;
 
-        let concept_select = "c.id, c.title, c.summary, c.content, c.entity_id, c.space, \
-                              c.source_memory_ids, c.version, c.status, c.created_at, \
-                              c.last_compiled, c.last_modified, \
-                              COALESCE(c.sources_updated_count, 0), c.stale_reason, \
-                              COALESCE(c.user_edited, 0), COALESCE(c.changelog, '[]'), COALESCE(c.creation_kind, 'distilled'), COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations, COALESCE(c.kind, 'concept')";
+        // #708: `entity_id` filled in from `entity_page_map` for the
+        // `kind='entity'` shadow rows, whose own column is NULL.
+        let entity_id_column = page_entity_id_column("c.");
+        let concept_select = format!(
+            "c.id, c.title, c.summary, c.content, {entity_id_column}, c.space, \
+             c.source_memory_ids, c.version, c.status, c.created_at, \
+             c.last_compiled, c.last_modified, \
+             COALESCE(c.sources_updated_count, 0), c.stale_reason, \
+             COALESCE(c.user_edited, 0), COALESCE(c.changelog, '[]'), COALESCE(c.creation_kind, 'distilled'), COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations, COALESCE(c.kind, 'concept')"
+        );
 
         // Optional page_type clause: pages store their category in `space`.
         // When Some("recap") is passed, only pages with space='recap' are returned.
@@ -52075,13 +53083,27 @@ impl MemoryDB {
             ""
         };
 
+        // Fence (M3 PR-1 stage f; Q1 lift, stage c; #708): `search_pages`
+        // bypasses the shared `select_visible_pages` gate (it's a direct
+        // index search, not a context-assembly call), so each arm carries its
+        // own entity-row rule. The retrieval arm (`fence_entity=true`)
+        // excludes every shadow page; the browse arm (`search_pages_browse`)
+        // keeps established, active entity rows and drops detected and
+        // archived ones, matching the Wiki list. In SQL rather than a
+        // post-fusion Rust filter so the fence lands before `LIMIT`.
+        let entity_clause = if fence_entity {
+            " AND COALESCE(c.kind, 'concept') != 'entity'".to_string()
+        } else {
+            entity_row_browse_fence("c.")
+        };
+
         // --- Vector search via DiskANN index ---
         let mut vector_results: Vec<(String, f64, Page)> = Vec::new();
         let vec_sql = format!(
             "SELECT {}, vector_distance_cos(c.embedding, vector32(?1)) AS dist \
              FROM vector_top_k('idx_pages_embedding', vector32(?1), ?2) AS vt \
              JOIN pages c ON c.rowid = vt.id \
-             WHERE c.status = 'active'{type_clause}",
+             WHERE c.status = 'active'{type_clause}{entity_clause}",
             concept_select,
         );
         let vec_result = if let Some(pt) = page_type {
@@ -52144,7 +53166,7 @@ impl MemoryDB {
             "SELECT {} \
              FROM pages c \
              JOIN pages_fts f ON c.rowid = f.rowid \
-             WHERE pages_fts MATCH ?1 AND c.status = 'active'{type_clause} \
+             WHERE pages_fts MATCH ?1 AND c.status = 'active'{type_clause}{entity_clause} \
              ORDER BY rank LIMIT ?2",
             concept_select,
         );
@@ -52244,18 +53266,10 @@ impl MemoryDB {
             *score = (*score / theoretical_max_rrf).min(1.0);
         }
 
-        // Sort by combined RRF score, attach to pages, return top limit.
-        // Fence (M3 PR-1 stage f; Q1 lift, stage c): `search_pages` bypasses
-        // the shared `select_visible_pages` gate (it's a direct index
-        // search, not a context-assembly call), so each arm carries its own
-        // `kind='entity'` exclusion. The retrieval arm (`fence_entity=true`)
-        // excludes dual-write shadow pages; the browse arm
-        // (`fence_entity=false`, `search_pages_browse`) includes them per
-        // the Q1 ruling.
-        let mut final_results: Vec<Page> = concept_map
-            .into_values()
-            .filter(|p| !fence_entity || p.kind != "entity")
-            .collect();
+        // Sort by combined RRF score, attach to pages, return top limit. The
+        // entity fence is a SQL condition on both channels above
+        // (`entity_clause`), so nothing is filtered out here.
+        let mut final_results: Vec<Page> = concept_map.into_values().collect();
         final_results.sort_by(|a, b| {
             let sa = score_map.get(&a.id).unwrap_or(&0.0);
             let sb = score_map.get(&b.id).unwrap_or(&0.0);
@@ -56835,3 +57849,7 @@ pub struct MemoryEntitiesDegreeStats {
 #[cfg(test)]
 #[path = "db/main_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "db/entity_lifecycle_test.rs"]
+mod entity_lifecycle_test;

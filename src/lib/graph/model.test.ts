@@ -41,6 +41,9 @@ function makeEntity(o: Partial<Entity> = {}): Entity {
     confirmed: o.confirmed ?? true,
     created_at: o.created_at ?? 100,
     updated_at: o.updated_at ?? 200,
+    memory_count: o.memory_count ?? 0,
+    status: o.status ?? "detected",
+    established_by: o.established_by ?? null,
   };
 }
 

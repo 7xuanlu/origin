@@ -250,6 +250,15 @@ pub struct RefineryConfig {
     pub kg_rethink_interval_hours: u64,
     #[serde(default = "d_5_usize")]
     pub entity_backfill_batch_size: usize,
+    /// How many linked memories a detected entity needs before the system
+    /// establishes it on its own (#708). Detected entities are an index the
+    /// system grows and prunes itself, so promotion is automatic: the write
+    /// path that records the Nth memory→entity link also stamps
+    /// `established_by = 'auto:memories'`. Clamped to at least 1 by the
+    /// reader, so a `0` in `intelligence.toml` cannot establish every entity
+    /// the moment it is detected.
+    #[serde(default = "d_3_usize")]
+    pub entity_establish_min_memories: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -528,6 +537,7 @@ impl Default for RefineryConfig {
             batch_window_secs: d_30_i64(),
             kg_rethink_interval_hours: d_168_u64(),
             entity_backfill_batch_size: d_5_usize(),
+            entity_establish_min_memories: d_3_usize(),
         }
     }
 }
@@ -698,6 +708,7 @@ mod tests {
         assert_eq!(cfg.refinery.consolidation_batch_size, 10);
         assert_eq!(cfg.refinery.batch_window_secs, 30);
         assert_eq!(cfg.refinery.kg_rethink_interval_hours, 168);
+        assert_eq!(cfg.refinery.entity_establish_min_memories, 3);
         // Narrative
         assert_eq!(cfg.narrative.stale_secs, 86400);
         assert_eq!(cfg.narrative.max_memories, 12);
@@ -741,6 +752,20 @@ score_threshold = 0.25
         // Non-overridden values should keep defaults
         assert_eq!(cfg.router.consumer_dedup_threshold, 0.85);
         assert_eq!(cfg.refinery.max_proposals_per_steep, 10);
+    }
+
+    /// #708: the auto-establish threshold is operator-tunable, and a config
+    /// that sets only it must not disturb the rest of the refinery block.
+    #[test]
+    fn entity_establish_min_memories_reads_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intelligence.toml");
+        std::fs::write(&path, "[refinery]\nentity_establish_min_memories = 7\n").unwrap();
+
+        let cfg = TuningConfig::load(&path);
+        assert_eq!(cfg.refinery.entity_establish_min_memories, 7);
+        assert_eq!(cfg.refinery.entity_backfill_batch_size, 5);
+        assert_eq!(cfg.refinery.max_proposals_per_steep, 5);
     }
 
     #[test]

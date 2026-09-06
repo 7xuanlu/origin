@@ -130,14 +130,32 @@ impl MemoryDB {
         let fetch_limit = (limit * 3) as i64;
         let conn = self.conn.lock().await;
 
-        let select = "c.id, c.title, c.summary, c.content, c.entity_id, c.space, \
-                      c.source_memory_ids, c.version, c.status, c.created_at, \
-                      c.last_compiled, c.last_modified, \
-                      COALESCE(c.sources_updated_count, 0), c.stale_reason, \
-                      COALESCE(c.user_edited, 0), COALESCE(c.changelog, '[]'), \
-                      COALESCE(c.creation_kind, 'distilled'), \
-                      COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations, COALESCE(c.kind, 'concept')";
+        // #708: `entity_id` filled in from `entity_page_map` for the
+        // `kind='entity'` shadow rows, whose own column is NULL.
+        let entity_id_column = super::page_entity_id_column("c.");
+        let select = format!(
+            "c.id, c.title, c.summary, c.content, {entity_id_column}, c.space, \
+             c.source_memory_ids, c.version, c.status, c.created_at, \
+             c.last_compiled, c.last_modified, \
+             COALESCE(c.sources_updated_count, 0), c.stale_reason, \
+             COALESCE(c.user_edited, 0), COALESCE(c.changelog, '[]'), \
+             COALESCE(c.creation_kind, 'distilled'), \
+             COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations, COALESCE(c.kind, 'concept')"
+        );
         let mut conditions = vec!["c.status = 'active'".to_string()];
+        // Fence (M3 PR-1 stage f; Q1 lift, stage c; #708): the retrieval arm
+        // (`fence_entity=true`) excludes every `kind='entity'` shadow page --
+        // this channel is used by `search_memory_cross_rerank_cued`'s direct
+        // page channel, which bypasses `select_visible_pages`. The browse arm
+        // (`search_pages_scoped_browse`) keeps established, active entity
+        // rows and drops detected and archived ones, matching the Wiki list.
+        // In SQL rather than a post-fusion Rust filter so the fence lands
+        // before `LIMIT`.
+        conditions.push(if fence_entity {
+            "COALESCE(c.kind, 'concept') != 'entity'".to_string()
+        } else {
+            super::entity_row_browse_predicate("c.")
+        });
         let mut values = Vec::new();
         super::push_read_scope_filter_folded(scope, "c.workspace", &mut conditions, &mut values);
         if let Some(page_type) = page_type {
@@ -258,17 +276,9 @@ impl MemoryDB {
         for score in scores.values_mut() {
             *score = (*score / theoretical_max).min(1.0);
         }
-        // Fence (M3 PR-1 stage f; Q1 lift, stage c): the retrieval arm
-        // (`fence_entity=true`) excludes `kind='entity'` dual-write shadow
-        // pages -- this channel is, more importantly, used by
-        // `search_memory_cross_rerank_cued`'s direct page channel, which
-        // bypasses `select_visible_pages`. The browse arm
-        // (`fence_entity=false`, `search_pages_scoped_browse`) includes them
-        // per the Q1 ruling.
-        let mut results: Vec<Page> = pages
-            .into_values()
-            .filter(|page| !fence_entity || page.kind != "entity")
-            .collect();
+        // The entity fence is a SQL condition on both channels above (see
+        // `conditions`), so nothing is filtered out here.
+        let mut results: Vec<Page> = pages.into_values().collect();
         results.sort_by(|left, right| {
             scores
                 .get(&right.id)
@@ -491,17 +501,27 @@ impl MemoryDB {
                 self.list_pages_browse(status, limit, offset).await
             };
         }
-        let select = "c.id, c.title, c.summary, c.content, c.entity_id, c.space, \
-                      c.source_memory_ids, c.version, c.status, c.created_at, \
-                      c.last_compiled, c.last_modified, \
-                      COALESCE(c.sources_updated_count, 0), c.stale_reason, \
-                      COALESCE(c.user_edited, 0), COALESCE(c.changelog, '[]'), \
-                      COALESCE(c.creation_kind, 'distilled'), \
-                      COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations, COALESCE(c.kind, 'concept')";
+        // #708: `entity_id` is filled in from `entity_page_map` for the
+        // `kind='entity'` shadow rows, whose own column is NULL.
+        let entity_id_column = super::page_entity_id_column("c.");
+        let select = format!(
+            "c.id, c.title, c.summary, c.content, {entity_id_column}, c.space, \
+             c.source_memory_ids, c.version, c.status, c.created_at, \
+             c.last_compiled, c.last_modified, \
+             COALESCE(c.sources_updated_count, 0), c.stale_reason, \
+             COALESCE(c.user_edited, 0), COALESCE(c.changelog, '[]'), \
+             COALESCE(c.creation_kind, 'distilled'), \
+             COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations, COALESCE(c.kind, 'concept')"
+        );
+        // #708: the browse twin keeps established, active entity rows and
+        // drops detected and archived ones; the fenced twin drops every
+        // entity row as before. Both land in SQL before `LIMIT`, so a burst
+        // of fresh detected entities can never crowd real pages out of a
+        // bounded window.
         let fence_sql = if fence_entity {
-            " AND COALESCE(c.kind, 'concept') != 'entity'"
+            " AND COALESCE(c.kind, 'concept') != 'entity'".to_string()
         } else {
-            ""
+            super::entity_row_browse_fence("c.")
         };
         let (sql, params) = match scope {
             ReadScope::Space(workspace) => (

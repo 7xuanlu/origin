@@ -453,7 +453,6 @@ pub struct SearchEntitiesResponse {
     pub results: Vec<EntitySearchResult>,
 }
 
-/// `POST /api/memory/entities/{id}/merge` response. `applied` is `false`
 /// `POST /api/memory/entities/archive` and `/restore`. `count` is the number
 /// of entities the action applied to (or would apply to when `dry_run`).
 /// `entity_ids` lists them, truncated to the first 1000 when larger.
@@ -464,6 +463,7 @@ pub struct EntityBulkResponse {
     pub dry_run: bool,
 }
 
+/// `POST /api/memory/entities/{id}/merge` response. `applied` is `false`
 /// for a `dry_run` preview (nothing mutated) and `true` once the merge ran.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MergeEntityResponse {

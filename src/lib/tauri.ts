@@ -834,6 +834,12 @@ export interface ListPageRevisionsResponse {
 
 // ── Memory Page ─────────────────────────────────────────────────────
 
+/** Lifecycle state of an entity: `detected` entities are the automatic index
+ * the system grows and prunes itself; `established` entities have earned
+ * substance and appear in the Wiki; `archived` entities stay resolvable so a
+ * recurring mention does not mint a duplicate. */
+export type EntityStatus = "detected" | "established" | "archived";
+
 export interface Entity {
   id: string;
   name: string;
@@ -845,6 +851,56 @@ export interface Entity {
   confirmed: boolean;
   created_at: number;
   updated_at: number;
+  /** Number of memories linked to this entity. Zero for a freshly detected entity. */
+  memory_count: number;
+  status: EntityStatus;
+  /** How the entity became established: "manual", "auto:memories",
+   * "auto:citation", or null while detected or archived-before-established. */
+  established_by: string | null;
+}
+
+/** `POST /api/memory/entities` (legacy list) and `POST /api/memory/entities/query`
+ * filter. Every field is optional; `limit`/`offset` are ignored by the legacy route. */
+export interface ListEntitiesRequest {
+  entity_type?: string;
+  space?: string;
+  status?: EntityStatus;
+  /** Inclusive lower bound on linked-memory count. */
+  min_memories?: number;
+  /** Inclusive upper bound on linked-memory count. */
+  max_memories?: number;
+  /** Case-insensitive substring match on name and aliases. */
+  query?: string;
+  /** Page size for `/query`; default 100, clamped to 1000. */
+  limit?: number;
+  offset?: number;
+}
+
+export interface ListEntitiesResponse {
+  entities: Entity[];
+  total: number;
+}
+
+/** Which entities a bulk archive/restore acts on: explicit `ids`, or every
+ * entity matching `filter` (whose `limit`/`offset` are ignored). Exactly one
+ * must be present. */
+export interface EntitySelection {
+  ids?: string[];
+  filter?: ListEntitiesRequest;
+}
+
+export interface ArchiveEntitiesRequest extends EntitySelection {
+  dry_run: boolean;
+}
+
+export interface RestoreEntitiesRequest extends EntitySelection {
+  dry_run: boolean;
+}
+
+export interface EntityBulkResponse {
+  count: number;
+  entity_ids: string[];
+  dry_run: boolean;
 }
 
 export interface Observation {
@@ -1178,6 +1234,37 @@ export function daemonErrorMessage(error: unknown): string | null {
   return typeof message === "string" && message.trim() !== "" ? message : null;
 }
 
+/** The daemon's guard when a page delete is refused because the row belongs
+ * to an entity: `{"error": "This page belongs to the entity '<name>'. Archive
+ * or delete it from Entities", "entity_id": "..."}`. Isolated here so the
+ * payload shape can move without touching the callers that render it. Returns
+ * null for any other rejection (transport failure, a plain-string error, or a
+ * daemon body with no `entity_id`). */
+export interface EntityGuardError {
+  readonly message: string;
+  readonly entityId: string;
+}
+
+export function parseEntityGuardError(error: unknown): EntityGuardError | null {
+  const text = pageDraftErrorText(error);
+  const objectStart = text.indexOf("{");
+  if (objectStart < 0) return null;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text.slice(objectStart));
+  } catch {
+    return null;
+  }
+  if (typeof payload !== "object" || payload === null) return null;
+  const entityId = Reflect.get(payload, "entity_id");
+  if (typeof entityId !== "string" || entityId.trim() === "") return null;
+  const message = Reflect.get(payload, "error");
+  return {
+    message: typeof message === "string" && message.trim() !== "" ? message : text,
+    entityId,
+  };
+}
+
 function parsePageDraftError(error: unknown): PageDraftApiError | null {
   const message = pageDraftErrorText(error);
   const objectStart = message.indexOf("{");
@@ -1451,6 +1538,30 @@ export async function deleteEntity(entityId: string): Promise<void> {
 
 export async function confirmEntity(entityId: string, confirmed: boolean): Promise<void> {
   return invoke("confirm_entity_cmd", { entityId, confirmed });
+}
+
+/** Filtered, paged entity list backing the Entities view (tabs, search, type
+ * and memory-count chips). */
+export async function queryEntities(
+  filter: ListEntitiesRequest,
+): Promise<ListEntitiesResponse> {
+  const result = await invoke<ListEntitiesResponse>("query_entities_cmd", { filter });
+  return { ...result, entities: withDomainArray(result.entities) };
+}
+
+/** Archives every entity in `req.ids`, or every entity matching `req.filter`
+ * when `ids` is absent. `req.dry_run` previews the count without mutating. */
+export async function archiveEntities(
+  req: ArchiveEntitiesRequest,
+): Promise<EntityBulkResponse> {
+  return invoke("archive_entities_cmd", { req });
+}
+
+/** Exact inverse of {@link archiveEntities} for the selected archived entities. */
+export async function restoreEntities(
+  req: RestoreEntitiesRequest,
+): Promise<EntityBulkResponse> {
+  return invoke("restore_entities_cmd", { req });
 }
 
 export async function confirmObservation(observationId: string, confirmed: boolean): Promise<void> {

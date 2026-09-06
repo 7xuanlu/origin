@@ -2198,6 +2198,44 @@ pub async fn list_entities_cmd(
     Ok(resp.entities)
 }
 
+/// The Entities view's reader (#708): all three lifecycle states, filtered and
+/// paged, with the unpaged match count so the view can say how many more there
+/// are. `list_entities_cmd` above stays as it is, because it feeds the Wiki,
+/// which only ever wants live entities.
+#[tauri::command]
+pub async fn query_entities_cmd(
+    state: tauri::State<'_, State>,
+    filter: requests::ListEntitiesRequest,
+) -> Result<responses::ListEntitiesResponse, String> {
+    let client = daemon_client(&state).await;
+    client
+        .post_json("/api/memory/entities/query", &filter)
+        .await
+}
+
+/// Bulk archive (#708). The selection is either explicit ids or the same
+/// filter the view is showing, so "archive everything I am looking at" does not
+/// have to round-trip every id first. `dry_run` previews the count.
+#[tauri::command]
+pub async fn archive_entities_cmd(
+    state: tauri::State<'_, State>,
+    req: requests::ArchiveEntitiesRequest,
+) -> Result<responses::EntityBulkResponse, String> {
+    let client = daemon_client(&state).await;
+    client.post_json("/api/memory/entities/archive", &req).await
+}
+
+/// The exact inverse of `archive_entities_cmd`, so an archive taken by mistake
+/// is one action to undo.
+#[tauri::command]
+pub async fn restore_entities_cmd(
+    state: tauri::State<'_, State>,
+    req: requests::RestoreEntitiesRequest,
+) -> Result<responses::EntityBulkResponse, String> {
+    let client = daemon_client(&state).await;
+    client.post_json("/api/memory/entities/restore", &req).await
+}
+
 #[tauri::command]
 pub async fn search_entities_cmd(
     state: tauri::State<'_, State>,

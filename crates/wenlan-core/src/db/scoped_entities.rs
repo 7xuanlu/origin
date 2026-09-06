@@ -37,11 +37,12 @@ impl MemoryDB {
         let sql = format!(
             "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
                     p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, \
-                    p.aliases \
+                    p.aliases, {} \
              FROM entity_page_map epm \
              JOIN pages p ON p.id = epm.page_id \
              WHERE p.kind = 'entity' AND p.status = 'active' AND {} \
              ORDER BY p.entity_updated_at DESC, epm.entity_id ASC",
+            super::ENTITY_LIFECYCLE_COLUMNS,
             conditions.join(" AND ")
         );
         let mut rows = conn
@@ -59,6 +60,78 @@ impl MemoryDB {
             entities.push(entity_from_row(&row, "list_entities_scoped")?);
         }
         Ok(entities)
+    }
+
+    /// The Entities view's reader (#708): every lifecycle state, filtered and
+    /// paged, with the unpaged match count beside the page.
+    ///
+    /// `list_entities_scoped` is the Wiki's reader and shows only live
+    /// entities; this one must be able to show detected and archived rows too,
+    /// because the Entities view is where a person triages them. Returns
+    /// `(page, total)` where `total` counts every match before `limit`/`offset`,
+    /// so the view can say "showing 100 of 4,312" without a second round trip.
+    ///
+    /// `filter.space` is ignored here -- the route resolves it into `scope`
+    /// first, the same way the legacy list route does.
+    pub async fn query_entities_scoped(
+        &self,
+        filter: &wenlan_types::requests::ListEntitiesRequest,
+        scope: &ReadScope,
+    ) -> Result<(Vec<Entity>, u64), WenlanError> {
+        let (conditions, values) = super::entity_filter_conditions(filter, scope);
+        let where_sql = conditions.join(" AND ");
+        // Default 100, clamp 1000: an unbounded entity list is the one query
+        // that can page a whole knowledge base into a JSON response.
+        let limit = filter.limit.unwrap_or(100).clamp(1, 1000);
+        let offset = filter.offset.unwrap_or(0);
+
+        let conn = self.conn.lock().await;
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM entity_page_map epm \
+             JOIN pages p ON p.id = epm.page_id \
+             WHERE {where_sql}"
+        );
+        let mut count_rows = conn
+            .query(&count_sql, libsql::params_from_iter(values.clone()))
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("query_entities_scoped count: {error}"))
+            })?;
+        let total = match count_rows.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("query_entities_scoped count row: {error}"))
+        })? {
+            Some(row) => row.get::<i64>(0).unwrap_or(0).max(0) as u64,
+            None => 0,
+        };
+        drop(count_rows);
+
+        let sql = format!(
+            "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
+                    p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, \
+                    p.aliases, {} \
+             FROM entity_page_map epm \
+             JOIN pages p ON p.id = epm.page_id \
+             WHERE {where_sql} \
+             ORDER BY p.entity_updated_at DESC, epm.entity_id ASC \
+             LIMIT ? OFFSET ?",
+            super::ENTITY_LIFECYCLE_COLUMNS
+        );
+        let mut page_values = values;
+        page_values.push(libsql::Value::Integer(i64::from(limit)));
+        page_values.push(libsql::Value::Integer(i64::from(offset)));
+        let mut rows = conn
+            .query(&sql, libsql::params_from_iter(page_values))
+            .await
+            .map_err(|error| {
+                WenlanError::VectorDb(format!("query_entities_scoped query: {error}"))
+            })?;
+        let mut entities = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|error| {
+            WenlanError::VectorDb(format!("query_entities_scoped next: {error}"))
+        })? {
+            entities.push(entity_from_row(&row, "query_entities_scoped")?);
+        }
+        Ok((entities, total))
     }
 
     pub async fn get_entity_detail_scoped(
@@ -88,10 +161,11 @@ impl MemoryDB {
         let entity_sql = format!(
             "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, \
                     p.confidence, p.entity_confirmed, p.entity_created_at, p.entity_updated_at, \
-                    p.aliases \
+                    p.aliases, {} \
              FROM entity_page_map epm \
              JOIN pages p ON p.id = epm.page_id \
              WHERE p.kind = 'entity' AND p.status = 'active' AND {} LIMIT 1",
+            super::ENTITY_LIFECYCLE_COLUMNS,
             conditions.join(" AND ")
         );
         let mut rows = conn
@@ -377,12 +451,14 @@ impl MemoryDB {
             ),
             ReadScope::Global => unreachable!(),
         };
+        let lifecycle = super::ENTITY_LIFECYCLE_COLUMNS;
         let sql = format!(
-            "SELECT m.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, \
+            "SELECT epm.entity_id, p.title, p.entity_type, p.space, p.source_agent, p.confidence, \
                     p.entity_confirmed, p.entity_created_at, p.entity_updated_at, p.aliases, \
+                    {lifecycle}, \
                     vector_distance_cos(p.embedding, vector32(?1)) AS distance \
-             FROM entity_page_map m \
-             JOIN pages p ON p.id = m.page_id \
+             FROM entity_page_map epm \
+             JOIN pages p ON p.id = epm.page_id \
              WHERE p.kind = 'entity' AND p.status = 'active' AND p.embedding IS NOT NULL {scope_sql} \
              ORDER BY distance ASC LIMIT ?2"
         );
@@ -402,7 +478,8 @@ impl MemoryDB {
         })? {
             results.push(EntitySearchResult {
                 entity: entity_from_row(&row, "search_entities_by_vector_scoped")?,
-                distance: row.get::<f64>(10).map_err(|error| {
+                // Column 13: the three #708 lifecycle columns sit at 10-12.
+                distance: row.get::<f64>(13).map_err(|error| {
                     WenlanError::VectorDb(format!(
                         "search_entities_by_vector_scoped distance: {error}"
                     ))
@@ -1115,7 +1192,16 @@ fn page_link(
     }
 }
 
+/// Decode one entity row. Columns 0-9 are the entity's own fields; columns
+/// 10-12 are [`super::ENTITY_LIFECYCLE_COLUMNS`], which every SELECT feeding
+/// this function appends in that order.
 fn entity_from_row(row: &libsql::Row, context: &str) -> Result<Entity, WenlanError> {
+    let confirmed = row
+        .get::<i64>(6)
+        .map_err(|error| WenlanError::VectorDb(format!("{context} confirmed: {error}")))?
+        != 0;
+    let (memory_count, status, established_by) =
+        super::entity_lifecycle_from_row(row, 10, confirmed);
     Ok(Entity {
         id: row
             .get(0)
@@ -1141,10 +1227,7 @@ fn entity_from_row(row: &libsql::Row, context: &str) -> Result<Entity, WenlanErr
             .get::<Option<f64>>(5)
             .map_err(|error| WenlanError::VectorDb(format!("{context} confidence: {error}")))?
             .map(|value| value as f32),
-        confirmed: row
-            .get::<i64>(6)
-            .map_err(|error| WenlanError::VectorDb(format!("{context} confirmed: {error}")))?
-            != 0,
+        confirmed,
         created_at: row
             .get(7)
             .map_err(|error| WenlanError::VectorDb(format!("{context} created_at: {error}")))?,
@@ -1155,8 +1238,8 @@ fn entity_from_row(row: &libsql::Row, context: &str) -> Result<Entity, WenlanErr
             row.get::<Option<String>>(9)
                 .map_err(|error| WenlanError::VectorDb(format!("{context} aliases: {error}")))?,
         ),
-        memory_count: 0,
-        status: wenlan_types::EntityStatus::Detected,
-        established_by: None,
+        memory_count,
+        status,
+        established_by,
     })
 }

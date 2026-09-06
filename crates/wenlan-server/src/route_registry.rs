@@ -391,6 +391,10 @@ const NON_SENSITIVE_PATHS: &[&str] = &[
     // not by this catalog.
     "/api/memory/entities/{id}/confirm", "/api/memory/entities/{id}/delete", "/api/memory/entities/{entity_id}/observations",
     "/api/memory/entities/{id}/merge", "/api/memory/entities/{id}/aliases",
+    // Bulk archive/restore (#708) join them: the selection they act on is
+    // resolved with the request scope folded into its SQL, so the scope fence
+    // is inside the write, not in this catalog.
+    "/api/memory/entities/archive", "/api/memory/entities/restore",
     "/api/memory/observations/{id}", "/api/memory/observations/{id}/confirm", "/api/spaces/{name}/pin",
     "/api/spaces/{name}/confirm", "/api/spaces/reorder", "/api/spaces/{name}/star", "/api/documents/{source_id}/space",
     "/api/tags/{name}", "/api/documents/{source_id}/tags", "/api/memory/{id}/update", "/api/memory/{id}/stability",

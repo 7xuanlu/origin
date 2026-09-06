@@ -853,6 +853,24 @@ async fn distill_one_cluster_with_tuning(
             )
             .await?;
             let page_id = write_result.id;
+            // #708: a distilled page written about an entity cites it, and a
+            // cited entity has earned its place in the Wiki whatever its memory
+            // count -- the page is the evidence the count was standing in for.
+            // Runs before the attach early-return because an attached page
+            // cites the entity just as much as a new one. A failure here is
+            // logged, never fatal: the page is already written, and the next
+            // memory link or citation promotes.
+            if let Some(entity_id) = cluster.entity_id.as_deref() {
+                match db.establish_entity_by_citation(entity_id).await {
+                    Ok(true) => log::info!(
+                        "[distill] established entity {entity_id} by citation from page {page_id}"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => {
+                        log::warn!("[distill] establish by citation failed for {entity_id}: {e}")
+                    }
+                }
+            }
             if write_result.attached_to.is_some() {
                 return Ok(None);
             }

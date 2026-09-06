@@ -40,6 +40,8 @@ function makeEntity(id: string, name: string, confirmed: boolean, confidence: nu
   return {
     id, name, entity_type: "topic", domain: "Wenlan", source_agent: "codex",
     confidence, confirmed, created_at: 1_700_000_000, updated_at: updatedAt,
+    memory_count: confirmed ? 1 : 0, status: confirmed ? "established" : "detected",
+    established_by: confirmed ? "manual" : null,
   };
 }
 

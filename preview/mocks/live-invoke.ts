@@ -751,6 +751,9 @@ export const HANDLERS: Record<string, (a: any) => Promise<unknown>> = {
   search_entities_cmd: (a) =>
     post("/api/memory/entities/search", { query: a.query }).then((r) => r.entities ?? r),
   get_entity_detail_cmd: (a) => get(`/api/memory/entities/${enc(a.entityId)}`),
+  query_entities_cmd: (a) => post("/api/memory/entities/query", a.filter),
+  archive_entities_cmd: (a) => post("/api/memory/entities/archive", a.req),
+  restore_entities_cmd: (a) => post("/api/memory/entities/restore", a.req),
   get_knowledge_graph_cmd: () => get("/api/memory/graph"),
   count_knowledge_files: () => get("/api/knowledge/count").then((r) => r.total ?? r.count ?? 0),
 

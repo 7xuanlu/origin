@@ -25,6 +25,9 @@ import "./pageActions.css";
 interface PagesOverviewProps {
   readonly onCreatePage: (space: string | null) => void;
   readonly onSelectDraft: (draftId: string, space: string | null) => void;
+  /** Established entity rows are their entity's dossier, not a Page; routes
+   * there by `entity_id` instead of `onSelectPage`. */
+  readonly onSelectEntity: (entityId: string) => void;
   readonly onSelectPage: (pageId: string) => void;
   readonly onSelectSpace: (spaceName: string) => void;
 }
@@ -122,6 +125,7 @@ function SpaceChip({
 export function PagesOverview({
   onCreatePage,
   onSelectDraft,
+  onSelectEntity,
   onSelectPage,
   onSelectSpace,
 }: PagesOverviewProps) {
@@ -366,6 +370,7 @@ export function PagesOverview({
                 ].join(" · ");
                 const openPage = () => {
                   if (isDraft) onSelectDraft(page.id, assignedSpace ?? null);
+                  else if (type === "entity" && page.entity_id) onSelectEntity(page.entity_id);
                   else onSelectPage(page.id);
                 };
                 return (

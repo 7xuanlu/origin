@@ -4,6 +4,7 @@ export type View =
   | { readonly kind: "activity" }
   | { readonly kind: "connect-agent" }
   | { readonly kind: "distill-review" }
+  | { readonly kind: "entities" }
   | { readonly kind: "entity"; readonly entityId: string }
   | { readonly kind: "graph" }
   | { readonly kind: "home" }
@@ -19,7 +20,7 @@ export type View =
   | { readonly kind: "spaces"; readonly create?: boolean }
   | { readonly kind: "stream" };
 
-export type GlobalNavigation = "home" | "memories" | "pages" | "spaces" | "graph" | "sources";
+export type GlobalNavigation = "home" | "memories" | "pages" | "entities" | "spaces" | "graph" | "sources";
 
 function assertNever(value: never): never {
   throw new TypeError(`Unsupported view: ${String(value)}`);
@@ -40,6 +41,8 @@ export function activeNavigationForView(view: View): GlobalNavigation | null {
     case "page-draft":
     case "pages":
       return "pages";
+    case "entities":
+      return "entities";
     case "space":
     case "spaces":
       return "spaces";

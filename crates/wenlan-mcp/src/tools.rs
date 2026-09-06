@@ -90,6 +90,69 @@ fn recall_search_request(params: RecallParams) -> SearchMemoryRequest {
     }
 }
 
+/// Convert the `list_entities`/`archive_entities`/`restore_entities` status
+/// filter text to the wire enum, or a tool error naming the accepted values.
+fn parse_entity_status(status: Option<&str>) -> Result<Option<EntityStatus>, McpError> {
+    match status {
+        None => Ok(None),
+        Some("detected") => Ok(Some(EntityStatus::Detected)),
+        Some("established") => Ok(Some(EntityStatus::Established)),
+        Some("archived") => Ok(Some(EntityStatus::Archived)),
+        Some(other) => Err(McpError::invalid_params(
+            format!(
+                "status must be one of \"detected\", \"established\", \"archived\" (got \"{other}\")"
+            ),
+            None,
+        )),
+    }
+}
+
+/// Build the daemon filter for `list_entities`, and the `filter` half of
+/// `archive_entities`/`restore_entities`.
+fn list_entities_request(params: ListEntitiesParams) -> Result<ListEntitiesRequest, McpError> {
+    Ok(ListEntitiesRequest {
+        entity_type: params.entity_type,
+        space: effective_space(&params.space),
+        status: parse_entity_status(params.status.as_deref())?,
+        min_memories: params.min_memories,
+        max_memories: params.max_memories,
+        query: params.query,
+        limit: params.limit,
+        offset: params.offset,
+    })
+}
+
+/// Build the `EntitySelection` half of `archive_entities`/`restore_entities`
+/// (flattened into the request body alongside `dry_run`).
+fn entity_selection(
+    ids: Option<Vec<String>>,
+    filter: Option<ListEntitiesParams>,
+) -> Result<EntitySelection, McpError> {
+    Ok(EntitySelection {
+        ids,
+        filter: filter.map(list_entities_request).transpose()?,
+    })
+}
+
+/// Format an `EntityBulkResponse` from `archive_entities`/`restore_entities`.
+/// `action`/`past_tense` name the operation, e.g. `("archive", "Archived")`.
+fn format_entity_bulk_response(
+    resp: &EntityBulkResponse,
+    action: &str,
+    past_tense: &str,
+) -> String {
+    let ids = resp.entity_ids.join(", ");
+    match (resp.dry_run, ids.is_empty()) {
+        (true, true) => format!("Would {action} 0 entities (dry run, nothing changed)"),
+        (true, false) => format!(
+            "Would {action} {} entities (dry run, nothing changed): {ids}",
+            resp.count
+        ),
+        (false, true) => format!("{past_tense} 0 entities"),
+        (false, false) => format!("{past_tense} {} entities: {ids}", resp.count),
+    }
+}
+
 /// Controls which operations are allowed based on transport.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TransportMode {
@@ -884,6 +947,80 @@ pub struct CreateRelationParams {
         description = "Required source memory id returned by capture for the user's explicit relation statement."
     )]
     pub source_memory_id: String,
+}
+
+/// Filter fields for `list_entities`, `archive_entities` and
+/// `restore_entities`. Mirrors `wenlan_types::ListEntitiesRequest` field for
+/// field; a local mirror is needed because `wenlan-types` stays free of the
+/// `schemars` dependency the MCP tool schema machinery requires.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct ListEntitiesParams {
+    #[schemars(
+        description = "Entity category filter (e.g. 'person', 'project', 'tool'). Omit to match every type."
+    )]
+    #[serde(default)]
+    pub entity_type: Option<String>,
+    #[schemars(description = "Topic scope (e.g. 'work', 'personal'). Optional.")]
+    #[serde(default, alias = "domain")]
+    pub space: Option<String>,
+    #[schemars(
+        description = "Lifecycle filter: 'detected' (the automatic index Wenlan grows on its own, not yet established), 'established' (earned substance, shown in the Wiki), or 'archived'. Omit to match every state."
+    )]
+    #[serde(default)]
+    pub status: Option<String>,
+    #[schemars(description = "Inclusive lower bound on linked-memory count.")]
+    #[serde(default)]
+    pub min_memories: Option<u32>,
+    #[schemars(description = "Inclusive upper bound on linked-memory count.")]
+    #[serde(default)]
+    pub max_memories: Option<u32>,
+    #[schemars(description = "Case-insensitive substring match on name and aliases.")]
+    #[serde(default)]
+    pub query: Option<String>,
+    #[schemars(description = "Page size. Default 100, clamped to 1000.")]
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[schemars(description = "Offset for pagination.")]
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ArchiveEntitiesParams {
+    #[schemars(
+        description = "Explicit entity ids to archive. Provide this or filter, never both."
+    )]
+    #[serde(default)]
+    pub ids: Option<Vec<String>>,
+    #[schemars(
+        description = "Filter selecting every entity to archive when ids is omitted; same shape as list_entities's parameters."
+    )]
+    #[serde(default)]
+    pub filter: Option<ListEntitiesParams>,
+    #[schemars(
+        description = "When true, returns the count and ids that would be archived without changing anything."
+    )]
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RestoreEntitiesParams {
+    #[schemars(
+        description = "Explicit entity ids to restore. Provide this or filter, never both."
+    )]
+    #[serde(default)]
+    pub ids: Option<Vec<String>>,
+    #[schemars(
+        description = "Filter selecting every archived entity to restore when ids is omitted; same shape as list_entities's parameters."
+    )]
+    #[serde(default)]
+    pub filter: Option<ListEntitiesParams>,
+    #[schemars(
+        description = "When true, returns the count and ids that would be restored without changing anything."
+    )]
+    #[serde(default)]
+    pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1844,6 +1981,73 @@ impl WenlanMcpServer {
         )]))
     }
 
+    pub async fn list_entities_impl(
+        &self,
+        params: ListEntitiesParams,
+    ) -> Result<CallToolResult, McpError> {
+        let req = list_entities_request(params)?;
+        let resp: ListEntitiesResponse = try_call!(
+            self.client.post("/api/memory/entities/query", &req),
+            "list_entities"
+        );
+        let pretty = serde_json::to_string_pretty(&resp)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "{} entities (total {})\n{}",
+            resp.entities.len(),
+            resp.total,
+            pretty
+        ))]))
+    }
+
+    pub async fn archive_entities_impl(
+        &self,
+        params: ArchiveEntitiesParams,
+    ) -> Result<CallToolResult, McpError> {
+        if self.transport == TransportMode::Http {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Archive operations are not available over remote connections. \
+                 Use local MCP on the machine running Wenlan to archive detected entities."
+                    .to_string(),
+            )]));
+        }
+        let req = ArchiveEntitiesRequest {
+            selection: entity_selection(params.ids, params.filter)?,
+            dry_run: params.dry_run.unwrap_or(false),
+        };
+        let resp: EntityBulkResponse = try_call!(
+            self.client.post("/api/memory/entities/archive", &req),
+            "archive_entities"
+        );
+        Ok(CallToolResult::success(vec![Content::text(
+            format_entity_bulk_response(&resp, "archive", "Archived"),
+        )]))
+    }
+
+    pub async fn restore_entities_impl(
+        &self,
+        params: RestoreEntitiesParams,
+    ) -> Result<CallToolResult, McpError> {
+        if self.transport == TransportMode::Http {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Restore operations are not available over remote connections. \
+                 Use local MCP on the machine running Wenlan to restore archived entities."
+                    .to_string(),
+            )]));
+        }
+        let req = RestoreEntitiesRequest {
+            selection: entity_selection(params.ids, params.filter)?,
+            dry_run: params.dry_run.unwrap_or(false),
+        };
+        let resp: EntityBulkResponse = try_call!(
+            self.client.post("/api/memory/entities/restore", &req),
+            "restore_entities"
+        );
+        Ok(CallToolResult::success(vec![Content::text(
+            format_entity_bulk_response(&resp, "restore", "Restored"),
+        )]))
+    }
+
     pub async fn list_refinements_impl(
         &self,
         params: ListRefinementsParams,
@@ -2650,6 +2854,22 @@ impl WenlanMcpServer {
     }
 
     #[tool(
+        description = "List entities in Wenlan's knowledge graph with additive filters: lifecycle status (detected, established, archived), entity type, linked-memory count range, and a name/alias substring search. Detected entities are the automatic index Wenlan grows on its own as memories are captured; established entities have earned enough substance to appear in the Wiki; archived entities are hidden but stay resolvable. Use when the user wants to browse or audit entities beyond a single recall, e.g. 'show me detected entities with no memories' or 'list established people'.",
+        annotations(
+            title = "List entities",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn list_entities(
+        &self,
+        Parameters(params): Parameters<ListEntitiesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.list_entities_impl(params).await
+    }
+
+    #[tool(
         description = "Create or refresh a distilled wiki page. Omit page_id to create a new page (title required); the daemon writes the DB row and the on-disk <pages dir>/<slug>.md projection atomically (default ~/.wenlan/pages/, slug made unique on collision). Pass page_id (from the `stale_pages` block in distill output) to refresh that page in place — replaces content + source_memory_ids + optional summary, clears stale_reason, preserves page_id and created_at, bumps version monotonically so external [[wikilinks]] keep working. Never delete_page + recreate to refresh: that churns ids and loses version history. Refresh is not available over remote HTTP MCP transport (local stdio only).",
         annotations(
             title = "Write page",
@@ -2681,6 +2901,40 @@ impl WenlanMcpServer {
         Parameters(params): Parameters<DeletePageParams>,
     ) -> Result<CallToolResult, McpError> {
         self.delete_page_impl(&params.page_id).await
+    }
+
+    #[tool(
+        description = "Archive detected or established entities in bulk — by explicit ids, or every entity matching a filter (same shape as list_entities). Archiving is reversible: use restore_entities to bring them back. Pass dry_run=true first to see the count and ids that would be archived without changing anything. Use only after the user explicitly asks to archive entities, and confirm a broad filter's dry-run count with them before archiving for real. Not available over remote HTTP MCP transport (local stdio only).",
+        annotations(
+            title = "Archive entities",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn archive_entities(
+        &self,
+        Parameters(params): Parameters<ArchiveEntitiesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.archive_entities_impl(params).await
+    }
+
+    #[tool(
+        description = "Restore previously archived entities in bulk — by explicit ids, or every archived entity matching a filter (same shape as list_entities). Exact inverse of archive_entities. Pass dry_run=true to preview the count and ids without changing anything. Not available over remote HTTP MCP transport (local stdio only).",
+        annotations(
+            title = "Restore entities",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn restore_entities(
+        &self,
+        Parameters(params): Parameters<RestoreEntitiesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.restore_entities_impl(params).await
     }
 
     #[tool(
@@ -2864,6 +3118,8 @@ const LOCAL_ONLY_TOOL_NAMES: &[&str] = &[
     "reject_refinement",
     "accept_revision",
     "dismiss_revision",
+    "archive_entities",
+    "restore_entities",
 ];
 
 impl WenlanMcpServer {
@@ -3295,10 +3551,17 @@ mod tests {
             "reject_refinement",
             "accept_revision",
             "dismiss_revision",
+            "archive_entities",
+            "restore_entities",
         ] {
             assert!(stdio.iter().any(|candidate| candidate == name));
             assert!(!http.iter().any(|candidate| candidate == name));
         }
+
+        // list_entities is a read-only query, not local-only: it stays
+        // visible over both transports.
+        assert!(stdio.iter().any(|candidate| candidate == "list_entities"));
+        assert!(http.iter().any(|candidate| candidate == "list_entities"));
     }
 
     #[tokio::test]
@@ -5703,6 +5966,222 @@ mod tests {
         );
     }
 
+    // --- ArchiveEntitiesParams / RestoreEntitiesParams (local-only, like delete_page) ---
+
+    fn ids_only_selection_params() -> (Option<Vec<String>>, Option<ListEntitiesParams>) {
+        (Some(vec!["ent_1".to_string()]), None)
+    }
+
+    #[tokio::test]
+    async fn test_archive_entities_blocked_on_http_transport() {
+        let server = make_server(TransportMode::Http, "agent", None);
+        let (ids, filter) = ids_only_selection_params();
+        let result = server
+            .archive_entities_impl(ArchiveEntitiesParams {
+                ids,
+                filter,
+                dry_run: None,
+            })
+            .await
+            .unwrap();
+        let content = &result.content[0];
+        match content.raw {
+            rmcp::model::RawContent::Text(ref tc) => {
+                assert!(tc.text.contains("not available over remote connections"));
+            }
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_archive_entities_allowed_on_stdio_transport() {
+        // No daemon running → falls through to connection error (not transport block).
+        let server = make_server(TransportMode::Stdio, "agent", None);
+        let (ids, filter) = ids_only_selection_params();
+        let result = server
+            .archive_entities_impl(ArchiveEntitiesParams {
+                ids,
+                filter,
+                dry_run: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.is_error.unwrap_or(false),
+            "should fail with connection error, not transport block"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_entities_blocked_on_http_transport() {
+        let server = make_server(TransportMode::Http, "agent", None);
+        let (ids, filter) = ids_only_selection_params();
+        let result = server
+            .restore_entities_impl(RestoreEntitiesParams {
+                ids,
+                filter,
+                dry_run: None,
+            })
+            .await
+            .unwrap();
+        let content = &result.content[0];
+        match content.raw {
+            rmcp::model::RawContent::Text(ref tc) => {
+                assert!(tc.text.contains("not available over remote connections"));
+            }
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_entities_allowed_on_stdio_transport() {
+        let server = make_server(TransportMode::Stdio, "agent", None);
+        let (ids, filter) = ids_only_selection_params();
+        let result = server
+            .restore_entities_impl(RestoreEntitiesParams {
+                ids,
+                filter,
+                dry_run: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.is_error.unwrap_or(false),
+            "should fail with connection error, not transport block"
+        );
+    }
+
+    // --- list_entities / archive_entities / restore_entities: selection wire shape ---
+
+    #[test]
+    fn archive_entities_ids_only_selection_serializes_flattened() {
+        let _guard = crate::lock_state::ENV_LOCK.blocking_lock();
+        std::env::remove_var("WENLAN_SPACE");
+        crate::lock_state::init_from_env();
+
+        let req = ArchiveEntitiesRequest {
+            selection: entity_selection(Some(vec!["ent_1".to_string(), "ent_2".to_string()]), None)
+                .unwrap(),
+            dry_run: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::json!({
+                "ids": ["ent_1", "ent_2"],
+                "filter": null,
+                "dry_run": false,
+            })
+        );
+    }
+
+    #[test]
+    fn restore_entities_filter_only_selection_serializes_flattened() {
+        let _guard = crate::lock_state::ENV_LOCK.blocking_lock();
+        std::env::remove_var("WENLAN_SPACE");
+        crate::lock_state::init_from_env();
+
+        let filter = ListEntitiesParams {
+            entity_type: Some("person".to_string()),
+            status: Some("archived".to_string()),
+            min_memories: Some(1),
+            ..Default::default()
+        };
+        let req = RestoreEntitiesRequest {
+            selection: entity_selection(None, Some(filter)).unwrap(),
+            dry_run: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::json!({
+                "ids": null,
+                "filter": {
+                    "entity_type": "person",
+                    "space": null,
+                    "status": "archived",
+                    "min_memories": 1,
+                    "max_memories": null,
+                    "query": null,
+                    "limit": null,
+                    "offset": null,
+                },
+                "dry_run": true,
+            })
+        );
+    }
+
+    #[test]
+    fn entity_selection_rejects_unknown_status() {
+        let filter = ListEntitiesParams {
+            status: Some("pending_review".to_string()),
+            ..Default::default()
+        };
+        let err = entity_selection(None, Some(filter)).unwrap_err();
+        assert!(err.message.contains("detected"));
+        assert!(err.message.contains("established"));
+        assert!(err.message.contains("archived"));
+    }
+
+    // --- list_entities / archive_entities / restore_entities: response shapes ---
+
+    #[test]
+    fn list_entities_response_deserializes_sample_payload() {
+        let json = serde_json::json!({
+            "entities": [{
+                "id": "ent_1",
+                "name": "Alice",
+                "entity_type": "person",
+                "space": "work",
+                "source_agent": "claude-code",
+                "confidence": 0.9,
+                "confirmed": true,
+                "created_at": 1_700_000_000i64,
+                "updated_at": 1_700_000_100i64,
+                "aliases": ["alicia"],
+                "memory_count": 4,
+                "status": "established",
+                "established_by": "auto:memories",
+            }],
+            "total": 1,
+        });
+        let resp: ListEntitiesResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.total, 1);
+        assert_eq!(resp.entities.len(), 1);
+        let entity = &resp.entities[0];
+        assert_eq!(entity.id, "ent_1");
+        assert_eq!(entity.memory_count, 4);
+        assert_eq!(entity.status, EntityStatus::Established);
+        assert_eq!(entity.established_by.as_deref(), Some("auto:memories"));
+    }
+
+    #[test]
+    fn entity_bulk_response_deserializes_sample_payload() {
+        let json = serde_json::json!({
+            "count": 2,
+            "entity_ids": ["ent_1", "ent_2"],
+            "dry_run": true,
+        });
+        let resp: EntityBulkResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.count, 2);
+        assert_eq!(
+            resp.entity_ids,
+            vec!["ent_1".to_string(), "ent_2".to_string()]
+        );
+        assert!(resp.dry_run);
+        assert_eq!(
+            format_entity_bulk_response(&resp, "archive", "Archived"),
+            "Would archive 2 entities (dry run, nothing changed): ent_1, ent_2"
+        );
+
+        let applied = EntityBulkResponse {
+            dry_run: false,
+            ..resp
+        };
+        assert_eq!(
+            format_entity_bulk_response(&applied, "restore", "Restored"),
+            "Restored 2 entities: ent_1, ent_2"
+        );
+    }
+
     // --- Tool registration ---
 
     #[test]
@@ -6179,6 +6658,7 @@ mod tests {
             "accept_refinement",
             "accept_revision",
             "apply_lint_repair",
+            "archive_entities",
             "capture",
             "confirm_memory",
             "brief",
@@ -6194,6 +6674,7 @@ mod tests {
             "get_page_revisions",
             "get_page_sources",
             "lint",
+            "list_entities",
             "list_pending",
             "list_pending_imports",
             "list_pending_revisions",
@@ -6203,6 +6684,7 @@ mod tests {
             "prepare_lint_repair_plan",
             "recall",
             "reject_refinement",
+            "restore_entities",
             "verify_lint_repair",
             "write_page",
         ]
