@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useState, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { useMilestones } from "./useMilestones";
@@ -16,6 +16,7 @@ const TOAST_CHANNEL_IDS: Record<MilestoneId, boolean> = {
 };
 
 const TWENTY_FOUR_HOURS_S = 24 * 60 * 60;
+const AUTO_DISMISS_MS = 8_000;
 
 /** Accent color per milestone — keeps indigo for most events (cool, quiet
  *  "it worked") and warm amber for intelligence-ready to mark the moment
@@ -59,6 +60,10 @@ function titleFor(t: TFunction, id: MilestoneId): string {
     case "graph-alive":
       return "";
   }
+}
+
+function toastKey(record: MilestoneRecord): string {
+  return `${record.id}@${record.first_triggered_at}`;
 }
 
 /** Shapes a secondary line from the payload, or returns null when the
@@ -128,20 +133,11 @@ export function MilestoneToaster() {
       if (now - m.first_triggered_at > TWENTY_FOUR_HOURS_S) return false;
       // Keyed by id + trigger time so a re-fire (new trigger_at) bypasses
       // any stale dismissal from a prior firing of the same id.
-      const key = `${m.id}@${m.first_triggered_at}`;
+      const key = toastKey(m);
       if (dismissed.has(key)) return false;
       return true;
     });
   }, [milestones, dismissed]);
-
-  const dismissKey = (m: MilestoneRecord) =>
-    `${m.id}@${m.first_triggered_at}`;
-
-  // No auto-dismiss timer: toast persists until user clicks (which acks
-  // via API) or the 24h window in the filter above excludes it. A timer
-  // would race with concurrent modal attention — user looks at modal,
-  // misses the bottom-right toast, and local dismissal makes it
-  // un-replayable until app restart.
 
   return (
     <div
@@ -157,12 +153,15 @@ export function MilestoneToaster() {
     >
       {visible.map((m, i) => (
         <Toast
-          key={m.id}
+          key={toastKey(m)}
           record={m}
           index={i}
           onClick={() => {
             acknowledge(m.id as MilestoneId);
-            setDismissed((p) => new Set(p).add(dismissKey(m)));
+            setDismissed((p) => new Set(p).add(toastKey(m)));
+          }}
+          onExpire={() => {
+            setDismissed((p) => new Set(p).add(toastKey(m)));
           }}
         />
       ))}
@@ -174,10 +173,12 @@ function Toast({
   record,
   index,
   onClick,
+  onExpire,
 }: {
   record: MilestoneRecord;
   index: number;
   onClick: () => void;
+  onExpire: () => void;
 }) {
   const { t } = useTranslation();
   const id = record.id as MilestoneId;
@@ -185,32 +186,164 @@ function Toast({
   const eyebrow = eyebrowFor(t, id);
   const title = titleFor(t, id);
   const sub = subtitleFor(t, record);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const timerStartedAtRef = useRef<number | null>(null);
+  const remainingMsRef = useRef(AUTO_DISMISS_MS);
+  const hoveredRef = useRef(false);
+  const focusedRef = useRef(false);
+  const documentHiddenRef = useRef(document.hidden);
+  const expiredRef = useRef(false);
+  const onExpireRef = useRef(onExpire);
+  onExpireRef.current = onExpire;
+
+  const expire = () => {
+    if (expiredRef.current) return;
+    expiredRef.current = true;
+    remainingMsRef.current = 0;
+    timerRef.current = null;
+    timerStartedAtRef.current = null;
+    onExpireRef.current();
+  };
+
+  const pauseTimer = () => {
+    if (timerRef.current == null) return;
+    clearTimeout(timerRef.current);
+    timerRef.current = null;
+    if (timerStartedAtRef.current != null) {
+      remainingMsRef.current = Math.max(
+        0,
+        remainingMsRef.current - (Date.now() - timerStartedAtRef.current),
+      );
+      timerStartedAtRef.current = null;
+    }
+  };
+
+  const startTimer = () => {
+    if (
+      timerRef.current != null ||
+      expiredRef.current ||
+      hoveredRef.current ||
+      focusedRef.current ||
+      documentHiddenRef.current
+    ) {
+      return;
+    }
+    if (remainingMsRef.current <= 0) {
+      expire();
+      return;
+    }
+
+    timerStartedAtRef.current = Date.now();
+    timerRef.current = setTimeout(() => {
+      timerRef.current = null;
+      if (timerStartedAtRef.current != null) {
+        remainingMsRef.current = Math.max(
+          0,
+          remainingMsRef.current - (Date.now() - timerStartedAtRef.current),
+        );
+        timerStartedAtRef.current = null;
+      }
+      if (remainingMsRef.current <= 0) {
+        expire();
+      } else {
+        // Keep the countdown accurate if the platform wakes the timer early.
+        startTimer();
+      }
+    }, remainingMsRef.current);
+  };
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      documentHiddenRef.current = document.hidden;
+      if (document.hidden) {
+        pauseTimer();
+      } else {
+        startTimer();
+      }
+    };
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    startTimer();
+
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      pauseTimer();
+    };
+  }, []);
 
   return (
-    <button
+    <div
+      data-testid="milestone-toast"
       onClick={onClick}
       className="text-left group"
       style={{
+        position: "relative",
         fontFamily: "var(--mem-font-body)",
         color: "var(--mem-text)",
         backgroundColor: "var(--mem-surface)",
         border: "1px solid var(--mem-border)",
         borderRadius: 10,
-        padding: "14px 18px",
+        padding: "14px 44px 14px 18px",
         boxShadow: "var(--mem-shadow-toast)",
         animation: `mem-fade-up 400ms cubic-bezier(0.16, 1, 0.3, 1) ${index * 70}ms both`,
         maxWidth: 380,
-        minWidth: 280,
+        width: "min(380px, calc(100vw - 48px))",
+        minWidth: 0,
+        boxSizing: "border-box",
         transition: "transform 180ms ease, border-color 180ms ease",
         cursor: "pointer",
       }}
+      onFocusCapture={() => {
+        focusedRef.current = true;
+        pauseTimer();
+      }}
+      onBlurCapture={(event) => {
+        const relatedTarget = event.relatedTarget as Node | null;
+        if (!relatedTarget || !event.currentTarget.contains(relatedTarget)) {
+          focusedRef.current = false;
+          startTimer();
+        }
+      }}
       onMouseEnter={(e) => {
+        hoveredRef.current = true;
+        pauseTimer();
         e.currentTarget.style.transform = "translateY(-1px)";
       }}
       onMouseLeave={(e) => {
+        hoveredRef.current = false;
+        startTimer();
         e.currentTarget.style.transform = "translateY(0)";
       }}
     >
+      <button
+        type="button"
+        aria-label={t("common.close")}
+        title={`${t("common.close")}: ${title}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          onClick();
+        }}
+        className="rounded-md p-1 transition-colors duration-150 hover:bg-[var(--mem-hover)]"
+        style={{
+          position: "absolute",
+          top: 8,
+          right: 8,
+          color: "var(--mem-text-tertiary)",
+          cursor: "pointer",
+        }}
+      >
+        <svg
+          aria-hidden="true"
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+        >
+          <path d="M18 6 6 18M6 6l12 12" />
+        </svg>
+      </button>
       {eyebrow && (
         <div
           style={{
@@ -296,6 +429,6 @@ function Toast({
           {sub.text}
         </div>
       )}
-    </button>
+    </div>
   );
 }
