@@ -1270,6 +1270,7 @@ carrying the authority of agreement.
 | `core/db.rs::link_memory_entities` | `pub` | no | no | — | `core/db.rs::maybe_establish_entity_in_transaction` |
 | `core/db.rs::restore_entities` | `pub` | yes | no | — | `core/db.rs::bulk_entity_lifecycle` |
 | `core/db.rs::search_corrections_by_topic` | `pub` | no | no | — | `core/db.rs::search_corrections_by_topic_scoped` |
+| `core/db.rs::update_memory_entity_id` | `pub` | no | **yes** | `server/entity_graph_routes.rs::handle_link_entity` | `core/db.rs::maybe_establish_entity_in_transaction` |
 | `core/db/repair_verification.rs::record_repair_verification_atomic` | `pub(crate)` | no | no | — | `core/repair.rs::projection_page_row_on_connection` |
 | `core/db/scoped_pages.rs::get_page_scoped` | `pub` | no | **yes** | `server/page_routes.rs::handle_export_page` | `core/db/scoped_pages.rs::get_page_scoped_inner` |
 | `core/db/scoped_pages.rs::get_page_scoped_browse` | `pub` | no | **yes** | `server/page_routes.rs::handle_get_page`, `server/page_routes.rs::handle_get_page_revisions` | `core/db/scoped_pages.rs::get_page_scoped_inner` |

@@ -396,9 +396,11 @@ async fn delete_of_shadow_id_is_rejected() {
 #[tokio::test]
 async fn write_and_page_map_surfaces_reject_shadow_while_get_stays_200() {
     let (router, _tmp, db) = common::test_app().await;
-    db.store_entity("HTTP Write Fence Marker", "person", None, None, None)
+    let entity_id = db
+        .store_entity("HTTP Write Fence Marker", "person", None, None, None)
         .await
         .unwrap();
+    db.confirm_entity(&entity_id, true).await.unwrap();
     let id = find_page_id_by_title(&router, "HTTP Write Fence Marker").await;
 
     // Manual update (POST /api/memory/{id}/update-page): fenced get_page →

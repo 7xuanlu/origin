@@ -164,7 +164,7 @@ impl MemoryDB {
                     p.aliases, {} \
              FROM entity_page_map epm \
              JOIN pages p ON p.id = epm.page_id \
-             WHERE p.kind = 'entity' AND p.status = 'active' AND {} LIMIT 1",
+             WHERE p.kind = 'entity' AND {} LIMIT 1",
             super::ENTITY_LIFECYCLE_COLUMNS,
             conditions.join(" AND ")
         );

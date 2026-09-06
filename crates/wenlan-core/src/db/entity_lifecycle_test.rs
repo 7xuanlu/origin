@@ -733,6 +733,75 @@ async fn an_archived_entity_absorbs_mentions_and_returns_at_the_threshold() {
     );
 }
 
+/// A/C 2 over the HTTP link route: `POST /api/memory/link-entity` goes through
+/// `update_memory_entity_id`, which used to write only the legacy
+/// `memories.entity_id` column. `memory_count` reads `memory_entities`, so the
+/// entity showed zero links and never promoted. Live proof against a scratch
+/// daemon caught it; this pins it at the seam.
+#[tokio::test]
+async fn the_legacy_link_path_counts_toward_promotion() {
+    let (db, _tmp) = test_db().await;
+    let entity = db
+        .store_entity("Borealis Freight", "organization", None, None, Some(0.7))
+        .await
+        .unwrap();
+
+    for index in 0..3 {
+        let source_id = format!("legacy-link-{index}");
+        db.upsert_documents(vec![memory_doc(&source_id)])
+            .await
+            .unwrap();
+        let updated = db
+            .update_memory_entity_id(&source_id, &entity)
+            .await
+            .unwrap();
+        assert_eq!(updated, 1, "the memory row exists, so the update lands");
+        let row = entity_row(&db, &entity).await;
+        assert_eq!(row.memory_count, (index + 1) as u64);
+    }
+    let crossed = entity_row(&db, &entity).await;
+    assert_eq!(crossed.status, EntityStatus::Established);
+    assert_eq!(crossed.established_by.as_deref(), Some("auto:memories"));
+
+    // Linking the same memory twice is idempotent, and an unknown memory is a
+    // no-op that neither links nor errors.
+    db.update_memory_entity_id("legacy-link-0", &entity)
+        .await
+        .unwrap();
+    let unknown = db
+        .update_memory_entity_id("never-stored", &entity)
+        .await
+        .unwrap();
+    assert_eq!(unknown, 0);
+    assert_eq!(entity_row(&db, &entity).await.memory_count, 3);
+}
+
+/// The Archived tab's "Open" and the delete-permanently route both read the
+/// entity dossier by id, so `get_entity_detail` (and its scoped twin) must see
+/// an archived row. Before #708 they were live-only and returned "entity not
+/// found" for the very rows the Archived tab lists.
+#[tokio::test]
+async fn entity_detail_reads_an_archived_entity() {
+    let (db, _tmp) = test_db().await;
+    let entity = db
+        .store_entity("Quill Harbor", "place", None, None, Some(0.6))
+        .await
+        .unwrap();
+    db.archive_entity(&entity).await.unwrap();
+    assert_eq!(page_status(&db, &entity).await, "archived");
+
+    let detail = db.get_entity_detail(&entity).await.unwrap().entity;
+    assert_eq!(detail.status, EntityStatus::Archived);
+    assert_eq!(detail.name, "Quill Harbor");
+
+    let scoped = db
+        .get_entity_detail_scoped(&entity, &ReadScope::Global)
+        .await
+        .unwrap()
+        .entity;
+    assert_eq!(scoped.status, EntityStatus::Archived);
+}
+
 /// A/C: migration 130. The space fence must judge an edge endpoint by its
 /// space, which is what it exists for, and not by whether the entity is
 /// archived -- otherwise an archived entity can absorb a mention but not the

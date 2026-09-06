@@ -37239,7 +37239,7 @@ impl MemoryDB {
                             p.entity_updated_at, p.aliases, {ENTITY_LIFECYCLE_COLUMNS} \
                      FROM entity_page_map epm \
                      JOIN pages p ON p.id = epm.page_id \
-                     WHERE epm.entity_id = ?1 AND p.kind = 'entity' AND p.status = 'active'"
+                     WHERE epm.entity_id = ?1 AND p.kind = 'entity'"
                 ),
                 libsql::params![entity_id],
             )
@@ -38077,20 +38077,65 @@ impl MemoryDB {
 
     /// Update a memory's entity_id (for post-ingest entity linking).
     /// Returns the number of memory rows updated (0 = unknown `source_id`).
+    ///
+    /// #708: when the memory exists, the link is also recorded in
+    /// `memory_entities` (the table `memory_count` reads) and the entity
+    /// runs through the auto-establish check, all in one transaction. The
+    /// legacy `memories.entity_id` column alone never counted toward
+    /// promotion, so a link made through `POST /api/memory/link-entity`
+    /// left the entity detected forever.
     pub async fn update_memory_entity_id(
         &self,
         source_id: &str,
         entity_id: &str,
     ) -> Result<u64, WenlanError> {
+        let min_memories = entity_establish_min_memories();
         let conn = self.conn.lock().await;
-        let updated = conn
-            .execute(
-                "UPDATE memories SET entity_id = ?1 WHERE source_id = ?2",
-                libsql::params![entity_id, source_id],
-            )
+        conn.execute("BEGIN", ())
             .await
-            .map_err(|e| WenlanError::VectorDb(format!("update_memory_entity_id: {}", e)))?;
-        Ok(updated)
+            .map_err(|e| WenlanError::VectorDb(format!("update_memory_entity_id BEGIN: {e}")))?;
+
+        let result: Result<u64, WenlanError> = async {
+            let updated = conn
+                .execute(
+                    "UPDATE memories SET entity_id = ?1 WHERE source_id = ?2",
+                    libsql::params![entity_id, source_id],
+                )
+                .await
+                .map_err(|e| WenlanError::VectorDb(format!("update_memory_entity_id: {}", e)))?;
+            if updated > 0 {
+                conn.execute(
+                    "INSERT INTO memory_entities (memory_id, entity_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                    libsql::params![source_id, entity_id],
+                )
+                .await
+                .map_err(|e| {
+                    WenlanError::VectorDb(format!("update_memory_entity_id link: {e}"))
+                })?;
+                self.maybe_establish_entity_in_transaction(
+                    &conn,
+                    entity_id,
+                    ESTABLISHED_BY_AUTO_MEMORIES,
+                    min_memories,
+                )
+                .await?;
+            }
+            Ok(updated)
+        }
+        .await;
+
+        match result {
+            Ok(updated) => {
+                commit_or_rollback(&conn).await.map_err(|e| {
+                    WenlanError::VectorDb(format!("update_memory_entity_id COMMIT: {e}"))
+                })?;
+                Ok(updated)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     /// Promote a detected entity to established, inside the caller's already
