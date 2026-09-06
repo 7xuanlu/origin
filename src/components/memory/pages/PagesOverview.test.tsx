@@ -176,6 +176,23 @@ describe("PagesOverview", () => {
     expect(onSelectPage).not.toHaveBeenCalledWith("entity");
   });
 
+  it("never badges an established entity row as unconfirmed (#708)", async () => {
+    vi.mocked(listPagesExplicitBrowse).mockResolvedValue([
+      page({ id: "entity", title: "Nash Su", entity_id: "entity-1", review_status: "unconfirmed" }),
+      page({ id: "prose", title: "Needs verification", review_status: "unconfirmed" }),
+    ]);
+    const user = userEvent.setup();
+    renderOverview();
+
+    expect(await screen.findByRole("button", { name: "Open Nash Su" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open Needs verification · Unconfirmed" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open Nash Su · Unconfirmed" })).not.toBeInTheDocument();
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "Review" }), "unconfirmed");
+    expect(await screen.findByRole("button", { name: "Open Needs verification · Unconfirmed" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open Nash Su" })).not.toBeInTheDocument();
+  });
+
   it("treats persisted unconfirmed Pages as an inventory status, not a new-page candidate", async () => {
     vi.mocked(listPagesExplicitBrowse).mockResolvedValue([
       page({ id: "confirmed", title: "Confirmed note" }),

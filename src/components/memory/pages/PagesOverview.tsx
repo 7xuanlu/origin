@@ -36,6 +36,15 @@ type PageSort = "recent" | "title";
 type TypeFilter = "all" | PagePresentationType;
 type StatusFilter = "all" | "unconfirmed";
 
+// The review badge belongs to distilled prose awaiting a human look. An
+// entity row only reaches the Wiki once it is established (#708), so its
+// shadow page's `review_status` says nothing the reader should see.
+function isUnconfirmedPage(page: Page): boolean {
+  return page.status !== "draft"
+    && page.review_status === "unconfirmed"
+    && classifyPage(page) !== "entity";
+}
+
 const PAGE_SIZE = 7;
 
 function modifiedAt(page: Page): number {
@@ -191,8 +200,7 @@ export function PagesOverview({
   const filteredPages = useMemo(
     () => pages
       .filter((page) => typeFilter === "all" || classifyPage(page) === typeFilter)
-      .filter((page) => statusFilter === "all"
-        || (page.status !== "draft" && page.review_status === "unconfirmed"))
+      .filter((page) => statusFilter === "all" || isUnconfirmedPage(page))
       .filter((page) => spaceFilter === "all" || pageSpaceContext(page) === spaceFilter)
       .sort((left, right) => comparePages(left, right, sort)),
     [pages, sort, spaceFilter, statusFilter, typeFilter],
@@ -357,7 +365,7 @@ export function PagesOverview({
                 const spaceDestination = assignedSpace
                   ? t("pages.overview.openSpace", { space: assignedSpace })
                   : "";
-                const isUnconfirmed = !isDraft && page.review_status === "unconfirmed";
+                const isUnconfirmed = isUnconfirmedPage(page);
                 const hasCleanupSuggestion = !isDraft && cleanupSuggestionIds.has(page.id);
                 const stateLabels = [
                   isDraft ? t("pages.overview.draft") : null,
