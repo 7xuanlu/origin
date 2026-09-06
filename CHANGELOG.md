@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.18.1](https://github.com/7xuanlu/wenlan/compare/v0.18.0...v0.18.1) (2026-09-06)
+
+
+### Bug Fixes
+
+* **app:** let local presets send an API key; report upstream LLM refusals as 502 ([#705](https://github.com/7xuanlu/wenlan/issues/705)) ([af646dd](https://github.com/7xuanlu/wenlan/commit/af646ddcf705ee7450335a8772a8cb196f89a3a1))
+* **harness:** close shared Claude/Codex hook and runner gaps ([#689](https://github.com/7xuanlu/wenlan/issues/689)) ([ce4d69d](https://github.com/7xuanlu/wenlan/commit/ce4d69d7e5bdee9e12275b19271d50fc7d3837ac))
+* **release:** stop requiring the codex runner script in release PRs ([#707](https://github.com/7xuanlu/wenlan/issues/707)) ([c589470](https://github.com/7xuanlu/wenlan/commit/c589470e7e58fdfa745740ff8ab3a89bd971c8cd))
+
 ## [0.18.0](https://github.com/7xuanlu/wenlan/compare/v0.17.8...v0.18.0) (2026-09-04)
 
 
