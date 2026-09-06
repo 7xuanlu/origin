@@ -29831,6 +29831,9 @@ impl MemoryDB {
                         created_at: row.get::<i64>(7).unwrap_or(0),
                         updated_at: row.get::<i64>(8).unwrap_or(0),
                         aliases: parse_pages_aliases(row.get::<Option<String>>(10).unwrap_or(None)),
+                        memory_count: 0,
+                        status: wenlan_types::EntityStatus::Detected,
+                        established_by: None,
                     };
                     let distance: f64 = row.get::<f64>(9).unwrap_or(1.0);
                     results.push(EntitySearchResult {
@@ -29898,6 +29901,9 @@ impl MemoryDB {
                             aliases: parse_pages_aliases(
                                 row.get::<Option<String>>(10).unwrap_or(None),
                             ),
+                            memory_count: 0,
+                            status: wenlan_types::EntityStatus::Detected,
+                            established_by: None,
                         };
                         let distance: f64 = row.get::<f64>(9).unwrap_or(1.0);
                         results.push(EntitySearchResult {
@@ -35010,6 +35016,9 @@ impl MemoryDB {
                 created_at: row.get::<i64>(7).unwrap_or(0),
                 updated_at: row.get::<i64>(8).unwrap_or(0),
                 aliases: parse_pages_aliases(row.get::<Option<String>>(9).unwrap_or(None)),
+                memory_count: 0,
+                status: wenlan_types::EntityStatus::Detected,
+                established_by: None,
             });
         }
         Ok(entities)
@@ -36652,6 +36661,9 @@ impl MemoryDB {
                 created_at: row.get::<i64>(7).unwrap_or(0),
                 updated_at: row.get::<i64>(8).unwrap_or(0),
                 aliases: parse_pages_aliases(row.get::<Option<String>>(9).unwrap_or(None)),
+                memory_count: 0,
+                status: wenlan_types::EntityStatus::Detected,
+                established_by: None,
             });
         }
         Ok(entities)
@@ -36703,6 +36715,9 @@ impl MemoryDB {
                 created_at: row.get::<i64>(7).unwrap_or(0),
                 updated_at: row.get::<i64>(8).unwrap_or(0),
                 aliases: parse_pages_aliases(row.get::<Option<String>>(9).unwrap_or(None)),
+                memory_count: 0,
+                status: wenlan_types::EntityStatus::Detected,
+                established_by: None,
             }
         } else {
             return Err(WenlanError::NotFound("entity not found".to_string()));

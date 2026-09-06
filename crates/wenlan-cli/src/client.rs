@@ -537,10 +537,7 @@ impl WenlanClient {
     /// on this route, so callers filter the returned list client-side.
     pub async fn list_entities(&self) -> Result<ListEntitiesResponse> {
         let url = format!("{}/api/memory/entities/list", self.base_url);
-        let req = ListEntitiesRequest {
-            entity_type: None,
-            space: None,
-        };
+        let req = ListEntitiesRequest::default();
         let resp = self
             .send(
                 self.http.post(&url).json(&req),

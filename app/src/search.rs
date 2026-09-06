@@ -2191,6 +2191,7 @@ pub async fn list_entities_cmd(
     let req = requests::ListEntitiesRequest {
         entity_type,
         space: domain,
+        ..Default::default()
     };
     let resp: responses::ListEntitiesResponse =
         client.post_json("/api/memory/entities/list", &req).await?;

@@ -1155,5 +1155,8 @@ fn entity_from_row(row: &libsql::Row, context: &str) -> Result<Entity, WenlanErr
             row.get::<Option<String>>(9)
                 .map_err(|error| WenlanError::VectorDb(format!("{context} aliases: {error}")))?,
         ),
+        memory_count: 0,
+        status: wenlan_types::EntityStatus::Detected,
+        established_by: None,
     })
 }

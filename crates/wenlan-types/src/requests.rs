@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! API request types for all HTTP endpoints.
 
+use crate::entities::EntityStatus;
 use crate::WriteSpaceTarget;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -205,12 +206,67 @@ pub struct LinkEntityRequest {
     pub entity_id: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// `POST /api/memory/entities` (legacy, returns `Vec<Entity>`) and the
+/// filter half of `POST /api/memory/entities/query`, `/archive`, `/restore`.
+/// Every field is optional so the legacy `{entity_type, space}` body still
+/// parses. `limit`/`offset` are ignored by the legacy route.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ListEntitiesRequest {
     #[serde(default)]
     pub entity_type: Option<String>,
     #[serde(default, alias = "domain")]
     pub space: Option<String>,
+    /// Lifecycle filter. `None` on the legacy route means "not archived";
+    /// `None` on `/query` means all three states.
+    #[serde(default)]
+    pub status: Option<EntityStatus>,
+    /// Inclusive lower bound on linked-memory count.
+    #[serde(default)]
+    pub min_memories: Option<u32>,
+    /// Inclusive upper bound on linked-memory count.
+    #[serde(default)]
+    pub max_memories: Option<u32>,
+    /// Case-insensitive substring match on name and aliases.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Page size for `/query`; default 100, clamped to 1000.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+/// Which entities a bulk archive/restore acts on: explicit `ids`, or every
+/// entity matching `filter` (a [`ListEntitiesRequest`] whose `limit`/`offset`
+/// are ignored). Exactly one must be present; both or neither is a 400.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EntitySelection {
+    #[serde(default)]
+    pub ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub filter: Option<ListEntitiesRequest>,
+}
+
+/// `POST /api/memory/entities/archive`. Archives the selected entities that are
+/// not already archived (reuses `archive_entity`: page status archived, incident
+/// edges retired and tagged, entity row kept). `dry_run` returns the count and
+/// ids without mutating.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveEntitiesRequest {
+    #[serde(flatten)]
+    pub selection: EntitySelection,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `POST /api/memory/entities/restore`. Exact inverse of archive for the
+/// selected archived entities: page status active, tagged edges un-retired.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RestoreEntitiesRequest {
+    #[serde(flatten)]
+    pub selection: EntitySelection,
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

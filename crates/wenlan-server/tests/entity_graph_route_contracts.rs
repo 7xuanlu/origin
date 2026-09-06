@@ -255,10 +255,7 @@ async fn moved_entity_graph_handlers_preserve_typed_contracts() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(error.error.contains("no-such-memory"), "{}", error.error);
 
-    let list_request = ListEntitiesRequest {
-        entity_type: None,
-        space: None,
-    };
+    let list_request = ListEntitiesRequest::default();
     let (status, listed): (StatusCode, ListEntitiesResponse) = request_typed(
         &router,
         Method::POST,
