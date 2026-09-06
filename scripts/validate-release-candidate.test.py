@@ -73,17 +73,12 @@ class FakeContentApi:
         records = []
         for name in sorted(VALIDATOR.REQUIRED_RELEASE_PATHS):
             raw = contents[name].encode()
-            default_mode = (
-                "100755"
-                if name == "plugin-codex/bin/wenlan-mcp-runner.sh"
-                else "100644"
-            )
             records.append(
                 {
                     "path": name,
-                    "mode": self.head_mode_overrides.get(name, default_mode)
+                    "mode": self.head_mode_overrides.get(name, "100644")
                     if head
-                    else default_mode,
+                    else "100644",
                     "type": "blob",
                     "sha": git_blob_sha(raw),
                     "size": len(raw),
@@ -1456,16 +1451,14 @@ class ValidateReleaseCandidateTests(unittest.TestCase):
                 ):
                     transform(qualified, "0.15.3", "0.15.4")
 
-    def test_release_runner_mode_change_is_rejected(self) -> None:
+    def test_release_managed_mode_change_is_rejected(self) -> None:
         old, new = release_contents()
         with self.assertRaisesRegex(VALIDATOR.CandidateError, "mode/type changed"):
             VALIDATOR.validate_release_pr_content(
                 FakeContentApi(
                     old,
                     new,
-                    head_mode_overrides={
-                        "plugin-codex/bin/wenlan-mcp-runner.sh": "100644"
-                    },
+                    head_mode_overrides={"version.txt": "100755"},
                 ),
                 "7xuanlu/wenlan",
                 candidate_pr(),
