@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.2](https://github.com/7xuanlu/wenlan/compare/v0.18.1...v0.18.2) (2026-09-06)
+
+
+### Bug Fixes
+
+* **app:** add explicit and automatic milestone toast dismissal ([#709](https://github.com/7xuanlu/wenlan/issues/709)) ([8e1f764](https://github.com/7xuanlu/wenlan/commit/8e1f7643f76fa6922b59643c7f467e28f0130d46))
+
 ## [0.18.1](https://github.com/7xuanlu/wenlan/compare/v0.18.0...v0.18.1) (2026-09-06)
 
 
