@@ -59,7 +59,8 @@ EOF
 echo '{"version": "0.5.0"}' > "$TMPDIR_TEST/app/tauri.conf.json"
 echo '{"name": "wenlan-app", "version": "0.5.0"}' > "$TMPDIR_TEST/package.json"
 cat > "$TMPDIR_TEST/plugin-codex/bin/wenlan-mcp-runner.sh" <<EOF
-exec npx -y wenlan-mcp@^0.5.0 --agent-name "\${agent_name}" "\$@"
+plugin_json="\${here}/../.codex-plugin/plugin.json"
+exec npx -y "wenlan-mcp@^\${ver}" --agent-name "\${agent_name}" "\$@"
 EOF
 cat > "$TMPDIR_TEST/plugin-codex/skills/setup/SKILL.md" <<EOF
 curl -fsSL https://raw.githubusercontent.com/7xuanlu/wenlan/v0.5.0/install.sh | bash
@@ -139,14 +140,22 @@ fi
 echo "PASS test 5: Codex plugin manifest drift detected"
 
 echo '{"version": "0.5.0+codex"}' > "$TMPDIR_TEST/plugin-codex/.codex-plugin/plugin.json"
-perl -0pi -e 's/wenlan-mcp@\^0\.5\.0/wenlan-mcp@^0.4.9/g' "$TMPDIR_TEST/plugin-codex/bin/wenlan-mcp-runner.sh"
+perl -0pi -e 's/\^\$\{ver\}/^0.5.0/g' "$TMPDIR_TEST/plugin-codex/bin/wenlan-mcp-runner.sh"
+grep -q 'wenlan-mcp@\^0\.5\.0' "$TMPDIR_TEST/plugin-codex/bin/wenlan-mcp-runner.sh" || { echo "FAIL test 6: fixture mutation did not apply"; exit 1; }
 if (cd "$TMPDIR_TEST" && RELEASE_TAG="v0.5.0" bash "$OLDPWD/scripts/validate-versions.sh") 2>/dev/null; then
-    echo "FAIL test 6: should have detected Codex runner pin drift"
+    echo "FAIL test 6: should have rejected a hardcoded Codex runner pin (even a matching one)"
     exit 1
 fi
-echo "PASS test 6: Codex runner pin drift detected"
+echo "PASS test 6: hardcoded Codex runner pin rejected"
 
-perl -0pi -e 's/wenlan-mcp@\^0\.4\.9/wenlan-mcp@^0.5.0/g' "$TMPDIR_TEST/plugin-codex/bin/wenlan-mcp-runner.sh"
+perl -0pi -e 's/\^0\.5\.0/^\${ver}/g' "$TMPDIR_TEST/plugin-codex/bin/wenlan-mcp-runner.sh"
+perl -0pi -e 's|\.codex-plugin/plugin\.json|.codex-plugin/other.json|g' "$TMPDIR_TEST/plugin-codex/bin/wenlan-mcp-runner.sh"
+if (cd "$TMPDIR_TEST" && RELEASE_TAG="v0.5.0" bash "$OLDPWD/scripts/validate-versions.sh") 2>/dev/null; then
+    echo "FAIL test 6b: should have rejected a Codex runner that does not read plugin.json"
+    exit 1
+fi
+echo "PASS test 6b: Codex runner without plugin.json derivation rejected"
+perl -0pi -e 's|\.codex-plugin/other\.json|.codex-plugin/plugin.json|g' "$TMPDIR_TEST/plugin-codex/bin/wenlan-mcp-runner.sh"
 perl -0pi -e 's|/v0\.5\.0/install\.sh|/v0.4.9/install.sh|g' "$TMPDIR_TEST/plugin-codex/skills/setup/SKILL.md"
 if (cd "$TMPDIR_TEST" && RELEASE_TAG="v0.5.0" bash "$OLDPWD/scripts/validate-versions.sh") 2>/dev/null; then
     echo "FAIL test 7: should have detected Codex setup install tag drift"

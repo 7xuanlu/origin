@@ -25,7 +25,6 @@ RELEASE_FILES = (
     "crates/wenlan-cli/npm/package.json",
     "crates/wenlan-mcp/npm/package.json",
     "plugin-codex/.codex-plugin/plugin.json",
-    "plugin-codex/bin/wenlan-mcp-runner.sh",
     "plugin-codex/skills/setup/SKILL.md",
     "plugin/.claude-plugin/plugin.json",
     "plugin/skills/setup/SKILL.md",
@@ -360,8 +359,8 @@ class ReleaseManagedPathsConsistencyTests(unittest.TestCase):
     """A stale copy of RELEASE_MANAGED_PATHS must not silently drift.
 
     validate-release-candidate.py is the canonical source of REQUIRED_RELEASE_PATHS.
-    This copy legitimately carries extra entries (e.g. "plugin/bin/wenlan-mcp-runner.sh"),
-    so the contract is superset, not equality.
+    This copy may carry extra entries, so the contract is superset, not
+    equality.
     """
 
     def test_release_managed_paths_is_superset_of_validator_required_paths(self) -> None:

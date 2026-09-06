@@ -65,7 +65,6 @@ RELEASE_MANAGED_PATHS = frozenset(
         "crates/wenlan-mcp/npm/package.json",
         "package.json",
         "plugin-codex/.codex-plugin/plugin.json",
-        "plugin-codex/bin/wenlan-mcp-runner.sh",
         "plugin-codex/skills/setup/SKILL.md",
         "plugin/.claude-plugin/plugin.json",
         "plugin/skills/setup/SKILL.md",

@@ -33,7 +33,10 @@ WENLAN_NPM_VER=$(jq -r .version crates/wenlan-cli/npm/package.json)
 PLUGIN_VER=$(jq -r .version plugin/.claude-plugin/plugin.json)
 CODEX_PLUGIN_VER_RAW=$(jq -r .version plugin-codex/.codex-plugin/plugin.json)
 CODEX_PLUGIN_VER="${CODEX_PLUGIN_VER_RAW%%+*}"
-CODEX_RUNNER_PINS=$(grep -Eo 'wenlan-mcp@\^[0-9]+\.[0-9]+\.[0-9]+' plugin-codex/bin/wenlan-mcp-runner.sh | sed -E 's/.*@\^//' | sort -u || true)
+# The Codex runner derives its `npx wenlan-mcp@^X.Y.Z` fallback from the sibling
+# plugin.json at run time, so it must carry no hardcoded pin that could drift.
+CODEX_RUNNER_HARDCODED_PINS=$(grep -Eo 'wenlan-mcp@\^[0-9]+\.[0-9]+\.[0-9]+' plugin-codex/bin/wenlan-mcp-runner.sh | sed -E 's/.*@\^//' | sort -u || true)
+CODEX_RUNNER_DERIVES_PIN=$(grep -c '\.codex-plugin/plugin\.json' plugin-codex/bin/wenlan-mcp-runner.sh || true)
 CODEX_SETUP_TAGS=$(grep -Eo '/v[0-9]+\.[0-9]+\.[0-9]+/install\.sh' plugin-codex/skills/setup/SKILL.md | sed -E 's|/v([^/]+)/install\.sh|\1|' | sort -u || true)
 
 echo "Tag:         $TAG_VER"
@@ -50,8 +53,7 @@ echo "wenlan-mcp npm: $MCP_NPM_VER"
 echo "wenlan npm: $WENLAN_NPM_VER"
 echo "Plugin:      $PLUGIN_VER"
 echo "Codex plugin: $CODEX_PLUGIN_VER_RAW"
-echo "Codex runner pins:"
-printf '%s\n' "$CODEX_RUNNER_PINS" | sed 's/^/  /'
+echo "Codex runner hardcoded pins: ${CODEX_RUNNER_HARDCODED_PINS:-none}"
 echo "Codex setup tags:"
 printf '%s\n' "$CODEX_SETUP_TAGS" | sed 's/^/  /'
 
@@ -60,15 +62,25 @@ if [[ "$VTXT_VER" != "$TAG_VER" || "$WS_VER" != "$TAG_VER" || "$WENLAN_TYPES_DEP
     exit 1
 fi
 
-for pin in $CODEX_RUNNER_PINS $CODEX_SETUP_TAGS; do
+for pin in $CODEX_SETUP_TAGS; do
     if [[ "$pin" != "$TAG_VER" ]]; then
         echo "ERROR: Codex plugin release pin drift — ${pin} is not ${TAG_VER}"
         exit 1
     fi
 done
 
-if [[ -z "$CODEX_RUNNER_PINS" || -z "$CODEX_SETUP_TAGS" ]]; then
+if [[ -z "$CODEX_SETUP_TAGS" ]]; then
     echo "ERROR: Codex plugin release pin missing"
+    exit 1
+fi
+
+if [[ -n "$CODEX_RUNNER_HARDCODED_PINS" ]]; then
+    echo "ERROR: Codex runner carries a hardcoded wenlan-mcp pin (${CODEX_RUNNER_HARDCODED_PINS//$'\n'/ }); it must derive the pin from plugin.json"
+    exit 1
+fi
+
+if [[ "$CODEX_RUNNER_DERIVES_PIN" == "0" ]]; then
+    echo "ERROR: Codex runner does not derive its wenlan-mcp pin from .codex-plugin/plugin.json"
     exit 1
 fi
 
