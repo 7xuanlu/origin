@@ -419,5 +419,7 @@ describe("EntitiesView", () => {
 
     expect(await screen.findByText("Detected Entity 100")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Load more" })).not.toBeInTheDocument();
-  });
+    // Renders a full 100-row page twice; ~1.5s locally, timed out at the 5s
+    // default on the shared CI runner.
+  }, 20_000);
 });
