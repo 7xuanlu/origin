@@ -833,3 +833,149 @@ async fn the_space_fence_accepts_an_archived_endpoint_and_still_refuses_a_cross_
         "the refusal must come from the fence itself: {refused}"
     );
 }
+
+/// Sol review of #711: permanent delete is scoped by Space, not by lifecycle
+/// state. The Archived tab is its main caller, and the live-only scope gate
+/// answered "entity not found" for exactly the rows it lists. The memories an
+/// archived entity had linked survive the delete; only the link goes.
+#[tokio::test]
+async fn delete_entity_in_scope_deletes_an_archived_entity_and_keeps_its_memories() {
+    let (db, _tmp) = test_db().await;
+    let entity = db
+        .store_entity("Quill Harbor", "place", None, None, Some(0.6))
+        .await
+        .unwrap();
+    link_memories(&db, &entity, "quill", 2).await;
+    db.archive_entity(&entity).await.unwrap();
+    assert_eq!(page_status(&db, &entity).await, "archived");
+
+    db.create_space("work", None, false).await.unwrap();
+    let elsewhere = db
+        .delete_entity_in_scope(&ReadScope::Space("work".to_string()), &entity)
+        .await
+        .expect_err("an entity outside the scope is not there to delete");
+    assert!(matches!(elsewhere, crate::WenlanError::NotFound(_)));
+    assert_eq!(page_status(&db, &entity).await, "archived");
+
+    db.delete_entity_in_scope(&ReadScope::Global, &entity)
+        .await
+        .expect("an archived entity in scope deletes");
+    assert!(matches!(
+        db.get_entity_detail(&entity).await,
+        Err(crate::WenlanError::NotFound(_))
+    ));
+    for index in 0..2 {
+        let source_id = format!("quill-{index}");
+        assert!(
+            db.get_memory_detail(&source_id).await.unwrap().is_some(),
+            "memory {source_id} survives the entity's permanent delete"
+        );
+    }
+}
+
+/// Sol review of #711: an archived entity still owns its aliases (the
+/// resolver matches them, so a recurring mention lands on the archived row),
+/// so another entity must not be able to claim the same alias while it is
+/// archived. Otherwise the resolver's oldest-first pick and the guard disagree
+/// about who owns the name.
+#[tokio::test]
+async fn an_archived_entity_keeps_its_alias_against_a_new_claimant() {
+    let (db, _tmp) = test_db().await;
+    let older = db
+        .store_entity("Borealis Freight", "organization", None, None, Some(0.7))
+        .await
+        .unwrap();
+    db.add_entity_alias("borealis", &older, "test")
+        .await
+        .unwrap();
+    db.archive_entity(&older).await.unwrap();
+
+    let newer = db
+        .store_entity("Borealis Shipping", "organization", None, None, Some(0.7))
+        .await
+        .unwrap();
+    db.add_entity_alias("borealis", &newer, "test")
+        .await
+        .unwrap();
+
+    let owner = db.resolve_entity_by_alias("borealis").await.unwrap();
+    assert_eq!(owner.as_deref(), Some(older.as_str()));
+    let newer_aliases = db.get_entity_detail(&newer).await.unwrap().entity.aliases;
+    assert!(
+        !newer_aliases.iter().any(|alias| alias == "borealis"),
+        "the guard must skip an alias an archived entity still owns: {newer_aliases:?}"
+    );
+}
+
+/// Sol review of #711: the Archived tab's "Archived" column reads
+/// `updated_at`, so archive and restore must bump it or the column shows when
+/// the entity was last edited, not when it was archived.
+#[tokio::test]
+async fn archive_and_restore_bump_the_entity_updated_at() {
+    let (db, _tmp) = test_db().await;
+    let entity = db
+        .store_entity("Zephyr Analytics", "organization", None, None, Some(0.7))
+        .await
+        .unwrap();
+    let conn = db.conn.lock().await;
+    conn.execute(
+        "UPDATE pages SET entity_updated_at = 1000 \
+         WHERE id = (SELECT page_id FROM entity_page_map WHERE entity_id = ?1)",
+        libsql::params![entity.clone()],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    assert_eq!(entity_row(&db, &entity).await.updated_at, 1000);
+
+    db.archive_entity(&entity).await.unwrap();
+    let archived_at = entity_row(&db, &entity).await.updated_at;
+    assert!(
+        archived_at > 1000,
+        "archive stamps updated_at: {archived_at}"
+    );
+
+    db.restore_entity(&entity).await.unwrap();
+    assert!(entity_row(&db, &entity).await.updated_at >= archived_at);
+}
+
+/// Sol review of #711: a bulk apply re-runs the selection predicate inside
+/// each chunk transaction. An id that was archived between the dry run and the
+/// apply is simply not eligible any more; the apply reports what it did, not
+/// what the dry run promised. (The revalidation query is the same one that
+/// selects the ids, narrowed to the chunk, so the filter arm is pinned by the
+/// query/archive agreement test above.)
+#[tokio::test]
+async fn bulk_archive_reports_only_what_it_actually_archived() {
+    let (db, _tmp) = test_db().await;
+    let mut ids = Vec::new();
+    for name in ["Alpha Guess", "Beta Guess", "Gamma Guess"] {
+        ids.push(
+            db.store_entity(name, "concept", None, None, Some(0.5))
+                .await
+                .unwrap(),
+        );
+    }
+    let selection = EntitySelection {
+        ids: Some(ids.clone()),
+        filter: None,
+    };
+    let preview = db
+        .archive_entities(&selection, &ReadScope::Global, true)
+        .await
+        .unwrap();
+    assert_eq!(preview.count, 3);
+
+    // Something else archives one of them before the apply lands.
+    db.archive_entity(&ids[1]).await.unwrap();
+
+    let applied = db
+        .archive_entities(&selection, &ReadScope::Global, false)
+        .await
+        .unwrap();
+    assert_eq!(applied.count, 2);
+    assert!(!applied.entity_ids.contains(&ids[1]));
+    for id in &ids {
+        assert_eq!(page_status(&db, id).await, "archived");
+    }
+}

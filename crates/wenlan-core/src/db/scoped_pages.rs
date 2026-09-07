@@ -730,13 +730,20 @@ impl MemoryDB {
                 self.get_page_browse(id).await
             };
         }
-        let select = "c.id, c.title, c.summary, c.content, c.entity_id, c.space, \
-                      c.source_memory_ids, c.version, c.status, c.created_at, \
-                      c.last_compiled, c.last_modified, \
-                      COALESCE(c.sources_updated_count, 0), c.stale_reason, \
-                      COALESCE(c.user_edited, 0), COALESCE(c.changelog, '[]'), \
-                      COALESCE(c.creation_kind, 'distilled'), \
-                      COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations, COALESCE(c.kind, 'concept')";
+        // #708: `entity_id` filled in from `entity_page_map` for the
+        // `kind='entity'` shadow rows, whose own column is NULL -- the same
+        // projection the list twins use, so a by-id read classifies the row
+        // the way the listing that linked to it did.
+        let entity_id_column = super::page_entity_id_column("c.");
+        let select = format!(
+            "c.id, c.title, c.summary, c.content, {entity_id_column}, c.space, \
+             c.source_memory_ids, c.version, c.status, c.created_at, \
+             c.last_compiled, c.last_modified, \
+             COALESCE(c.sources_updated_count, 0), c.stale_reason, \
+             COALESCE(c.user_edited, 0), COALESCE(c.changelog, '[]'), \
+             COALESCE(c.creation_kind, 'distilled'), \
+             COALESCE(c.review_status, 'confirmed'), c.workspace, c.citations, COALESCE(c.kind, 'concept')"
+        );
         let (scope_sql, scope_value) = page_scope_clause(scope, "c.workspace", 2);
         let fence_sql = if fence_entity {
             " AND COALESCE(c.kind, 'concept') != 'entity'"

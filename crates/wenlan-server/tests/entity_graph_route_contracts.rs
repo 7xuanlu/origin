@@ -1365,3 +1365,177 @@ async fn entity_graph_routes_refuse_an_ambiguous_bulk_selection() {
         }
     }
 }
+
+/// Sol review of #711: `/archive` and `/restore` fold a `filter.space` into
+/// the scope exactly as `/query` does. Before this they scoped by header only,
+/// so `{filter:{space:"work"}}` with no header read back one Space in the
+/// dry run and then archived every Space on apply.
+#[tokio::test]
+async fn entity_bulk_routes_honor_the_filter_space_like_query() {
+    let (router, _tmp, db) = common::test_app_no_gate().await;
+    db.create_space("work", None, false).await.unwrap();
+    db.create_space("home", None, false).await.unwrap();
+    let work = create_test_entity_in_space(&router, "Work Guess", "concept", "work").await;
+    let home = create_test_entity_in_space(&router, "Home Guess", "concept", "home").await;
+
+    let work_filter = ListEntitiesRequest {
+        status: Some(EntityStatus::Detected),
+        space: Some("work".to_string()),
+        ..Default::default()
+    };
+    let (status, seen): (StatusCode, ListEntitiesResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/query",
+        json_body(&work_filter),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(seen.total, 1);
+    assert_eq!(seen.entities[0].id, work.id);
+
+    let selection = EntitySelection {
+        ids: None,
+        filter: Some(work_filter.clone()),
+    };
+    let (status, preview): (StatusCode, EntityBulkResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/archive",
+        json_body(&ArchiveEntitiesRequest {
+            selection: selection.clone(),
+            dry_run: true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        preview.count, 1,
+        "the dry run sees the one Space the filter names"
+    );
+    assert_eq!(preview.entity_ids, vec![work.id.clone()]);
+
+    let (status, applied): (StatusCode, EntityBulkResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/archive",
+        json_body(&ArchiveEntitiesRequest {
+            selection: selection.clone(),
+            dry_run: false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        applied.count, 1,
+        "the apply touches what the dry run showed"
+    );
+    assert_eq!(applied.entity_ids, vec![work.id.clone()]);
+
+    // The other Space's entity is untouched.
+    let (status, home_seen): (StatusCode, ListEntitiesResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/query",
+        json_body(&ListEntitiesRequest {
+            status: Some(EntityStatus::Detected),
+            space: Some("home".to_string()),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(home_seen.total, 1);
+    assert_eq!(home_seen.entities[0].id, home.id);
+
+    // Restore scopes the same way.
+    let (status, restored): (StatusCode, EntityBulkResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/restore",
+        json_body(&RestoreEntitiesRequest {
+            selection: EntitySelection {
+                ids: None,
+                filter: Some(ListEntitiesRequest {
+                    status: Some(EntityStatus::Archived),
+                    space: Some("work".to_string()),
+                    ..Default::default()
+                }),
+            },
+            dry_run: false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(restored.entity_ids, vec![work.id.clone()]);
+
+    // An unknown Space in the filter is refused, not silently widened.
+    let (status, bytes) = request_bytes(
+        &router,
+        Method::POST,
+        "/api/memory/entities/archive",
+        json_body(&ArchiveEntitiesRequest {
+            selection: EntitySelection {
+                ids: None,
+                filter: Some(ListEntitiesRequest {
+                    space: Some("nowhere".to_string()),
+                    ..Default::default()
+                }),
+            },
+            dry_run: true,
+        }),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let envelope: ErrorEnvelope = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        envelope.error.contains("unknown Space"),
+        "{}",
+        envelope.error
+    );
+}
+
+/// Sol review of #711: the Archived tab's "Delete permanently" hits the
+/// scoped delete route, which used to gate on a live-only scope check and
+/// answer 404 for every archived row.
+#[tokio::test]
+async fn delete_entity_route_deletes_an_archived_entity() {
+    let (router, _tmp, _db) = common::test_app_no_gate().await;
+    let entity = create_test_entity(&router, "Quill Harbor", "place").await;
+    let (status, archived): (StatusCode, EntityBulkResponse) = request_typed(
+        &router,
+        Method::POST,
+        "/api/memory/entities/archive",
+        json_body(&ArchiveEntitiesRequest {
+            selection: EntitySelection {
+                ids: Some(vec![entity.id.clone()]),
+                filter: None,
+            },
+            dry_run: false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(archived.count, 1);
+
+    let (status, deleted): (StatusCode, SuccessResponse) = request_typed(
+        &router,
+        Method::DELETE,
+        &format!("/api/memory/entities/{}/delete", entity.id),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(deleted.ok);
+
+    let (status, _) = request_bytes(
+        &router,
+        Method::GET,
+        &format!("/api/memory/entities/{}", entity.id),
+        Body::empty(),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

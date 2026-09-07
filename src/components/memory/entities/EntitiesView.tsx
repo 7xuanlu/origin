@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import {
@@ -48,8 +48,15 @@ type Dialog =
        * it. Null when the Memories chip already excludes them (filter is
        * "None") or the second dry-run came back at zero. */
       includesMemoriesCount: number | null;
+      /** The filters the dry run was taken with, rendered as the dialog's
+       * readback. A snapshot, not the live state: the search box debounces
+       * into `filters`, so the live value can describe a different filter
+       * than the one the dry run (and the apply) actually use. */
+      readback: EntityFilters;
     }
-  | { kind: "deletePermanently"; ids: string[] };
+  | { kind: "deletePermanently"; id: string; name: string };
+
+const TAB_ORDER: readonly EntityTab[] = ["established", "detected", "archived"];
 
 const TYPE_CHIPS: EntityTypeFilter[] = ["all", "concept", "person", "organization", "place"];
 const MEMORIES_CHIPS: EntityMemoriesFilter[] = ["any", "none", "some"];
@@ -76,6 +83,12 @@ export function EntitiesView({ onEntityClick }: EntitiesViewProps) {
   const [dialogPending, setDialogPending] = useState(false);
   const [archiveMatchingPending, setArchiveMatchingPending] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // Monotonic request id: a list response only lands if it is still the
+  // newest request. Without it a slow Detected response could overwrite the
+  // Archived list after the user switched tabs, and the row actions would
+  // then act on rows the current tab never offers.
+  const requestSeqRef = useRef(0);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
 
   // Debounce the search box into `filters.query` (Detected tab only).
   useEffect(() => {
@@ -105,6 +118,7 @@ export function EntitiesView({ onEntityClick }: EntitiesViewProps) {
   const loadPage = useCallback(
     async (reset: boolean) => {
       const nextOffset = reset ? 0 : offsetRef.current;
+      const seq = ++requestSeqRef.current;
       if (reset) {
         setLoading(true);
         setLoadError(false);
@@ -113,15 +127,19 @@ export function EntitiesView({ onEntityClick }: EntitiesViewProps) {
       }
       try {
         const response = await queryEntities(entityListRequest(tab, filters, nextOffset));
+        if (seq !== requestSeqRef.current) return;
         setEntities((current) => (reset ? response.entities : [...current, ...response.entities]));
         setTotal(response.total);
         offsetRef.current = nextOffset + response.entities.length;
       } catch {
+        if (seq !== requestSeqRef.current) return;
         if (reset) setLoadError(true);
         else toast.error(t("entities.error.load"));
       } finally {
-        setLoading(false);
-        setLoadingMore(false);
+        if (seq === requestSeqRef.current) {
+          setLoading(false);
+          setLoadingMore(false);
+        }
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -141,13 +159,45 @@ export function EntitiesView({ onEntityClick }: EntitiesViewProps) {
   useEffect(() => {
     if (!dialog) return;
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      event.stopPropagation();
-      setDialog(null);
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        // The request is already in flight; closing now would only hide
+        // its outcome.
+        if (!dialogPending) setDialog(null);
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = Array.from(
+        dialogRef.current.querySelectorAll<HTMLElement>("button:not([disabled])"),
+      );
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || !dialogRef.current.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (active === last || !dialogRef.current.contains(active))) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [dialog]);
+  }, [dialog, dialogPending]);
+
+  const handleTabListKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const index = TAB_ORDER.indexOf(tab);
+    let next: EntityTab | undefined;
+    if (event.key === "ArrowRight") next = TAB_ORDER[(index + 1) % TAB_ORDER.length];
+    else if (event.key === "ArrowLeft") next = TAB_ORDER[(index + TAB_ORDER.length - 1) % TAB_ORDER.length];
+    else if (event.key === "Home") next = TAB_ORDER[0];
+    else if (event.key === "End") next = TAB_ORDER[TAB_ORDER.length - 1];
+    if (!next) return;
+    event.preventDefault();
+    setTab(next);
+    event.currentTarget.querySelector<HTMLButtonElement>(`#entities-tab-${next}`)?.focus();
+  };
 
   const reload = useCallback(async () => {
     setSelected(new Set());
@@ -189,17 +239,22 @@ export function EntitiesView({ onEntityClick }: EntitiesViewProps) {
   const openArchiveMatchingDialog = async () => {
     setArchiveMatchingPending(true);
     try {
-      const filter = entityListRequest("detected", filters, 0);
+      // Snapshot what the user can see -- including a search term the 300 ms
+      // debounce has not folded into `filters` yet -- and flush it, so the
+      // dry run, the readback, and the apply all describe the same filter.
+      const readback: EntityFilters = { ...filters, query: queryInput };
+      if (readback.query !== filters.query) setFilters(readback);
+      const filter = entityListRequest("detected", readback, 0);
       const dryRun = await archiveEntities({ filter, dry_run: true });
       // The Memories chip already excludes them when it's "None"; otherwise a
       // second dry-run (same filter, but only entities that have memories)
       // tells the dialog whether archiving would quietly take some with it.
       let includesMemoriesCount: number | null = null;
-      if (filters.memories !== "none") {
+      if (readback.memories !== "none") {
         const withMemories = await archiveEntities({ filter: { ...filter, min_memories: 1 }, dry_run: true });
         includesMemoriesCount = withMemories.count > 0 ? withMemories.count : null;
       }
-      setDialog({ kind: "archiveMatching", count: dryRun.count, filter, includesMemoriesCount });
+      setDialog({ kind: "archiveMatching", count: dryRun.count, filter, includesMemoriesCount, readback });
     } catch {
       toast.error(t("entities.error.action"));
     } finally {
@@ -207,8 +262,10 @@ export function EntitiesView({ onEntityClick }: EntitiesViewProps) {
     }
   };
 
-  const openDeletePermanentlyDialog = (ids: string[]) => {
-    setDialog({ kind: "deletePermanently", ids });
+  // One row at a time (spec): permanent delete has no undo, so it never
+  // rides on a multi-select.
+  const openDeletePermanentlyDialog = (entity: Entity) => {
+    setDialog({ kind: "deletePermanently", id: entity.id, name: entity.name });
   };
 
   const confirmDialog = async () => {
@@ -219,8 +276,8 @@ export function EntitiesView({ onEntityClick }: EntitiesViewProps) {
         await archiveEntities({ filter: dialog.filter, dry_run: false });
         toast.success(t("entities.toast_archived", { count: dialog.count }));
       } else {
-        await Promise.all(dialog.ids.map((id) => deleteEntity(id)));
-        toast.success(t("entities.toast_deleted", { count: dialog.ids.length }));
+        await deleteEntity(dialog.id);
+        toast.success(t("entities.toast_deleted", { count: 1 }));
       }
       setDialog(null);
       await reload();
@@ -243,14 +300,17 @@ export function EntitiesView({ onEntityClick }: EntitiesViewProps) {
         <span className="entities-subtitle">{subtitle(counts, t)}</span>
       </header>
 
-      <div className="entities-tabs" role="tablist" aria-label={t("entities.title")}>
-        {(["established", "detected", "archived"] as const).map((key) => (
+      <div className="entities-tabs" role="tablist" aria-label={t("entities.title")} onKeyDown={handleTabListKeyDown}>
+        {TAB_ORDER.map((key) => (
           <button
             key={key}
+            aria-controls="entities-tabpanel"
             aria-selected={tab === key}
             className="entities-tab"
+            id={`entities-tab-${key}`}
             onClick={() => setTab(key)}
             role="tab"
+            tabIndex={tab === key ? 0 : -1}
             type="button"
           >
             {t(`entities.tabs.${key}`)}
@@ -259,6 +319,7 @@ export function EntitiesView({ onEntityClick }: EntitiesViewProps) {
         ))}
       </div>
 
+      <div aria-labelledby={`entities-tab-${tab}`} id="entities-tabpanel" role="tabpanel">
       {tab === "detected" && (
         <div className="entities-filters" aria-label={t("entities.filters.typeLabel")}>
           <input
@@ -348,13 +409,6 @@ export function EntitiesView({ onEntityClick }: EntitiesViewProps) {
             <>
               <button className="entities-ghost-btn" onClick={() => void handleRestore([...selected])} type="button">
                 {t("entities.selectionBar.restoreSelected")}
-              </button>
-              <button
-                className="entities-ghost-btn entities-danger-btn"
-                onClick={() => openDeletePermanentlyDialog([...selected])}
-                type="button"
-              >
-                {t("entities.actions.deletePermanently")}
               </button>
             </>
           )}
@@ -447,9 +501,19 @@ export function EntitiesView({ onEntityClick }: EntitiesViewProps) {
                     </>
                   )}
                   {tab === "archived" && (
-                    <button className="entities-ghost-btn" onClick={() => void handleRestore([entity.id])} type="button">
-                      {t("entities.actions.restore")}
-                    </button>
+                    <>
+                      <button className="entities-ghost-btn" onClick={() => void handleRestore([entity.id])} type="button">
+                        {t("entities.actions.restore")}
+                      </button>
+                      <button
+                        aria-label={t("entities.actions.deletePermanentlyNamed", { name: entity.name })}
+                        className="entities-ghost-btn entities-danger-btn"
+                        onClick={() => openDeletePermanentlyDialog(entity)}
+                        type="button"
+                      >
+                        {t("entities.actions.deletePermanently")}
+                      </button>
+                    </>
                   )}
                 </td>
               </tr>
@@ -468,14 +532,21 @@ export function EntitiesView({ onEntityClick }: EntitiesViewProps) {
           {t("entities.actions.loadMore")}
         </button>
       )}
+      </div>
 
       {dialog && (
         <div className="entities-scrim">
-          <div aria-labelledby="entities-dialog-title" aria-modal="true" className="entities-dialog" role="dialog">
+          <div
+            aria-labelledby="entities-dialog-title"
+            aria-modal="true"
+            className="entities-dialog"
+            ref={dialogRef}
+            role="dialog"
+          >
             <h2 id="entities-dialog-title">
               {dialog.kind === "archiveMatching"
                 ? t("entities.dialogs.archiveMatching.title", { count: dialog.count })
-                : t("entities.dialogs.deletePermanently.title", { count: dialog.ids.length })}
+                : t("entities.dialogs.deletePermanently.titleNamed", { name: dialog.name })}
             </h2>
             <p>
               {dialog.kind === "archiveMatching"
@@ -485,7 +556,7 @@ export function EntitiesView({ onEntityClick }: EntitiesViewProps) {
             {dialog.kind === "archiveMatching" && (
               <div className="entities-dialog-scope">
                 <span className="entities-dialog-scope-key">{t("entities.dialogs.archiveMatching.filterLabel")}</span>
-                <span>{filterReadback(filters, t)}</span>
+                <span>{filterReadback(dialog.readback, t)}</span>
               </div>
             )}
             {dialog.kind === "archiveMatching" && dialog.includesMemoriesCount !== null && (
@@ -505,13 +576,18 @@ export function EntitiesView({ onEntityClick }: EntitiesViewProps) {
                 : t("entities.dialogs.deletePermanently.irreversibleHint")}
             </p>
             <div className="entities-dialog-actions">
-              <button className="entities-ghost-btn" disabled={dialogPending} onClick={() => setDialog(null)} type="button">
+              <button
+                autoFocus
+                className="entities-ghost-btn"
+                disabled={dialogPending}
+                onClick={() => setDialog(null)}
+                type="button"
+              >
                 {dialog.kind === "archiveMatching"
                   ? t("entities.dialogs.archiveMatching.cancel")
                   : t("entities.dialogs.deletePermanently.cancel")}
               </button>
               <button
-                autoFocus
                 className={dialog.kind === "deletePermanently" ? "entities-primary-btn entities-danger-btn" : "entities-primary-btn"}
                 disabled={dialogPending}
                 onClick={() => void confirmDialog()}

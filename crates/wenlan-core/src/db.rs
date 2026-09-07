@@ -35230,7 +35230,7 @@ impl MemoryDB {
                AND NOT EXISTS (
                    SELECT 1 FROM entity_page_map epm2
                     JOIN pages p2 ON p2.id = epm2.page_id
-                    WHERE p2.kind = 'entity' AND p2.status = 'active'
+                    WHERE p2.kind = 'entity'
                       AND epm2.entity_id <> ?3
                       AND EXISTS (SELECT 1 FROM json_each(p2.aliases) WHERE value = ?1))",
             libsql::params![alias.trim().to_lowercase(), now_iso, entity_id.to_string()],
@@ -35897,6 +35897,38 @@ impl MemoryDB {
             Some(space) => Ok(scope.matches(Some(space.as_str()))),
             None => Ok(false),
         }
+    }
+
+    /// [`Self::entity_in_scope`] without the `status = 'active'` fence: an
+    /// archived entity is still in its Space. Used where the lifecycle state
+    /// is the caller's business (permanent delete, #708).
+    async fn entity_in_scope_any_status(
+        conn: &libsql::Connection,
+        entity_id: &str,
+        scope: &ReadScope,
+    ) -> Result<bool, WenlanError> {
+        let mut rows = conn
+            .query(
+                "SELECT p.space FROM entity_page_map epm \
+                 JOIN pages p ON p.id = epm.page_id \
+                 WHERE epm.entity_id = ?1 AND p.kind = 'entity' \
+                 LIMIT 1",
+                libsql::params![entity_id],
+            )
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("entity_in_scope_any_status: {e}")))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| WenlanError::VectorDb(format!("entity_in_scope_any_status row: {e}")))?
+        else {
+            return Ok(false);
+        };
+        let space = row
+            .get::<Option<String>>(0)
+            .unwrap_or(None)
+            .unwrap_or_default();
+        Ok(scope.matches(Some(space.as_str())))
     }
 
     /// Read-only preview of `merge_entities_in_scope(scope, canonical_id,
@@ -37443,9 +37475,10 @@ impl MemoryDB {
         let affected = conn
             .execute(
                 "UPDATE pages
-                 SET status = 'archived', version = version + 1, last_modified = ?1
+                 SET status = 'archived', version = version + 1, last_modified = ?1,
+                     entity_updated_at = ?3
                  WHERE id = ?2 AND kind = 'entity' AND status = 'active'",
-                libsql::params![now.to_rfc3339(), page_id.clone()],
+                libsql::params![now.to_rfc3339(), page_id.clone(), now.timestamp()],
             )
             .await
             .map_err(|e| WenlanError::VectorDb(format!("archive_entity: {e}")))?;
@@ -37513,9 +37546,10 @@ impl MemoryDB {
             let affected = conn
                 .execute(
                     "UPDATE pages
-                     SET status = 'active', version = version + 1, last_modified = ?1
+                     SET status = 'active', version = version + 1, last_modified = ?1,
+                         entity_updated_at = ?3
                      WHERE id = ?2 AND kind = 'entity' AND status = 'archived'",
-                    libsql::params![now.to_rfc3339(), page_id.clone()],
+                    libsql::params![now.to_rfc3339(), page_id.clone(), now.timestamp()],
                 )
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("restore_entity: {e}")))?;
@@ -37528,9 +37562,13 @@ impl MemoryDB {
 
             let mut rows = conn
                 .query(
+                    // Only the edges THIS entity's archive retired. An edge
+                    // stamped by the other endpoint's archive belongs to that
+                    // archive; restoring this side must not quietly undo it
+                    // and re-activate an edge into a still-archived entity.
                     "SELECT edge_id FROM edges \
                      WHERE valid_until IS NOT NULL AND superseded_by IS NULL \
-                       AND json_extract(payload, '$.retired_by_archive') IS NOT NULL \
+                       AND json_extract(payload, '$.retired_by_archive') = ?1 \
                        AND ((src_kind = 'entity' AND src_id = ?1) \
                             OR (dst_kind = 'entity' AND dst_id = ?1)) \
                      ORDER BY edge_id",
@@ -37558,8 +37596,9 @@ impl MemoryDB {
                         "UPDATE edges \
                          SET valid_until = NULL, \
                              payload = json_remove(payload, '$.retired_by_archive') \
-                         WHERE edge_id = ?1 AND valid_until IS NOT NULL",
-                        libsql::params![edge_id.clone()],
+                         WHERE edge_id = ?1 AND valid_until IS NOT NULL \
+                           AND json_extract(payload, '$.retired_by_archive') = ?2",
+                        libsql::params![edge_id.clone(), entity_id],
                     )
                     .await
                 {
@@ -37672,8 +37711,15 @@ impl MemoryDB {
                 .await
                 .map_err(|e| WenlanError::VectorDb(format!("{} begin: {e}", action.label())))?;
             let result: Result<Vec<String>, WenlanError> = async {
+                // The connection was released between chunks, so another
+                // writer may have moved, established, or re-filed rows
+                // since the first selection. Re-run the caller's predicate
+                // against this chunk inside its own transaction so nothing
+                // outside the selection the dry run described is touched.
+                let chunk =
+                    Self::reselect_bulk_chunk(&conn, selection, scope, action, chunk).await?;
                 let mut done = Vec::new();
-                for entity_id in chunk {
+                for entity_id in &chunk {
                     let changed = match action {
                         EntityBulkAction::Archive => {
                             self.archive_entity_in_transaction(&conn, entity_id, &now)
@@ -37725,6 +37771,45 @@ impl MemoryDB {
         scope: &ReadScope,
         action: EntityBulkAction,
     ) -> Result<Vec<String>, WenlanError> {
+        Self::select_bulk_entity_ids_within(conn, selection, scope, action, None).await
+    }
+
+    /// [`Self::select_bulk_entity_ids`] narrowed to `chunk`: the same
+    /// predicate (ids or filter, scope, eligibility) intersected with the ids
+    /// a chunk transaction is about to apply.
+    async fn reselect_bulk_chunk(
+        conn: &libsql::Connection,
+        selection: &wenlan_types::requests::EntitySelection,
+        scope: &ReadScope,
+        action: EntityBulkAction,
+        chunk: &[String],
+    ) -> Result<Vec<String>, WenlanError> {
+        let mut out = Vec::new();
+        for slice in chunk.chunks(ENTITY_ID_LOOKUP_CHUNK) {
+            out.extend(
+                Self::select_bulk_entity_ids_within(conn, selection, scope, action, Some(slice))
+                    .await?,
+            );
+        }
+        Ok(out)
+    }
+
+    async fn select_bulk_entity_ids_within(
+        conn: &libsql::Connection,
+        selection: &wenlan_types::requests::EntitySelection,
+        scope: &ReadScope,
+        action: EntityBulkAction,
+        within: Option<&[String]>,
+    ) -> Result<Vec<String>, WenlanError> {
+        fn within_ids(
+            ids: &[String],
+            conditions: &mut Vec<String>,
+            values: &mut Vec<libsql::Value>,
+        ) {
+            let placeholders = vec!["?"; ids.len()].join(", ");
+            conditions.push(format!("epm.entity_id IN ({placeholders})"));
+            values.extend(ids.iter().map(|id| libsql::Value::Text(id.clone())));
+        }
         match (&selection.ids, &selection.filter) {
             (Some(_), Some(_)) => Err(WenlanError::Validation(
                 "entity selection: pass either `ids` or `filter`, not both".into(),
@@ -37735,15 +37820,21 @@ impl MemoryDB {
             (Some(ids), None) => {
                 let mut out = Vec::new();
                 // SQLite caps bound parameters per statement, so a selection
-                // of thousands of ids is resolved in slices.
-                for slice in ids.chunks(ENTITY_ID_LOOKUP_CHUNK) {
-                    let mut conditions = vec!["p.kind = 'entity'".to_string()];
-                    let placeholders = vec!["?"; slice.len()].join(", ");
-                    conditions.push(format!("epm.entity_id IN ({placeholders})"));
-                    let mut values: Vec<libsql::Value> = slice
+                // of thousands of ids is resolved in slices. A `within` chunk
+                // is itself at most one slice, so the intersection stays
+                // under the cap too.
+                let requested: Vec<String> = match within {
+                    Some(within) => ids
                         .iter()
-                        .map(|id| libsql::Value::Text(id.clone()))
-                        .collect();
+                        .filter(|id| within.contains(id))
+                        .cloned()
+                        .collect(),
+                    None => ids.clone(),
+                };
+                for slice in requested.chunks(ENTITY_ID_LOOKUP_CHUNK) {
+                    let mut conditions = vec!["p.kind = 'entity'".to_string()];
+                    let mut values: Vec<libsql::Value> = Vec::new();
+                    within_ids(slice, &mut conditions, &mut values);
                     push_read_scope_filter_folded(scope, "p.space", &mut conditions, &mut values);
                     out.extend(
                         Self::run_bulk_entity_selection(conn, conditions, values, action).await?,
@@ -37754,7 +37845,10 @@ impl MemoryDB {
                 Ok(out)
             }
             (None, Some(filter)) => {
-                let (conditions, values) = entity_filter_conditions(filter, scope);
+                let (mut conditions, mut values) = entity_filter_conditions(filter, scope);
+                if let Some(within) = within {
+                    within_ids(within, &mut conditions, &mut values);
+                }
                 Self::run_bulk_entity_selection(conn, conditions, values, action).await
             }
         }
@@ -37867,7 +37961,11 @@ impl MemoryDB {
             .await
             .map_err(|e| WenlanError::VectorDb(format!("delete_entity begin: {e}")))?;
         let result: Result<(), WenlanError> = async {
-            if !Self::entity_in_scope(&conn, entity_id, scope).await? {
+            // #708: judged by Space alone, not by lifecycle state. The
+            // Archived tab's "Delete permanently" is the main caller, and
+            // `entity_in_scope` only sees ACTIVE pages, so gating on it
+            // answered 404 for exactly the rows the user meant to delete.
+            if !Self::entity_in_scope_any_status(&conn, entity_id, scope).await? {
                 return Err(WenlanError::NotFound("entity not found".to_string()));
             }
             self.delete_entity_body(&conn, entity_id).await

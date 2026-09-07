@@ -270,6 +270,15 @@ fn validate_entity_selection(selection: &EntitySelection) -> Result<(), ServerEr
     }
 }
 
+/// The Space a bulk selection names in its `filter`, if any. Id selections
+/// carry no Space of their own; the header (or the global default) scopes them.
+fn selection_space(selection: &EntitySelection) -> Option<&str> {
+    selection
+        .filter
+        .as_ref()
+        .and_then(|filter| filter.space.as_deref())
+}
+
 /// POST /api/memory/entities/archive -- bulk archive (#708). Space-scoped the
 /// same way `handle_delete_entity` is; `dry_run` previews without mutating.
 pub async fn handle_archive_entities(
@@ -282,7 +291,16 @@ pub async fn handle_archive_entities(
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
+    // A `filter.space` in the body narrows the scope exactly as it does on
+    // `/query`, so the dry run a user read back and the apply that follows
+    // resolve the same rows. Passing `None` here let `{filter:{space:"work"}}`
+    // without a header act on every Space.
+    let scope = crate::read_scope::effective_read_scope(
+        &db,
+        selection_space(&req.selection),
+        header_space.as_deref(),
+    )
+    .await?;
     let response = db
         .archive_entities(&req.selection, &scope, req.dry_run)
         .await?;
@@ -300,7 +318,12 @@ pub async fn handle_restore_entities(
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
-    let scope = crate::read_scope::effective_read_scope(&db, None, header_space.as_deref()).await?;
+    let scope = crate::read_scope::effective_read_scope(
+        &db,
+        selection_space(&req.selection),
+        header_space.as_deref(),
+    )
+    .await?;
     let response = db
         .restore_entities(&req.selection, &scope, req.dry_run)
         .await?;

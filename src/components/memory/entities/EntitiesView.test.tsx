@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { Entity, ListEntitiesRequest } from "../../../lib/tauri";
 import { EntitiesView } from "./EntitiesView";
@@ -271,23 +271,132 @@ describe("EntitiesView", () => {
     ).toBeInTheDocument();
   });
 
-  it("deletes selected archived entities permanently, with an irreversible confirm", async () => {
+  it("deletes one archived entity permanently from its row, with an irreversible confirm", async () => {
     const { user } = renderView();
     await screen.findByText("Ada Lovelace");
     await openTab(user, /Archived/);
     await screen.findByText("Countess of Lovelace");
 
+    // Permanent delete is per row (spec): the selection bar only restores.
     await user.click(screen.getByRole("checkbox", { name: "Select Countess of Lovelace" }));
-    await user.click(screen.getByRole("button", { name: "Delete permanently" }));
+    expect(screen.getByRole("button", { name: "Restore selected" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete permanently" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Delete Countess of Lovelace permanently" }));
 
     const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByText("Delete 1 entity permanently?")).toBeInTheDocument();
+    expect(within(dialog).getByText("Delete Countess of Lovelace permanently?")).toBeInTheDocument();
     expect(within(dialog).getByText("This cannot be undone.")).toBeInTheDocument();
+    // The safe action takes focus, not the destructive one.
+    expect(within(dialog).getByRole("button", { name: "Cancel" })).toHaveFocus();
 
     await user.click(within(dialog).getByRole("button", { name: "Delete permanently" }));
 
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(await screen.findByText("No archived entities")).toBeInTheDocument();
+    const tauri = await import("../../../lib/tauri");
+    expect(tauri.deleteEntity).toHaveBeenCalledTimes(1);
+    expect(tauri.deleteEntity).toHaveBeenCalledWith("countess");
+  });
+
+  it("keeps the confirm open on Escape while the delete is in flight", async () => {
+    const tauri = await import("../../../lib/tauri");
+    let release: () => void = () => {};
+    vi.mocked(tauri.deleteEntity).mockImplementation(
+      (id) =>
+        new Promise<void>((resolve) => {
+          release = () => {
+            fixture = fixture.filter((candidate) => candidate.id !== id);
+            resolve();
+          };
+        }),
+    );
+    const { user } = renderView();
+    await screen.findByText("Ada Lovelace");
+    await openTab(user, /Archived/);
+    await screen.findByText("Countess of Lovelace");
+    await user.click(screen.getByRole("button", { name: "Delete Countess of Lovelace permanently" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Delete permanently" }));
+
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    release();
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(await screen.findByText("No archived entities")).toBeInTheDocument();
+  });
+
+  it("drops a list response that arrives after the tab changed", async () => {
+    const tauri = await import("../../../lib/tauri");
+    let releaseDetected: () => void = () => {};
+    vi.mocked(tauri.queryEntities).mockImplementation(async (filter) => {
+      const all = fixture.filter((candidate) => matchesFilter(candidate, filter));
+      const offset = filter.offset ?? 0;
+      const limit = filter.limit ?? 100;
+      const page = { entities: all.slice(offset, offset + limit), total: all.length };
+      // The Detected LIST (not the limit-1 count probe) hangs until released.
+      if (filter.status === "detected" && limit !== 1) {
+        await new Promise<void>((resolve) => {
+          releaseDetected = resolve;
+        });
+      }
+      return page;
+    });
+
+    const { user } = renderView();
+    await screen.findByRole("tab", { name: /Archived/ });
+    await openTab(user, /Archived/);
+    await screen.findByText("Countess of Lovelace");
+
+    releaseDetected();
+    // Give the stale promise every chance to land, then assert it did not.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(screen.getByText("Countess of Lovelace")).toBeInTheDocument();
+    expect(screen.queryByText("Ada Lovelace")).not.toBeInTheDocument();
+    expect(screen.queryByText("Charles Babbage")).not.toBeInTheDocument();
+  });
+
+  it("reads back and applies the search term as typed, even before the debounce lands", async () => {
+    const tauri = await import("../../../lib/tauri");
+    const { user } = renderView();
+    await screen.findByText("Ada Lovelace");
+
+    await user.type(screen.getByRole("searchbox", { name: "Find a name" }), "Ada");
+    await user.click(screen.getByRole("button", { name: "Archive all matching" }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/"Ada"/)).toBeInTheDocument();
+    expect(within(dialog).getByText("Archive 1 detected entity?")).toBeInTheDocument();
+    const dryRuns = vi.mocked(tauri.archiveEntities).mock.calls.filter(([req]) => req.dry_run);
+    expect(dryRuns.length).toBeGreaterThan(0);
+    for (const [req] of dryRuns) expect(req.filter?.query).toBe("Ada");
+
+    await user.click(within(dialog).getByRole("button", { name: "Archive" }));
+    const applied = vi.mocked(tauri.archiveEntities).mock.calls.find(([req]) => !req.dry_run);
+    expect(applied?.[0].filter?.query).toBe("Ada");
+    await openTab(user, /Archived/);
+    await screen.findByText("Ada Lovelace");
+    // Only the "Ada" match went; Babbage is still detected (the search box
+    // still says "Ada", so he is filtered out of the list, not archived).
+    expect(fixture.find((candidate) => candidate.id === "babbage")?.status).toBe("detected");
+  });
+
+  it("moves between tabs with the arrow keys", async () => {
+    const { user } = renderView();
+    await screen.findByText("Ada Lovelace");
+
+    screen.getByRole("tab", { name: /Detected/ }).focus();
+    await user.keyboard("{ArrowRight}");
+    expect(screen.getByRole("tab", { name: /Archived/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: /Archived/ })).toHaveFocus();
+    expect(await screen.findByText("Countess of Lovelace")).toBeInTheDocument();
+
+    await user.keyboard("{ArrowRight}");
+    expect(screen.getByRole("tab", { name: /Established/ })).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{End}");
+    expect(screen.getByRole("tab", { name: /Archived/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tabpanel", { name: /Archived/ })).toBeInTheDocument();
   });
 
   it("paginates the Detected tab 100 rows at a time with Load more", async () => {

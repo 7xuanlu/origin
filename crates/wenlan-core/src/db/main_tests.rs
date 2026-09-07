@@ -48982,19 +48982,16 @@ async fn archive_entity_retracts_its_edges_so_rename_and_rebind_succeed_and_rest
     );
 }
 
-/// Restore is order-independent when both endpoints were archived. The stamp
+/// Restore only re-activates the edges its OWN archive retired. The stamp
 /// names the entity whose archive retired the edge (A); B's archive finds the
 /// edge already retired and stamps nothing.
 ///
-/// #708 (migration 130) changed WHEN the edge comes back. The space fence used
-/// to resolve an archived endpoint's space to NULL and abort, so the first
-/// restore was refused and only the second brought the edge back. The fence
-/// now judges an endpoint by its space alone -- archived entities have to be
-/// able to take edges, or one could not absorb a recurring mention -- so the
-/// FIRST restore re-activates the shared edge and clears the stamp, and the
-/// second finds nothing left to do. Order-independent either way.
+/// Sol review of #711: before this, restoring B un-retired A's edge while A
+/// was still archived, quietly undoing A's archive and re-activating an edge
+/// into an archived entity. Now B's restore leaves A's stamp alone, and A's
+/// restore is what brings the edge back -- whichever order the two land in.
 #[tokio::test]
-async fn restore_entity_reactivates_shared_edge_regardless_of_restore_order() {
+async fn restore_entity_reactivates_only_the_edges_its_own_archive_retired() {
     let (db, _dir) = test_db().await;
     let edge_id = seed_linked_entity_pair(&db, "ord", "work").await;
 
@@ -49008,22 +49005,28 @@ async fn restore_entity_reactivates_shared_edge_regardless_of_restore_order() {
         "first archive stamps the edge"
     );
 
-    // A first. B is still archived, and that is no longer a reason to refuse.
-    assert!(db.restore_entity("ord-a").await.unwrap());
-    let (valid_until, _, tag, _) = relates_edge_state(&db, &edge_id).await;
-    assert!(
-        valid_until.is_none(),
-        "the first restore re-activates the shared edge: the fence judges \
-         space, not whether the other endpoint is archived"
-    );
-    assert!(tag.is_none(), "re-activation clears the archive stamp");
-
-    // B second: nothing left to re-activate, and the restore still reports
-    // that it moved the page from archived to active.
+    // B first: the stamp is A's, so B's restore must not touch the edge.
     assert!(db.restore_entity("ord-b").await.unwrap());
     let (valid_until, _, tag, _) = relates_edge_state(&db, &edge_id).await;
-    assert!(valid_until.is_none());
-    assert!(tag.is_none());
+    assert!(
+        valid_until.is_some(),
+        "restoring B must not un-retire an edge A's archive retired"
+    );
+    assert_eq!(
+        tag.as_deref(),
+        Some("ord-a"),
+        "A's stamp survives B's restore"
+    );
+    assert_eq!(
+        db.entity_link_summary("ord-b").await.unwrap().active_edges,
+        0
+    );
+
+    // A second: its own stamp, so the edge comes back and the stamp clears.
+    assert!(db.restore_entity("ord-a").await.unwrap());
+    let (valid_until, _, tag, _) = relates_edge_state(&db, &edge_id).await;
+    assert!(valid_until.is_none(), "A's restore re-activates A's edge");
+    assert!(tag.is_none(), "re-activation clears the archive stamp");
     assert_eq!(
         db.entity_link_summary("ord-a").await.unwrap().active_edges,
         1
