@@ -654,6 +654,9 @@ export const REVIEW_ENTITIES: Record<string, EntityDetail> = {
       confirmed: true,
       created_at: 1_749_000_000,
       updated_at: 1_751_500_000,
+      memory_count: 4,
+      status: "established",
+      established_by: "manual",
     },
     observations: [
       {
@@ -679,6 +682,10 @@ export const REVIEW_ENTITIES: Record<string, EntityDetail> = {
       confirmed: false,
       created_at: 1_751_900_000,
       updated_at: 1_751_900_000,
+
+      memory_count: 1,
+      status: "detected",
+      established_by: null,
     },
     observations: [
       {
@@ -763,6 +770,9 @@ export const GRAPH_ENTITIES: Entity[] = GRAPH_ENTITY_SEED.map((seed, i) => ({
   confirmed: true,
   created_at: 1_752_000_000 + i * 1000,
   updated_at: 1_752_000_000 + i * 1000,
+  memory_count: 3,
+  status: "established",
+  established_by: "auto:memories",
 }));
 
 const graphEntityById = new Map(GRAPH_ENTITIES.map((e) => [e.id, e]));
