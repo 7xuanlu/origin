@@ -187,6 +187,34 @@ pub async fn handle_get_page_sources(
     Ok(Json(result))
 }
 
+/// Refuse a page mutation that targets an entity's page, naming the entity and
+/// carrying its id as a field (#708).
+///
+/// The core guard produces the same sentence, but its only channel is an error
+/// string; the desktop app needs the id to offer "open in Entities", so the
+/// HTTP surface sends it separately. Returns `Ok(())` for every page that is
+/// not an entity's, including ids that do not exist -- archive and delete keep
+/// their no-op-on-missing behavior.
+async fn reject_entity_page_mutation(
+    db: &std::sync::Arc<wenlan_core::db::MemoryDB>,
+    page_id: &str,
+) -> Result<(), ServerError> {
+    let Some(owner) = db.entity_shadow_page_owner(page_id).await? else {
+        return Ok(());
+    };
+    let mut body = serde_json::json!({
+        "error": wenlan_core::db::entity_shadow_page_guard_message(&owner.entity_name),
+        "entity_name": owner.entity_name,
+    });
+    if let Some(entity_id) = owner.entity_id {
+        body["entity_id"] = serde_json::Value::String(entity_id);
+    }
+    Err(ServerError::Structured {
+        status: axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        body,
+    })
+}
+
 /// POST /api/pages/{id}/archive
 pub async fn handle_archive_page(
     State(state): State<Arc<RwLock<ServerState>>>,
@@ -196,8 +224,10 @@ pub async fn handle_archive_page(
         let s = state.read().await;
         s.db.clone().ok_or(ServerError::DbNotInitialized)?
     };
-    // `ServerError::from` maps the entity-shadow fence's WenlanError::Validation
-    // to a 4xx (ValidationError), matching the neighboring page-write handlers.
+    // Checked here, not left to the core fence, so the refusal can carry the
+    // entity id as a field. The core fence still stands behind it for every
+    // caller that does not come through this route.
+    reject_entity_page_mutation(&db, &id).await?;
     db.archive_page(&id).await.map_err(ServerError::from)?;
     Ok(Json(serde_json::json!({"status": "archived"})))
 }
@@ -224,8 +254,9 @@ pub async fn handle_delete_page(
     let knowledge_path = wenlan_core::config::load_config().knowledge_path_or_default();
     let projection =
         wenlan_core::export::knowledge::KnowledgeProjectionWrite::new(knowledge_path, &db);
-    // `ServerError::from` maps the entity-shadow fence's WenlanError::Validation
-    // to a 4xx (ValidationError), matching the neighboring page-write handlers.
+    // Same as archive: refuse an entity's page here so the response can name
+    // the entity and carry its id.
+    reject_entity_page_mutation(&db, &id).await?;
     db.delete_page(&id).await.map_err(ServerError::from)?;
 
     if let Err(e) = projection.remove_page(&id) {
@@ -1832,3 +1863,7 @@ mod conflict_identity_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "page_routes/entity_page_guard_tests.rs"]
+mod entity_page_guard_tests;

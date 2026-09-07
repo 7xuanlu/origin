@@ -39,9 +39,9 @@ pub use communities::{
     PageCommunityAssignmentState,
 };
 pub use entities::{
-    Entity, EntityDetail, EntitySearchResult, GraphMemoryLink, GraphMemoryNode, GraphPageLink,
-    GraphPageNode, GraphRef, GraphRelation, KnowledgeGraphResponse, Observation, Relation,
-    RelationWithEntity,
+    Entity, EntityDetail, EntitySearchResult, EntityStatus, GraphMemoryLink, GraphMemoryNode,
+    GraphPageLink, GraphPageNode, GraphRef, GraphRelation, KnowledgeGraphResponse, Observation,
+    Relation, RelationWithEntity,
 };
 pub use lint::{LintCheckResult, LintQuery, LintReport};
 pub use memory::{
@@ -60,16 +60,17 @@ pub use pages::{Page, PageEvidence};
 pub use repair::*;
 pub use repair_plan::*;
 pub use requests::{
-    AcceptRefinementRequest, CreatePageDraftRequest, PageDraftVersionRequest,
-    UpdatePageDraftRequest,
+    AcceptRefinementRequest, ArchiveEntitiesRequest, CreatePageDraftRequest, EntitySelection,
+    ListEntitiesRequest, PageDraftVersionRequest, RestoreEntitiesRequest, UpdatePageDraftRequest,
 };
 pub use responses::{
-    ContradictionDismissResponse, ExportStats, ListMemoryRevisionsResponse,
-    ListPageRevisionsResponse, ListRefinementsResponse, MemoryDetail, MemoryRevisionEntry,
-    OnDeviceModelEntry, OnDeviceModelResponse, OrphanLink, OrphanLinksResponse, PageChangelogEntry,
-    PageDraftResponse, PageWriteResponse, PendingRevision, PendingRevisionItem, ProposalAction,
-    RefinementCardAction, RefinementPayload, RefinementProposalSummary, RejectRefinementResponse,
-    RevisionAcceptResponse, RevisionDismissResponse,
+    ContradictionDismissResponse, EntityBulkResponse, ExportStats, ListEntitiesResponse,
+    ListMemoryRevisionsResponse, ListPageRevisionsResponse, ListRefinementsResponse, MemoryDetail,
+    MemoryRevisionEntry, OnDeviceModelEntry, OnDeviceModelResponse, OrphanLink,
+    OrphanLinksResponse, PageChangelogEntry, PageDraftResponse, PageWriteResponse, PendingRevision,
+    PendingRevisionItem, ProposalAction, RefinementCardAction, RefinementPayload,
+    RefinementProposalSummary, RejectRefinementResponse, RevisionAcceptResponse,
+    RevisionDismissResponse,
 };
 pub use sources::{MemoryType, RawDocument, SourceType, StabilityTier, SyncStatus};
 pub use space_context::{WriteOutcome, WriteSpaceSource, WriteSpaceTarget};

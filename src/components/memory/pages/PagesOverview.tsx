@@ -25,6 +25,9 @@ import "./pageActions.css";
 interface PagesOverviewProps {
   readonly onCreatePage: (space: string | null) => void;
   readonly onSelectDraft: (draftId: string, space: string | null) => void;
+  /** Established entity rows are their entity's dossier, not a Page; routes
+   * there by `entity_id` instead of `onSelectPage`. */
+  readonly onSelectEntity: (entityId: string) => void;
   readonly onSelectPage: (pageId: string) => void;
   readonly onSelectSpace: (spaceName: string) => void;
 }
@@ -32,6 +35,15 @@ interface PagesOverviewProps {
 type PageSort = "recent" | "title";
 type TypeFilter = "all" | PagePresentationType;
 type StatusFilter = "all" | "unconfirmed";
+
+// The review badge belongs to distilled prose awaiting a human look. An
+// entity row only reaches the Wiki once it is established (#708), so its
+// shadow page's `review_status` says nothing the reader should see.
+function isUnconfirmedPage(page: Page): boolean {
+  return page.status !== "draft"
+    && page.review_status === "unconfirmed"
+    && classifyPage(page) !== "entity";
+}
 
 const PAGE_SIZE = 7;
 
@@ -122,6 +134,7 @@ function SpaceChip({
 export function PagesOverview({
   onCreatePage,
   onSelectDraft,
+  onSelectEntity,
   onSelectPage,
   onSelectSpace,
 }: PagesOverviewProps) {
@@ -187,8 +200,7 @@ export function PagesOverview({
   const filteredPages = useMemo(
     () => pages
       .filter((page) => typeFilter === "all" || classifyPage(page) === typeFilter)
-      .filter((page) => statusFilter === "all"
-        || (page.status !== "draft" && page.review_status === "unconfirmed"))
+      .filter((page) => statusFilter === "all" || isUnconfirmedPage(page))
       .filter((page) => spaceFilter === "all" || pageSpaceContext(page) === spaceFilter)
       .sort((left, right) => comparePages(left, right, sort)),
     [pages, sort, spaceFilter, statusFilter, typeFilter],
@@ -353,7 +365,7 @@ export function PagesOverview({
                 const spaceDestination = assignedSpace
                   ? t("pages.overview.openSpace", { space: assignedSpace })
                   : "";
-                const isUnconfirmed = !isDraft && page.review_status === "unconfirmed";
+                const isUnconfirmed = isUnconfirmedPage(page);
                 const hasCleanupSuggestion = !isDraft && cleanupSuggestionIds.has(page.id);
                 const stateLabels = [
                   isDraft ? t("pages.overview.draft") : null,
@@ -366,6 +378,7 @@ export function PagesOverview({
                 ].join(" · ");
                 const openPage = () => {
                   if (isDraft) onSelectDraft(page.id, assignedSpace ?? null);
+                  else if (type === "entity" && page.entity_id) onSelectEntity(page.entity_id);
                   else onSelectPage(page.id);
                 };
                 return (

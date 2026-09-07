@@ -43,6 +43,7 @@ function page(overrides: Partial<Page>): Page {
 function renderOverview({
   onCreatePage = vi.fn(),
   onSelectDraft = vi.fn(),
+  onSelectEntity = vi.fn(),
   onSelectPage = vi.fn(),
   onSelectSpace = vi.fn(),
   queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
@@ -51,6 +52,7 @@ function renderOverview({
     queryClient,
     onCreatePage,
     onSelectDraft,
+    onSelectEntity,
     onSelectPage,
     onSelectSpace,
     ...render(
@@ -58,6 +60,7 @@ function renderOverview({
         <PagesOverview
           onCreatePage={onCreatePage}
           onSelectDraft={onSelectDraft}
+          onSelectEntity={onSelectEntity}
           onSelectPage={onSelectPage}
           onSelectSpace={onSelectSpace}
         />
@@ -147,7 +150,7 @@ describe("PagesOverview", () => {
       page({ id: "recap", title: "July research recap", space: "Research" }),
     ]);
     const user = userEvent.setup();
-    const { onSelectPage } = renderOverview();
+    const { onSelectEntity, onSelectPage } = renderOverview();
 
     expect(await screen.findByRole("heading", { name: "Wiki" })).toBeInTheDocument();
     expect(screen.getByText("A living ledger of ideas, people, decisions, and recaps.")).toBeInTheDocument();
@@ -167,6 +170,27 @@ describe("PagesOverview", () => {
 
     await user.click(screen.getByRole("button", { name: "Open Independent research note" }));
     expect(onSelectPage).toHaveBeenCalledWith("independent");
+
+    await user.click(screen.getByRole("button", { name: "Open Nash Su" }));
+    expect(onSelectEntity).toHaveBeenCalledWith("entity-1");
+    expect(onSelectPage).not.toHaveBeenCalledWith("entity");
+  });
+
+  it("never badges an established entity row as unconfirmed (#708)", async () => {
+    vi.mocked(listPagesExplicitBrowse).mockResolvedValue([
+      page({ id: "entity", title: "Nash Su", entity_id: "entity-1", review_status: "unconfirmed" }),
+      page({ id: "prose", title: "Needs verification", review_status: "unconfirmed" }),
+    ]);
+    const user = userEvent.setup();
+    renderOverview();
+
+    expect(await screen.findByRole("button", { name: "Open Nash Su" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open Needs verification · Unconfirmed" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open Nash Su · Unconfirmed" })).not.toBeInTheDocument();
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "Review" }), "unconfirmed");
+    expect(await screen.findByRole("button", { name: "Open Needs verification · Unconfirmed" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open Nash Su" })).not.toBeInTheDocument();
   });
 
   it("treats persisted unconfirmed Pages as an inventory status, not a new-page candidate", async () => {
@@ -380,14 +404,15 @@ describe("PagesOverview", () => {
     expect(distillReview).not.toHaveBeenCalled();
   });
 
-  it("opens the Page from any non-Space cell while keeping Space as its own destination", async () => {
+  it("opens the entity dossier from any non-Space cell while keeping Space as its own destination", async () => {
     vi.mocked(listPagesExplicitBrowse).mockResolvedValue([
       page({ id: "entity", title: "Nash Su", entity_id: "entity-1", space: "Research" }),
     ]);
     const user = userEvent.setup();
+    const onSelectEntity = vi.fn();
     const onSelectPage = vi.fn();
     const onSelectSpace = vi.fn();
-    renderOverview({ onSelectPage, onSelectSpace });
+    renderOverview({ onSelectEntity, onSelectPage, onSelectSpace });
 
     const pageLink = await screen.findByRole("button", { name: "Open Nash Su" });
     const row = pageLink.closest("tr");
@@ -396,13 +421,14 @@ describe("PagesOverview", () => {
 
     fireEvent.click(within(row!).getAllByText("Entity")[0]!);
     fireEvent.click(row!.querySelector("td:last-child")!);
-    expect(onSelectPage).toHaveBeenNthCalledWith(1, "entity");
-    expect(onSelectPage).toHaveBeenNthCalledWith(2, "entity");
+    expect(onSelectEntity).toHaveBeenNthCalledWith(1, "entity-1");
+    expect(onSelectEntity).toHaveBeenNthCalledWith(2, "entity-1");
+    expect(onSelectPage).not.toHaveBeenCalled();
     const spaceLinks = within(row!).getAllByRole("button", { name: "Open Space: Research" });
     expect(spaceLinks).toHaveLength(2);
     await user.click(spaceLinks[0]!);
     expect(onSelectSpace).toHaveBeenCalledWith("Research");
-    expect(onSelectPage).toHaveBeenCalledTimes(2);
+    expect(onSelectEntity).toHaveBeenCalledTimes(2);
   });
 
   it("renders Page and Entity kinds with one restrained 16px glyph system", async () => {

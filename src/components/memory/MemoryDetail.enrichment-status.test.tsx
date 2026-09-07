@@ -150,6 +150,9 @@ describe("MemoryDetail enrichment status", () => {
         confirmed: true,
         created_at: 1,
         updated_at: 1,
+        memory_count: 1,
+        status: "established",
+        established_by: "manual",
       },
     ]);
     vi.mocked(tauri.search).mockResolvedValue([
@@ -253,6 +256,9 @@ describe("MemoryDetail enrichment status", () => {
         confirmed: true,
         created_at: 1,
         updated_at: 1,
+        memory_count: 1,
+        status: "established",
+        established_by: "manual",
       })),
     );
     vi.mocked(tauri.search).mockResolvedValue(

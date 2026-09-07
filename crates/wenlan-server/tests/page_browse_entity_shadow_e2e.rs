@@ -5,6 +5,13 @@
 //! Mirrors the core-level fence-lift tests in `wenlan-core/src/db.rs` at the
 //! HTTP layer, so a regression that only breaks the handler wiring (not the
 //! underlying DB fn) is still caught.
+//!
+//! #708 narrowed WHICH shadow pages the browse surfaces show: an ESTABLISHED
+//! entity appears, a detected or archived one does not, because the detected
+//! set is an index the system grows on its own and listing it buries every
+//! real page. Every fixture here therefore establishes its entity; that a
+//! DETECTED one stays hidden is pinned in
+//! `wenlan-core/src/db/entity_lifecycle_test.rs`.
 mod common;
 
 use axum::body::Body;
@@ -118,9 +125,11 @@ async fn find_page_id_by_title(router: &common::AppRouter, title: &str) -> Strin
 #[tokio::test]
 async fn list_pages_includes_entity_kind_shadow() {
     let (router, _tmp, db) = common::test_app().await;
-    db.store_entity("HTTP List Shadow Marker", "person", None, None, None)
+    let entity_id = db
+        .store_entity("HTTP List Shadow Marker", "person", None, None, None)
         .await
         .unwrap();
+    db.confirm_entity(&entity_id, true).await.unwrap();
 
     let resp = get(&router, "/api/pages").await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -137,9 +146,11 @@ async fn list_pages_includes_entity_kind_shadow() {
 #[tokio::test]
 async fn search_pages_includes_entity_kind_shadow() {
     let (router, _tmp, db) = common::test_app().await;
-    db.store_entity("HTTP Search Shadow Marker", "person", None, None, None)
+    let entity_id = db
+        .store_entity("HTTP Search Shadow Marker", "person", None, None, None)
         .await
         .unwrap();
+    db.confirm_entity(&entity_id, true).await.unwrap();
 
     let resp = post_json(
         &router,
@@ -161,9 +172,11 @@ async fn search_pages_includes_entity_kind_shadow() {
 #[tokio::test]
 async fn recent_pages_includes_entity_kind_shadow() {
     let (router, _tmp, db) = common::test_app().await;
-    db.store_entity("HTTP Recent Shadow Marker", "person", None, None, None)
+    let entity_id = db
+        .store_entity("HTTP Recent Shadow Marker", "person", None, None, None)
         .await
         .unwrap();
+    db.confirm_entity(&entity_id, true).await.unwrap();
 
     let resp = get(&router, "/api/pages/recent").await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -177,15 +190,17 @@ async fn recent_pages_includes_entity_kind_shadow() {
 #[tokio::test]
 async fn recent_page_changes_includes_entity_kind_shadow() {
     let (router, _tmp, db) = common::test_app().await;
-    db.store_entity(
-        "HTTP Recent Changes Shadow Marker",
-        "person",
-        None,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let entity_id = db
+        .store_entity(
+            "HTTP Recent Changes Shadow Marker",
+            "person",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.confirm_entity(&entity_id, true).await.unwrap();
 
     let resp = get(&router, "/api/pages/recent-changes").await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -201,9 +216,11 @@ async fn recent_page_changes_includes_entity_kind_shadow() {
 #[tokio::test]
 async fn get_page_by_id_returns_entity_kind_shadow() {
     let (router, _tmp, db) = common::test_app().await;
-    db.store_entity("HTTP Get By Id Shadow Marker", "person", None, None, None)
+    let entity_id = db
+        .store_entity("HTTP Get By Id Shadow Marker", "person", None, None, None)
         .await
         .unwrap();
+    db.confirm_entity(&entity_id, true).await.unwrap();
     let id = find_page_id_by_title(&router, "HTTP Get By Id Shadow Marker").await;
 
     let resp = get(&router, &format!("/api/pages/{id}")).await;
@@ -219,15 +236,17 @@ async fn get_page_by_id_returns_entity_kind_shadow() {
 #[tokio::test]
 async fn shadow_sub_resources_return_empty_not_404() {
     let (router, _tmp, db) = common::test_app().await;
-    db.store_entity(
-        "HTTP Sub Resource Shadow Marker",
-        "person",
-        None,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let entity_id = db
+        .store_entity(
+            "HTTP Sub Resource Shadow Marker",
+            "person",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.confirm_entity(&entity_id, true).await.unwrap();
     let id = find_page_id_by_title(&router, "HTTP Sub Resource Shadow Marker").await;
 
     let sources_resp = get(&router, &format!("/api/pages/{id}/sources")).await;
@@ -264,9 +283,11 @@ async fn export_stays_stub_free() {
         "authored",
     )
     .await;
-    db.store_entity("HTTP Export Shadow Marker", "person", None, None, None)
+    let entity_id = db
+        .store_entity("HTTP Export Shadow Marker", "person", None, None, None)
         .await
         .unwrap();
+    db.confirm_entity(&entity_id, true).await.unwrap();
     let stub_id = find_page_id_by_title(&router, "HTTP Export Shadow Marker").await;
 
     let vault_path = tmp.path().join("vault");
@@ -319,9 +340,11 @@ async fn export_stays_stub_free() {
 #[tokio::test]
 async fn archive_of_shadow_id_is_rejected() {
     let (router, _tmp, db) = common::test_app().await;
-    db.store_entity("HTTP Archive Fence Marker", "person", None, None, None)
+    let entity_id = db
+        .store_entity("HTTP Archive Fence Marker", "person", None, None, None)
         .await
         .unwrap();
+    db.confirm_entity(&entity_id, true).await.unwrap();
     let id = find_page_id_by_title(&router, "HTTP Archive Fence Marker").await;
 
     let resp = post_json(
@@ -348,9 +371,11 @@ async fn archive_of_shadow_id_is_rejected() {
 #[tokio::test]
 async fn delete_of_shadow_id_is_rejected() {
     let (router, _tmp, db) = common::test_app().await;
-    db.store_entity("HTTP Delete Fence Marker", "person", None, None, None)
+    let entity_id = db
+        .store_entity("HTTP Delete Fence Marker", "person", None, None, None)
         .await
         .unwrap();
+    db.confirm_entity(&entity_id, true).await.unwrap();
     let id = find_page_id_by_title(&router, "HTTP Delete Fence Marker").await;
 
     let resp = delete(&router, &format!("/api/pages/{id}")).await;
@@ -371,9 +396,11 @@ async fn delete_of_shadow_id_is_rejected() {
 #[tokio::test]
 async fn write_and_page_map_surfaces_reject_shadow_while_get_stays_200() {
     let (router, _tmp, db) = common::test_app().await;
-    db.store_entity("HTTP Write Fence Marker", "person", None, None, None)
+    let entity_id = db
+        .store_entity("HTTP Write Fence Marker", "person", None, None, None)
         .await
         .unwrap();
+    db.confirm_entity(&entity_id, true).await.unwrap();
     let id = find_page_id_by_title(&router, "HTTP Write Fence Marker").await;
 
     // Manual update (POST /api/memory/{id}/update-page): fenced get_page →

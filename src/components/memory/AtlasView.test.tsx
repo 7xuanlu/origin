@@ -271,6 +271,9 @@ function makeEntity(overrides: Partial<import("../../lib/tauri").Entity> = {}): 
     confirmed: overrides.confirmed ?? false,
     created_at: overrides.created_at ?? Math.floor(Date.now() / 1000),
     updated_at: overrides.updated_at ?? Date.now(),
+    memory_count: overrides.memory_count ?? 0,
+    status: overrides.status ?? "detected",
+    established_by: overrides.established_by ?? null,
   };
 }
 

@@ -108,6 +108,11 @@ export const REVIEW_COMMAND_CAPABILITIES = {
     "confirm_entity_cmd",
     "delete_entity_cmd",
   ],
+  entitiesView: [
+    "query_entities_cmd",
+    "archive_entities_cmd",
+    "restore_entities_cmd",
+  ],
   cartography: [
     "list_communities",
     "list_community_members",

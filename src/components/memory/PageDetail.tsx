@@ -21,6 +21,7 @@ import {
   getPageSources,
   reviewPage,
   pageReviewSupported,
+  parseEntityGuardError,
   type Entity,
   type Page,
   type PageReviewOutcome,
@@ -244,6 +245,13 @@ export default function PageDetail({
     epoch: number;
   } | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  // Set only alongside a delete-blocked-by-entity actionError, so the "Open
+  // the entity" link renders next to that message and nowhere else.
+  const [deleteGuardEntityId, setDeleteGuardEntityId] = useState<string | null>(null);
+  const setActionErrorMessage = (message: string | null, entityId: string | null = null) => {
+    setActionError(message);
+    setDeleteGuardEntityId(entityId);
+  };
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [actionMenuOpen, setActionMenuOpen] = useState(false);
   const [redistillNotice, setRedistillNotice] = useState<{
@@ -415,7 +423,7 @@ export default function PageDetail({
 
   useEffect(() => {
     setRedistillNotice(null);
-    setActionError(null);
+    setActionErrorMessage(null);
     setCopied(false);
     setExported(false);
     setEditing(false);
@@ -562,7 +570,7 @@ export default function PageDetail({
         queryClient.invalidateQueries({ queryKey: ["page-links", input.id] });
         queryClient.invalidateQueries({ queryKey: ["page-revisions", input.id] });
         if (activePageIdRef.current !== input.id) return;
-        setActionError(null);
+        setActionErrorMessage(null);
         setEditing(false);
         setEditGate({ kind: "closed" });
         setEditBaseline(null);
@@ -594,12 +602,14 @@ export default function PageDetail({
       queryClient.invalidateQueries({ queryKey: ["page-revisions", id] });
       queryClient.invalidateQueries({ queryKey: ["page-sources", id] });
       if (activePageIdRef.current !== id) return;
-      setActionError(null);
+      setActionErrorMessage(null);
       onBack();
     },
-    onError: (_error, id) => {
+    onError: (error, id) => {
       if (activePageIdRef.current !== id) return;
-      setActionError(t("pageDetail.deleteError"));
+      const guard = parseEntityGuardError(error);
+      if (guard) setActionErrorMessage(guard.message, guard.entityId);
+      else setActionErrorMessage(t("pageDetail.deleteError"));
     },
   });
 
@@ -691,7 +701,7 @@ export default function PageDetail({
       "",
       page.content,
     ].join("\n");
-    setActionError(null);
+    setActionErrorMessage(null);
     setCopying(true);
     try {
       await clipboardWrite(text);
@@ -700,7 +710,7 @@ export default function PageDetail({
       setTimeout(() => setCopied(false), 2000);
     } catch {
       if (activePageIdRef.current !== originPageId) return;
-      setActionError(t("pageDetail.copyError"));
+      setActionErrorMessage(t("pageDetail.copyError"));
     } finally {
       setCopying(false);
     }
@@ -710,7 +720,7 @@ export default function PageDetail({
     async (vaultPath: string) => {
       const originPageId = pageId;
       setExportMenuOpen(false);
-      setActionError(null);
+      setActionErrorMessage(null);
       setExporting(true);
       try {
         await exportPageToObsidian(originPageId, `${vaultPath}/Wenlan/pages`);
@@ -719,7 +729,7 @@ export default function PageDetail({
         setTimeout(() => setExported(false), 2000);
       } catch {
         if (activePageIdRef.current !== originPageId) return;
-        setActionError(t("pageDetail.exportError"));
+        setActionErrorMessage(t("pageDetail.exportError"));
       } finally {
         setExporting(false);
       }
@@ -811,7 +821,7 @@ export default function PageDetail({
       activePageIdRef.current === originPageId &&
       beginEditAttemptRef.current === beginEditAttempt;
 
-    setActionError(null);
+    setActionErrorMessage(null);
     setEditing(true);
     setActionMenuOpen(false);
     setEditGate({ kind: "checking" });
@@ -1153,7 +1163,7 @@ export default function PageDetail({
     setActionMenuOpen(false);
     if (saveStateRef.current.phase === "pending") return;
     if (confirm(t("pageDetail.deleteConfirm"))) {
-      setActionError(null);
+      setActionErrorMessage(null);
       deleteMutation.mutate(pageId);
     }
   };
@@ -1883,6 +1893,24 @@ export default function PageDetail({
           role="alert"
         >
           {actionError}
+          {deleteGuardEntityId && onEntityClick && (
+            <button
+              onClick={() => onEntityClick(deleteGuardEntityId)}
+              style={{
+                background: "none",
+                border: "none",
+                color: "inherit",
+                cursor: "pointer",
+                font: "inherit",
+                marginLeft: 6,
+                padding: 0,
+                textDecoration: "underline",
+              }}
+              type="button"
+            >
+              {t("pageDetail.entityGuardOpen")}
+            </button>
+          )}
         </div>
       )}
 

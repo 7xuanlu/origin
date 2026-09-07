@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type {
+  ArchiveEntitiesRequest,
   DistillReviewResponse,
+  Entity,
+  EntityBulkResponse,
   EntityDetail,
+  ListEntitiesRequest,
+  ListEntitiesResponse,
   MemoryItem,
   Page as KnowledgePage,
   PageReviewOutcome,
   RefinementProposalSummary,
+  RestoreEntitiesRequest,
   Space,
   UpdatePageInput,
   UpdatePageOutcome,
@@ -223,6 +229,9 @@ export class TauriMockRuntime {
       case "confirm_observation_cmd": return this.confirmObservation(args);
       case "confirm_entity_cmd": return this.confirmEntity(args);
       case "delete_entity_cmd": return this.deleteEntity(args);
+      case "query_entities_cmd": return this.queryEntities(args);
+      case "archive_entities_cmd": return this.archiveEntities(args);
+      case "restore_entities_cmd": return this.restoreEntities(args);
       case "list_memories_cmd": return this.listMemories(args);
       case "get_memory_detail": return this.memories.find((memory) => memory.source_id === requiredString(command, args, "sourceId")) ?? null;
       case "list_memories_by_ids": {
@@ -902,6 +911,85 @@ export class TauriMockRuntime {
     const entityId = requiredString("delete_entity_cmd", args, "entityId");
     this.entityDetails = this.entityDetails.filter((detail) => detail.entity.id !== entityId);
     return null;
+  }
+
+  /** Shared by `query_entities_cmd` and the `filter` half of a bulk selection:
+   * every clause is optional and unset ones pass everything through, matching
+   * `entity_filter_conditions` in wenlan-core/src/db.rs. */
+  private entityMatchesFilter(entity: Entity, filter: ListEntitiesRequest): boolean {
+    if (filter.status && entity.status !== filter.status) return false;
+    if (filter.entity_type && entity.entity_type !== filter.entity_type) return false;
+    if (filter.space && entity.space !== filter.space && entity.domain !== filter.space) return false;
+    if (typeof filter.min_memories === "number" && entity.memory_count < filter.min_memories) return false;
+    if (typeof filter.max_memories === "number" && entity.memory_count > filter.max_memories) return false;
+    const needle = filter.query?.trim().toLowerCase();
+    if (needle && !entity.name.toLowerCase().includes(needle)) return false;
+    return true;
+  }
+
+  /** The Entities view's paged reader (#708): all three lifecycle states,
+   * filtered and paged, unlike the legacy `list_entities_cmd`. */
+  private queryEntities(args: unknown): ListEntitiesResponse {
+    const filter = (optionalValue(args, "filter") as ListEntitiesRequest | undefined) ?? {};
+    const matches = this.entityDetails
+      .map((detail) => detail.entity)
+      .filter((entity) => this.entityMatchesFilter(entity, filter));
+    const offset = filter.offset ?? 0;
+    const limit = filter.limit ?? 100;
+    return { entities: matches.slice(offset, offset + limit), total: matches.length };
+  }
+
+  /** Resolves an `EntitySelection` (`ids` xor `filter`) against entities that
+   * are actually eligible for the bulk action, mirroring the daemon's
+   * skip-don't-fail selection in `select_bulk_entity_ids`. */
+  private selectEligibleEntities(
+    selection: { ids?: string[]; filter?: ListEntitiesRequest },
+    eligible: (entity: Entity) => boolean,
+  ): Entity[] {
+    const pool = this.entityDetails.map((detail) => detail.entity).filter(eligible);
+    if (selection.ids) {
+      const ids = new Set(selection.ids);
+      return pool.filter((entity) => ids.has(entity.id));
+    }
+    if (selection.filter) {
+      const filter = selection.filter;
+      return pool.filter((entity) => this.entityMatchesFilter(entity, filter));
+    }
+    return [];
+  }
+
+  /** Archives every eligible (non-archived) selected entity (#708);
+   * `confirmed`/`established_by` are untouched, exactly as `archive_entity_in_transaction`
+   * only flips the page's `status` column. `dry_run` previews without mutating. */
+  private archiveEntities(args: unknown): EntityBulkResponse {
+    const req = optionalValue(args, "req") as ArchiveEntitiesRequest;
+    const selected = this.selectEligibleEntities(req, (entity) => entity.status !== "archived");
+    if (!req.dry_run) {
+      const ids = new Set(selected.map((entity) => entity.id));
+      this.entityDetails = this.entityDetails.map((detail) =>
+        ids.has(detail.entity.id)
+          ? { ...detail, entity: { ...detail.entity, status: "archived" } }
+          : detail,
+      );
+    }
+    return { count: selected.length, entity_ids: selected.map((entity) => entity.id), dry_run: req.dry_run };
+  }
+
+  /** Exact inverse of {@link archiveEntities}: only archived entities are
+   * eligible, and each reverts to established or detected by its own
+   * `confirmed` flag, not unconditionally to detected. */
+  private restoreEntities(args: unknown): EntityBulkResponse {
+    const req = optionalValue(args, "req") as RestoreEntitiesRequest;
+    const selected = this.selectEligibleEntities(req, (entity) => entity.status === "archived");
+    if (!req.dry_run) {
+      const ids = new Set(selected.map((entity) => entity.id));
+      this.entityDetails = this.entityDetails.map((detail) =>
+        ids.has(detail.entity.id)
+          ? { ...detail, entity: { ...detail.entity, status: detail.entity.confirmed ? "established" : "detected" } }
+          : detail,
+      );
+    }
+    return { count: selected.length, entity_ids: selected.map((entity) => entity.id), dry_run: req.dry_run };
   }
 
   private listMemories(args: unknown): readonly MemoryItem[] {

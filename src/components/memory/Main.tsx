@@ -34,6 +34,7 @@ import SettingsSidebar from "./settings/SettingsSidebar";
 import SpaceDetail from "./SpaceDetail";
 import { SpacesOverview } from "./spaces";
 import { PagesOverview } from "./pages/PagesOverview";
+import { EntitiesView } from "./entities/EntitiesView";
 import {
   PageDraftEditor,
   type PageDraftEditorHandle,
@@ -681,6 +682,7 @@ export default function Main({
               });
             }}
             onNavigatePages={navigatePages}
+            onNavigateEntities={() => navigateTo({ kind: "entities" })}
             onNavigateHome={navigateHome}
             onNavigateGraph={() => navigateTo({ kind: "graph" })}
             onNavigateSources={() => navigateTo({ kind: "sources" })}
@@ -855,8 +857,13 @@ export default function Main({
                 draftId,
                 space,
               })}
+              onSelectEntity={handleEntityClick}
               onSelectPage={(id) => navigateTo({ kind: "page", pageId: id })}
               onSelectSpace={(spaceName) => navigateTo({ kind: "space", spaceId: null, spaceName })}
+            />
+          ) : view.kind === "entities" ? (
+            <EntitiesView
+              onEntityClick={handleEntityClick}
             />
           ) : view.kind === "spaces" ? (
             <SpacesOverview

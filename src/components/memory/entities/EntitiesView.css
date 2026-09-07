@@ -1,0 +1,363 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+
+.entities-view {
+  margin: 0 auto;
+  max-width: 1130px;
+  padding: 0 0 64px;
+  width: 100%;
+}
+
+.entities-header {
+  align-items: baseline;
+  border-bottom: 1px solid var(--mem-border);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mem-space-3);
+  justify-content: space-between;
+  padding: var(--mem-space-8) 0 var(--mem-space-4);
+}
+
+.entities-header h1 {
+  color: var(--mem-text);
+  font-family: var(--mem-font-heading);
+  font-size: var(--mem-text-xl);
+  font-weight: 500;
+  margin: 0;
+}
+
+.entities-subtitle {
+  color: var(--mem-text-tertiary);
+  font-family: var(--mem-font-mono);
+  font-size: var(--mem-text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.entities-tabs {
+  border-bottom: 1px solid var(--mem-border);
+  display: flex;
+  gap: var(--mem-space-5);
+  margin-bottom: var(--mem-space-5);
+}
+
+.entities-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--mem-text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  font-family: var(--mem-font-body);
+  font-size: var(--mem-text-base);
+  gap: var(--mem-space-2);
+  padding: var(--mem-space-2) 0 var(--mem-space-3);
+}
+
+.entities-tab[aria-selected="true"] {
+  border-bottom-color: var(--mem-accent-indigo);
+  color: var(--mem-text);
+  font-weight: 500;
+}
+
+.entities-tab-count {
+  color: var(--mem-text-tertiary);
+  font-family: var(--mem-font-mono);
+  font-size: var(--mem-text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.entities-filters {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mem-space-4);
+  margin-bottom: var(--mem-space-3);
+}
+
+.entities-search {
+  background: var(--mem-surface);
+  border: 1px solid var(--mem-border);
+  border-radius: var(--mem-radius-md);
+  color: var(--mem-text);
+  font-family: var(--mem-font-body);
+  font-size: var(--mem-text-base);
+  min-width: 200px;
+  padding: 6px 10px;
+}
+
+.entities-chip-group {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mem-space-2);
+}
+
+.entities-chip-label {
+  color: var(--mem-text-tertiary);
+  font-family: var(--mem-font-body);
+  font-size: var(--mem-text-sm);
+  margin-right: 2px;
+}
+
+.entities-chip {
+  background: transparent;
+  border: 1px solid var(--mem-border);
+  border-radius: var(--mem-radius-full);
+  color: var(--mem-text-secondary);
+  cursor: pointer;
+  font-family: var(--mem-font-body);
+  font-size: var(--mem-text-sm);
+  line-height: 1;
+  padding: 6px 12px;
+  transition: background-color 150ms, color 150ms, border-color 150ms;
+}
+
+.entities-chip:hover {
+  background: var(--mem-hover);
+}
+
+.entities-chip[aria-pressed="true"] {
+  background: var(--mem-indigo-bg);
+  border-color: color-mix(in srgb, var(--mem-accent-indigo) 35%, transparent);
+  color: var(--mem-accent-indigo);
+}
+
+.entities-matchline {
+  align-items: center;
+  color: var(--mem-text-secondary);
+  display: flex;
+  font-family: var(--mem-font-body);
+  font-size: var(--mem-text-sm);
+  justify-content: space-between;
+  padding: var(--mem-space-3) 0;
+}
+
+.entities-selection-bar {
+  align-items: center;
+  background: var(--mem-hover);
+  border-radius: var(--mem-radius-md);
+  display: flex;
+  gap: var(--mem-space-3);
+  margin-bottom: var(--mem-space-3);
+  padding: var(--mem-space-2) var(--mem-space-3);
+}
+
+.entities-selection-count {
+  color: var(--mem-text);
+  font-family: var(--mem-font-body);
+  font-size: var(--mem-text-sm);
+  font-weight: 500;
+  margin-right: auto;
+}
+
+.entities-ghost-btn {
+  background: transparent;
+  border: 1px solid var(--mem-border);
+  border-radius: var(--mem-radius-sm);
+  color: var(--mem-text-secondary);
+  cursor: pointer;
+  font-family: var(--mem-font-body);
+  font-size: var(--mem-text-sm);
+  padding: 5px 10px;
+  white-space: nowrap;
+}
+
+.entities-ghost-btn:hover:not(:disabled) {
+  background: var(--mem-hover);
+  color: var(--mem-text);
+}
+
+.entities-ghost-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.entities-danger-btn {
+  border-color: color-mix(in srgb, var(--mem-danger) 45%, transparent);
+  color: var(--mem-danger);
+}
+
+.entities-load-more {
+  display: block;
+  margin: var(--mem-space-4) auto 0;
+}
+
+.entities-state {
+  color: var(--mem-text-tertiary);
+  font-family: var(--mem-font-body);
+  font-size: var(--mem-text-base);
+  padding: var(--mem-space-8) 0;
+  text-align: center;
+}
+
+.entities-empty {
+  border: 1px dashed var(--mem-border);
+  border-radius: var(--mem-radius-lg);
+  color: var(--mem-text-secondary);
+  padding: var(--mem-space-8);
+  text-align: center;
+}
+
+.entities-empty b {
+  color: var(--mem-text);
+  display: block;
+  font-family: var(--mem-font-body);
+  font-size: var(--mem-text-md);
+  font-weight: 500;
+  margin-bottom: var(--mem-space-1);
+}
+
+.entities-empty p {
+  color: var(--mem-text-tertiary);
+  font-size: var(--mem-text-sm);
+  margin: 0;
+}
+
+.entities-table {
+  border-collapse: collapse;
+  font-family: var(--mem-font-body);
+  width: 100%;
+}
+
+.entities-table th {
+  border-bottom: 1px solid var(--mem-border);
+  color: var(--mem-text-tertiary);
+  font-size: var(--mem-text-xs);
+  font-weight: 500;
+  padding: var(--mem-space-2) var(--mem-space-2);
+  text-align: left;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.entities-table td {
+  border-bottom: 1px solid var(--mem-border);
+  color: var(--mem-text);
+  font-size: var(--mem-text-base);
+  padding: var(--mem-space-2) var(--mem-space-2);
+  vertical-align: middle;
+}
+
+.entities-check-col {
+  width: 32px;
+}
+
+.entities-row-actions {
+  display: flex;
+  gap: var(--mem-space-2);
+  justify-content: flex-end;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.entities-name-link {
+  background: none;
+  border: none;
+  color: var(--mem-text);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: inherit;
+  padding: 0;
+  text-align: left;
+}
+
+.entities-name-link:hover {
+  text-decoration: underline;
+}
+
+.entities-scrim {
+  align-items: center;
+  background: rgba(0, 0, 0, 0.4);
+  bottom: 0;
+  display: flex;
+  justify-content: center;
+  left: 0;
+  position: fixed;
+  right: 0;
+  top: 0;
+  z-index: 60;
+}
+
+.entities-dialog {
+  background: var(--mem-surface);
+  border: 1px solid var(--mem-border);
+  border-radius: var(--mem-radius-lg);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+  max-width: 420px;
+  padding: var(--mem-space-6);
+  width: 90%;
+}
+
+.entities-dialog h2 {
+  color: var(--mem-text);
+  font-family: var(--mem-font-heading);
+  font-size: var(--mem-text-lg);
+  font-weight: 500;
+  margin: 0 0 var(--mem-space-3);
+}
+
+.entities-dialog p {
+  color: var(--mem-text-secondary);
+  font-size: var(--mem-text-sm);
+  line-height: 1.5;
+  margin: 0 0 var(--mem-space-3);
+}
+
+.entities-dialog-scope {
+  background: var(--mem-hover);
+  border-radius: var(--mem-radius-md);
+  display: flex;
+  font-size: var(--mem-text-sm);
+  gap: var(--mem-space-2);
+  justify-content: space-between;
+  margin-bottom: var(--mem-space-3);
+  padding: var(--mem-space-2) var(--mem-space-3);
+}
+
+.entities-dialog-scope-key {
+  color: var(--mem-text-tertiary);
+}
+
+.entities-dialog-scope-value {
+  align-items: center;
+  display: flex;
+  gap: var(--mem-space-2);
+}
+
+.entities-dialog-scope-count {
+  color: var(--mem-text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.entities-dialog-hint {
+  color: var(--mem-text-tertiary);
+  font-size: var(--mem-text-xs);
+}
+
+.entities-dialog-actions {
+  display: flex;
+  gap: var(--mem-space-2);
+  justify-content: flex-end;
+  margin-top: var(--mem-space-4);
+}
+
+.entities-primary-btn {
+  background: var(--mem-accent-indigo);
+  border: none;
+  border-radius: var(--mem-radius-sm);
+  color: var(--mem-text-on-accent);
+  cursor: pointer;
+  font-family: var(--mem-font-body);
+  font-size: var(--mem-text-sm);
+  padding: 6px 14px;
+}
+
+.entities-primary-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.entities-primary-btn.entities-danger-btn {
+  background: var(--mem-danger);
+  color: #1A1A2E;
+}

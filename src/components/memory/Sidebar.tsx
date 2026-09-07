@@ -19,6 +19,7 @@ interface SidebarProps {
   readonly currentPageId?: string | null;
   readonly currentSpaceId?: string | null;
   readonly onEntityClick: (entityId: string) => void;
+  readonly onNavigateEntities?: () => void;
   readonly onNavigateGraph?: () => void;
   onNavigateHome?: () => void;
   readonly onNavigateLog?: () => void;
@@ -61,6 +62,7 @@ export default function Sidebar({
   currentPageId = null,
   currentSpaceId = null,
   onEntityClick,
+  onNavigateEntities,
   onNavigateGraph,
   onNavigateHome,
   onNavigateLog,
@@ -156,6 +158,7 @@ export default function Sidebar({
           <PrimaryNavigation
             active={activeNavigation}
             labels={{
+              entities: t("sidebar.entities"),
               graph: t("sidebar.graph"),
               home: t("sidebar.home"),
               memories: t("sidebar.memories"),
@@ -164,6 +167,7 @@ export default function Sidebar({
               sources: t("sidebar.sources"),
               spaces: t("sidebar.spaces"),
             }}
+            onNavigateEntities={closeAfterNavigation(onNavigateEntities, closeOverlay)}
             onNavigateGraph={closeAfterNavigation(onNavigateGraph, closeOverlay)}
             onNavigateHome={closeAfterNavigation(onNavigateHome, closeOverlay)}
             onNavigateLog={closeAfterNavigation(onNavigateLog, closeOverlay)}

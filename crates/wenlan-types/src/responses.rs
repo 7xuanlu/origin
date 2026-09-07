@@ -438,14 +438,29 @@ pub struct CreatePageResponse {
     pub write_outcome: Option<WriteOutcome>,
 }
 
+/// `POST /api/memory/entities` (legacy list) and `POST /api/memory/entities/query`.
+/// `total` is the number of entities matching the filter before `limit`/`offset`;
+/// the legacy route sets it to `entities.len()`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListEntitiesResponse {
     pub entities: Vec<Entity>,
+    #[serde(default)]
+    pub total: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchEntitiesResponse {
     pub results: Vec<EntitySearchResult>,
+}
+
+/// `POST /api/memory/entities/archive` and `/restore`. `count` is the number
+/// of entities the action applied to (or would apply to when `dry_run`).
+/// `entity_ids` lists them, truncated to the first 1000 when larger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityBulkResponse {
+    pub count: u64,
+    pub entity_ids: Vec<String>,
+    pub dry_run: bool,
 }
 
 /// `POST /api/memory/entities/{id}/merge` response. `applied` is `false`

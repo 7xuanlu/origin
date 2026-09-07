@@ -47467,9 +47467,12 @@ async fn search_pages_excludes_entity_kind_shadow() {
 #[tokio::test]
 async fn search_pages_browse_includes_entity_kind_shadow() {
     let (db, _dir) = test_db().await;
-    db.store_entity("Unique Zephyrine Browse Marker", "person", None, None, None)
+    let entity_id = db
+        .store_entity("Unique Zephyrine Browse Marker", "person", None, None, None)
         .await
         .unwrap();
+    // #708: established, so the browse rule lets it through.
+    db.confirm_entity(&entity_id, true).await.unwrap();
 
     let results = db
         .search_pages_browse("Unique Zephyrine Browse Marker", 10, None)
@@ -47508,15 +47511,18 @@ async fn search_pages_scoped_excludes_entity_kind_shadow() {
 #[tokio::test]
 async fn search_pages_scoped_browse_includes_entity_kind_shadow() {
     let (db, _dir) = test_db().await;
-    db.store_entity(
-        "Unique Quorlath Browse Marker",
-        "person",
-        Some("work"),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let entity_id = db
+        .store_entity(
+            "Unique Quorlath Browse Marker",
+            "person",
+            Some("work"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // #708: established, so the browse rule lets it through.
+    db.confirm_entity(&entity_id, true).await.unwrap();
 
     let results = db
         .search_pages_scoped_browse(
@@ -47540,9 +47546,12 @@ async fn search_pages_scoped_browse_global_includes_entity_kind_shadow() {
     // Global scope exercises search_pages_scoped_browse's delegation to
     // search_pages_browse (both browse arms must agree).
     let (db, _dir) = test_db().await;
-    db.store_entity("Unique Quorlath Global Marker", "person", None, None, None)
+    let entity_id = db
+        .store_entity("Unique Quorlath Global Marker", "person", None, None, None)
         .await
         .unwrap();
+    // #708: established, so the browse rule lets it through.
+    db.confirm_entity(&entity_id, true).await.unwrap();
 
     let results = db
         .search_pages_scoped_browse(
@@ -47584,9 +47593,15 @@ async fn seed_concept_then_shadow(db: &MemoryDB, tag: &str) -> (String, String) 
     .await
     .unwrap();
     let shadow_title = format!("Q1 {tag} Entity Marker");
-    db.store_entity(&shadow_title, "person", None, None, None)
+    let entity_id = db
+        .store_entity(&shadow_title, "person", None, None, None)
         .await
         .unwrap();
+    // #708: the browse surfaces show ESTABLISHED entities. A detected one is
+    // a guess the system has not earned the right to put in the Wiki, so this
+    // fixture establishes the entity to keep asking the question these tests
+    // exist to ask -- does a shadow page reach the browse surface at all.
+    db.confirm_entity(&entity_id, true).await.unwrap();
     (concept_title, shadow_title)
 }
 
@@ -47611,15 +47626,18 @@ async fn list_recent_pages_with_badges_includes_entity_kind_shadow() {
 #[tokio::test]
 async fn list_recent_pages_with_badges_scoped_includes_entity_kind_shadow() {
     let (db, _dir) = test_db().await;
-    db.store_entity(
-        "Scoped Recent Entity Marker",
-        "person",
-        Some("work"),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let entity_id = db
+        .store_entity(
+            "Scoped Recent Entity Marker",
+            "person",
+            Some("work"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // #708: established, so the browse rule lets it through.
+    db.confirm_entity(&entity_id, true).await.unwrap();
 
     let items = db
         .list_recent_pages_with_badges_scoped(
@@ -47829,15 +47847,18 @@ async fn list_pages_scoped_excludes_entity_kind_shadow() {
 #[tokio::test]
 async fn list_pages_scoped_browse_includes_entity_kind_shadow() {
     let (db, _dir) = test_db().await;
-    db.store_entity(
-        "List Pages Scoped Browse Marker",
-        "person",
-        Some("work"),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let entity_id = db
+        .store_entity(
+            "List Pages Scoped Browse Marker",
+            "person",
+            Some("work"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // #708: established, so the browse rule lets it through.
+    db.confirm_entity(&entity_id, true).await.unwrap();
 
     let pages = db
         .list_pages_scoped_browse(
@@ -47888,15 +47909,18 @@ async fn list_pages_scoped_global_excludes_entity_kind_shadow() {
 #[tokio::test]
 async fn list_pages_scoped_browse_global_includes_entity_kind_shadow() {
     let (db, _dir) = test_db().await;
-    db.store_entity(
-        "List Pages Scoped Browse Global Marker",
-        "person",
-        None,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let entity_id = db
+        .store_entity(
+            "List Pages Scoped Browse Global Marker",
+            "person",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // #708: established, so the browse rule lets it through.
+    db.confirm_entity(&entity_id, true).await.unwrap();
 
     let pages = db
         .list_pages_scoped_browse("active", 50, 0, &crate::read_scope::ReadScope::Global)
@@ -48958,14 +48982,16 @@ async fn archive_entity_retracts_its_edges_so_rename_and_rebind_succeed_and_rest
     );
 }
 
-/// Restore is order-independent when both endpoints were archived. The
-/// stamp names the entity whose archive retired the edge (A); B's archive
-/// finds the edge already retired and stamps nothing. Restoring A first must
-/// leave the edge retired (B is still archived, the fence says no) but keep
-/// the stamp; restoring B then brings it back. Restoring in the other order
-/// works the same way.
+/// Restore only re-activates the edges its OWN archive retired. The stamp
+/// names the entity whose archive retired the edge (A); B's archive finds the
+/// edge already retired and stamps nothing.
+///
+/// Sol review of #711: before this, restoring B un-retired A's edge while A
+/// was still archived, quietly undoing A's archive and re-activating an edge
+/// into an archived entity. Now B's restore leaves A's stamp alone, and A's
+/// restore is what brings the edge back -- whichever order the two land in.
 #[tokio::test]
-async fn restore_entity_reactivates_shared_edge_regardless_of_restore_order() {
+async fn restore_entity_reactivates_only_the_edges_its_own_archive_retired() {
     let (db, _dir) = test_db().await;
     let edge_id = seed_linked_entity_pair(&db, "ord", "work").await;
 
@@ -48979,29 +49005,28 @@ async fn restore_entity_reactivates_shared_edge_regardless_of_restore_order() {
         "first archive stamps the edge"
     );
 
-    // A first: the other endpoint is still archived, so the fence refuses the
-    // re-activation and the row stays retired *and stamped*.
-    assert!(db.restore_entity("ord-a").await.unwrap());
+    // B first: the stamp is A's, so B's restore must not touch the edge.
+    assert!(db.restore_entity("ord-b").await.unwrap());
     let (valid_until, _, tag, _) = relates_edge_state(&db, &edge_id).await;
     assert!(
         valid_until.is_some(),
-        "an edge whose other endpoint is still archived must stay retired"
+        "restoring B must not un-retire an edge A's archive retired"
     );
     assert_eq!(
         tag.as_deref(),
         Some("ord-a"),
-        "the stamp survives a refused restore"
+        "A's stamp survives B's restore"
+    );
+    assert_eq!(
+        db.entity_link_summary("ord-b").await.unwrap().active_edges,
+        0
     );
 
-    // B second: the edge is incident to B, so B's restore picks it up even
-    // though the stamp names A.
-    assert!(db.restore_entity("ord-b").await.unwrap());
+    // A second: its own stamp, so the edge comes back and the stamp clears.
+    assert!(db.restore_entity("ord-a").await.unwrap());
     let (valid_until, _, tag, _) = relates_edge_state(&db, &edge_id).await;
-    assert!(
-        valid_until.is_none(),
-        "restoring the second endpoint re-activates the shared edge"
-    );
-    assert!(tag.is_none());
+    assert!(valid_until.is_none(), "A's restore re-activates A's edge");
+    assert!(tag.is_none(), "re-activation clears the archive stamp");
     assert_eq!(
         db.entity_link_summary("ord-a").await.unwrap().active_edges,
         1

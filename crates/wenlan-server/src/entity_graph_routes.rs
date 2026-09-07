@@ -13,12 +13,13 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use wenlan_core::read_scope::ReadScope;
 use wenlan_types::requests::{
-    AddEntityAliasRequest, AddObservationRequest, CreateEntityRequest, CreateRelationRequest,
-    MergeEntityRequest,
+    AddEntityAliasRequest, AddObservationRequest, ArchiveEntitiesRequest, CreateEntityRequest,
+    CreateRelationRequest, EntitySelection, ListEntitiesRequest, MergeEntityRequest,
+    RestoreEntitiesRequest,
 };
 use wenlan_types::responses::{
     AddObservationResponse, CreateEntityResponse, CreateRelationResponse, EntityAliasesResponse,
-    MergeEntityResponse,
+    EntityBulkResponse, ListEntitiesResponse, MergeEntityResponse,
 };
 use wenlan_types::{WriteOutcome, WriteSpaceSource, WriteSpaceTarget};
 
@@ -41,6 +42,7 @@ pub(crate) fn register_writes(router: TrackedRouter<SharedState>) -> TrackedRout
 pub(crate) fn register_reads(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
     router
         .route("/api/memory/entities/list", post(handle_list_entities))
+        .route("/api/memory/entities/query", post(handle_query_entities))
         .route("/api/memory/entities/search", post(handle_search_entities))
         .route("/api/memory/graph", get(handle_get_knowledge_graph))
         .route(
@@ -51,6 +53,14 @@ pub(crate) fn register_reads(router: TrackedRouter<SharedState>) -> TrackedRoute
 
 pub(crate) fn register_crud(router: TrackedRouter<SharedState>) -> TrackedRouter<SharedState> {
     router
+        .route(
+            "/api/memory/entities/archive",
+            post(handle_archive_entities),
+        )
+        .route(
+            "/api/memory/entities/restore",
+            post(handle_restore_entities),
+        )
         .route(
             "/api/memory/entities/{id}/confirm",
             put(handle_confirm_entity),
@@ -196,19 +206,9 @@ pub async fn handle_link_entity(
 
 // ===== Knowledge Graph Retrieval Handlers =====
 
-#[derive(Debug, Deserialize)]
-pub struct ListEntitiesRequest {
-    #[serde(default)]
-    pub entity_type: Option<String>,
-    #[serde(default, alias = "domain")]
-    pub space: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ListEntitiesResponse {
-    pub entities: Vec<wenlan_core::db::Entity>,
-}
-
+/// POST /api/memory/entities/list -- the legacy Wiki-facing list: live
+/// entities only, unpaged. `total` is what was returned, because this route
+/// never paged and clients that ignore the field keep working.
 pub async fn handle_list_entities(
     State(state): State<Arc<RwLock<ServerState>>>,
     crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
@@ -225,7 +225,109 @@ pub async fn handle_list_entities(
         .list_entities_scoped(req.entity_type.as_deref(), &scope)
         .await
         .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
-    Ok(Json(ListEntitiesResponse { entities }))
+    let total = entities.len() as u64;
+    Ok(Json(ListEntitiesResponse { entities, total }))
+}
+
+/// POST /api/memory/entities/query -- the Entities view's reader (#708).
+///
+/// Unlike `/list` this one sees all three lifecycle states, filters on them,
+/// and pages, so the view can offer "detected, one mention, oldest first" and
+/// then hand the same filter to `/archive`.
+pub async fn handle_query_entities(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    Json(req): Json<ListEntitiesRequest>,
+) -> Result<Json<ListEntitiesResponse>, ServerError> {
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    let scope =
+        crate::read_scope::effective_read_scope(&db, req.space.as_deref(), header_space.as_deref())
+            .await?;
+    let (entities, total) = db
+        .query_entities_scoped(&req, &scope)
+        .await
+        .map_err(|e| ServerError::SearchFailed(e.to_string()))?;
+    Ok(Json(ListEntitiesResponse { entities, total }))
+}
+
+/// A selection must name exactly one of `ids` or `filter`.
+///
+/// Both is ambiguous and neither would archive the entire scope, which is the
+/// one mistake this endpoint must never make on a caller's behalf, so it is a
+/// 400 rather than a guess.
+fn validate_entity_selection(selection: &EntitySelection) -> Result<(), ServerError> {
+    match (&selection.ids, &selection.filter) {
+        (Some(_), Some(_)) => Err(ServerError::BadRequest(
+            "pass either `ids` or `filter`, not both".to_string(),
+        )),
+        (None, None) => Err(ServerError::BadRequest(
+            "one of `ids` or `filter` is required".to_string(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The Space a bulk selection names in its `filter`, if any. Id selections
+/// carry no Space of their own; the header (or the global default) scopes them.
+fn selection_space(selection: &EntitySelection) -> Option<&str> {
+    selection
+        .filter
+        .as_ref()
+        .and_then(|filter| filter.space.as_deref())
+}
+
+/// POST /api/memory/entities/archive -- bulk archive (#708). Space-scoped the
+/// same way `handle_delete_entity` is; `dry_run` previews without mutating.
+pub async fn handle_archive_entities(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    Json(req): Json<ArchiveEntitiesRequest>,
+) -> Result<Json<EntityBulkResponse>, ServerError> {
+    validate_entity_selection(&req.selection)?;
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    // A `filter.space` in the body narrows the scope exactly as it does on
+    // `/query`, so the dry run a user read back and the apply that follows
+    // resolve the same rows. Passing `None` here let `{filter:{space:"work"}}`
+    // without a header act on every Space.
+    let scope = crate::read_scope::effective_read_scope(
+        &db,
+        selection_space(&req.selection),
+        header_space.as_deref(),
+    )
+    .await?;
+    let response = db
+        .archive_entities(&req.selection, &scope, req.dry_run)
+        .await?;
+    Ok(Json(response))
+}
+
+/// POST /api/memory/entities/restore -- the exact inverse of `/archive`.
+pub async fn handle_restore_entities(
+    State(state): State<Arc<RwLock<ServerState>>>,
+    crate::space_header::SpaceHeader(header_space): crate::space_header::SpaceHeader,
+    Json(req): Json<RestoreEntitiesRequest>,
+) -> Result<Json<EntityBulkResponse>, ServerError> {
+    validate_entity_selection(&req.selection)?;
+    let db = {
+        let s = state.read().await;
+        s.db.clone().ok_or(ServerError::DbNotInitialized)?
+    };
+    let scope = crate::read_scope::effective_read_scope(
+        &db,
+        selection_space(&req.selection),
+        header_space.as_deref(),
+    )
+    .await?;
+    let response = db
+        .restore_entities(&req.selection, &scope, req.dry_run)
+        .await?;
+    Ok(Json(response))
 }
 
 pub async fn handle_get_entity_detail(

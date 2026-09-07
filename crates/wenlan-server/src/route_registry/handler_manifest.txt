@@ -78,7 +78,10 @@ main|post|/api/llm/test|wenlan_server::routes::handle_test_llm
 main|post|/api/memory/confirm/{source_id}|wenlan_server::memory_routes::handle_confirm_memory
 main|post|/api/memory/contradiction/{source_id}/dismiss|wenlan_server::memory_routes::handle_dismiss_contradiction
 main|post|/api/memory/entities|wenlan_server::entity_graph_routes::handle_create_entity
+main|post|/api/memory/entities/archive|wenlan_server::entity_graph_routes::handle_archive_entities
 main|post|/api/memory/entities/list|wenlan_server::entity_graph_routes::handle_list_entities
+main|post|/api/memory/entities/query|wenlan_server::entity_graph_routes::handle_query_entities
+main|post|/api/memory/entities/restore|wenlan_server::entity_graph_routes::handle_restore_entities
 main|post|/api/memory/entities/search|wenlan_server::entity_graph_routes::handle_search_entities
 main|post|/api/memory/entities/{entity_id}/observations|wenlan_server::entity_graph_routes::handle_add_entity_observation
 main|post|/api/memory/entities/{id}/aliases|wenlan_server::entity_graph_routes::handle_add_entity_alias

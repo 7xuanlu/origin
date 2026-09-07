@@ -71,6 +71,7 @@ const adaEntity: Entity = {
   id: "entity-ada", name: "Ada Lovelace", entity_type: "person", domain: "Wenlan",
   space: "Wenlan", source_agent: "research-agent", confidence: 0.87, confirmed: false,
   created_at: NOW_SECONDS - 604_800, updated_at: NOW_SECONDS - 259_200,
+  memory_count: 0, status: "detected", established_by: null,
 };
 
 const entities: readonly Entity[] = [
@@ -79,12 +80,14 @@ const entities: readonly Entity[] = [
     id: "entity-babbage", name: "Charles Babbage", entity_type: "person", domain: "Wenlan",
     space: "Wenlan", source_agent: "research-agent", confidence: 0.91, confirmed: true,
     created_at: NOW_SECONDS - 691_200, updated_at: NOW_SECONDS - 345_600,
+    memory_count: 1, status: "established", established_by: "manual",
   },
   ...["Grace Hopper", "Alan Turing", "Edsger Dijkstra", "Margaret Hamilton", "Barbara Liskov"]
     .map((name, index): Entity => ({
       id: `entity-${index + 3}`, name, entity_type: "person", domain: "Wenlan", space: "Wenlan",
       source_agent: "research-agent", confidence: 0.8 - index * 0.03, confirmed: true,
       created_at: NOW_SECONDS - (index + 8) * 86_400, updated_at: NOW_SECONDS - (index + 5) * 86_400,
+      memory_count: 1, status: "established", established_by: "manual",
     })),
 ];
 

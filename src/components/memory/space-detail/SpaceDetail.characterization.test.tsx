@@ -77,6 +77,9 @@ const entity = {
   confirmed: true,
   created_at: 1_000,
   updated_at: 2_000,
+  memory_count: 1,
+  status: "established" as const,
+  established_by: "manual",
 };
 
 const page = {

@@ -28,7 +28,8 @@
 //! just the struct literal's default.
 
 use crate::entities::{
-    Entity, EntityDetail, EntitySearchResult, Observation, Relation, RelationWithEntity,
+    Entity, EntityDetail, EntitySearchResult, EntityStatus, Observation, Relation,
+    RelationWithEntity,
 };
 use crate::memory::{MemoryItem, SearchResult, Space};
 use crate::pages::Page;
@@ -62,6 +63,9 @@ fn sample_entity() -> Entity {
         created_at: 1_700_000_000,
         updated_at: 1_700_000_100,
         aliases: vec!["alicia".into()],
+        memory_count: 4,
+        status: EntityStatus::Established,
+        established_by: Some("manual".into()),
     }
 }
 
@@ -77,6 +81,9 @@ fn entity_json() -> serde_json::Value {
         "created_at": 1_700_000_000,
         "updated_at": 1_700_000_100,
         "aliases": ["alicia"],
+        "memory_count": 4,
+        "status": "established",
+        "established_by": "manual",
     })
 }
 
@@ -240,10 +247,11 @@ fn entity_crud_responses_freeze() {
 
     let list = ListEntitiesResponse {
         entities: vec![sample_entity()],
+        total: 1,
     };
     assert_eq!(
         serde_json::to_value(&list).unwrap(),
-        json!({ "entities": [entity_json()] })
+        json!({ "entities": [entity_json()], "total": 1 })
     );
 
     let search = SearchEntitiesResponse {

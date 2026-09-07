@@ -2,6 +2,7 @@ import type { GlobalNavigation } from "./viewState";
 import { SpaceMark } from "./SpaceMark";
 
 type PrimaryNavigationLabels = {
+  readonly entities: string;
   readonly graph: string;
   readonly home: string;
   readonly memories: string;
@@ -14,6 +15,7 @@ type PrimaryNavigationLabels = {
 type PrimaryNavigationProps = {
   readonly active: GlobalNavigation | null;
   readonly labels: PrimaryNavigationLabels;
+  readonly onNavigateEntities?: () => void;
   readonly onNavigateGraph?: () => void;
   readonly onNavigateHome?: () => void;
   readonly onNavigateLog?: () => void;
@@ -64,6 +66,7 @@ const iconStyle = { color: "var(--mem-text-tertiary)" } as const;
 export function PrimaryNavigation({
   active,
   labels,
+  onNavigateEntities,
   onNavigateGraph,
   onNavigateHome,
   onNavigateLog,
@@ -89,6 +92,13 @@ export function PrimaryNavigation({
           onClick={onNavigatePages}
         >
           {labels.pages}
+        </NavButton>
+        <NavButton
+          active={active === "entities"}
+          icon={<svg aria-hidden="true" data-navigation-icon="entities" height="14" style={{ color: active === "entities" ? "var(--mem-accent-sage)" : "var(--mem-text-tertiary)" }} viewBox="0 0 24 24" width="14"><circle cx="12" cy="12" fill="none" r="9" stroke="currentColor" strokeWidth="1.8" /><path d="M12 7v5l3.5 2" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" /></svg>}
+          onClick={onNavigateEntities}
+        >
+          {labels.entities}
         </NavButton>
         <NavButton
           active={active === "spaces"}

@@ -20,6 +20,43 @@ pub struct Entity {
     /// alias declaration (lowercase). Empty for an entity with no aliases.
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Number of memories linked to this entity through `memory_entities`.
+    /// Zero for a freshly detected entity.
+    #[serde(default)]
+    pub memory_count: u64,
+    /// Lifecycle state derived from `entity_confirmed` and the page status.
+    /// See [`EntityStatus`].
+    #[serde(default)]
+    pub status: EntityStatus,
+    /// How the entity became established: `"manual"` (user pressed Establish
+    /// or an agent confirmed it), `"auto:memories"` (linked-memory count
+    /// reached `entity_establish_min_memories`), `"auto:citation"` (a
+    /// distilled page cited it). `None` while detected or archived-before-established.
+    #[serde(default)]
+    pub established_by: Option<String>,
+}
+
+/// Lifecycle state of an entity. Detected entities are the automatic index
+/// the system grows and prunes itself; established entities have earned
+/// substance and appear in the Wiki; archived entities stay resolvable so a
+/// recurring mention does not mint a duplicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EntityStatus {
+    #[default]
+    Detected,
+    Established,
+    Archived,
+}
+
+impl EntityStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EntityStatus::Detected => "detected",
+            EntityStatus::Established => "established",
+            EntityStatus::Archived => "archived",
+        }
+    }
 }
 
 /// An entity search result with distance score.

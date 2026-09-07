@@ -32,6 +32,9 @@ const detail: EntityDetailRecord = {
     confirmed: true,
     created_at: 1_700_000_000,
     updated_at: 1_700_086_400,
+    memory_count: 1,
+    status: "established",
+    established_by: "manual",
   },
   observations: [
     {
